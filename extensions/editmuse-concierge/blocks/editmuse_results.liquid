@@ -1,0 +1,31 @@
+<div class="editmuse-results-container" data-editmuse-results data-api-endpoint="{{ block.settings.api_endpoint | default: 'https://api.example.com/quiz/results' }}">
+  <div class="editmuse-results-loading">
+    <div class="editmuse-results-spinner"></div>
+    <p class="editmuse-results-loading-text">Loading your style recommendations...</p>
+  </div>
+  <div class="editmuse-results-content" style="display: none;">
+    <div class="editmuse-results-grid"></div>
+  </div>
+  <div class="editmuse-results-error" style="display: none;">
+    <p class="editmuse-results-error-text">Unable to load results. Please try again.</p>
+  </div>
+</div>
+
+{% schema %}
+{
+  "name": "EditMuse Quiz Results",
+  "target": "section",
+  "stylesheet": "editmuse-results.css",
+  "javascript": "editmuse-results.js",
+  "settings": [
+    {
+      "type": "text",
+      "id": "api_endpoint",
+      "label": "API Endpoint",
+      "default": "https://api.example.com/quiz/results",
+      "info": "Endpoint URL for fetching quiz results (include {session} placeholder)"
+    }
+  ]
+}
+{% endschema %}
+

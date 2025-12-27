@@ -1,0 +1,30 @@
+<div class="editmuse-quiz-launcher">
+  <button type="button" class="editmuse-quiz-button" data-editmuse-quiz-trigger>
+    {{ block.settings.button_text }}
+  </button>
+  <p class="editmuse-quiz-subtitle">{{ block.settings.subtitle }}</p>
+</div>
+
+{% schema %}
+{
+  "name": "EditMuse Quiz Launcher",
+  "target": "section",
+  "stylesheet": "editmuse-quiz.css",
+  "javascript": "editmuse-quiz.js",
+  "settings": [
+    {
+      "type": "text",
+      "id": "button_text",
+      "label": "Button Text",
+      "default": "Start Style Quiz"
+    },
+    {
+      "type": "text",
+      "id": "subtitle",
+      "label": "Subtitle",
+      "default": "60 seconds. Curated picks."
+    }
+  ]
+}
+{% endschema %}
+

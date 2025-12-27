@@ -1,0 +1,195 @@
+.editmuse-concierge-block {
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.editmuse-concierge-button {
+  background-color: transparent;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  padding: 0.875rem 2rem;
+  font-size: 1rem;
+  font-weight: 500;
+  color: #1a1a1a;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: inherit;
+  min-width: 200px;
+}
+
+.editmuse-concierge-button:hover {
+  border-color: rgba(0, 0, 0, 0.25);
+  background-color: rgba(0, 0, 0, 0.02);
+}
+
+.editmuse-concierge-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.editmuse-concierge-modal-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.5);
+}
+
+.editmuse-concierge-modal-content {
+  position: relative;
+  background-color: #ffffff;
+  border-radius: 12px;
+  padding: 2rem;
+  max-width: 500px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+}
+
+.editmuse-concierge-modal-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: rgba(0, 0, 0, 0.5);
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+  z-index: 1;
+}
+
+.editmuse-concierge-modal-close:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+  color: rgba(0, 0, 0, 0.8);
+}
+
+.editmuse-concierge-progress {
+  width: 100%;
+  height: 4px;
+  background-color: rgba(0, 0, 0, 0.08);
+  border-radius: 2px;
+  margin-bottom: 2rem;
+  overflow: hidden;
+}
+
+.editmuse-concierge-progress-bar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+  width: 33.33%;
+}
+
+.editmuse-concierge-steps {
+  min-height: 300px;
+  margin-bottom: 2rem;
+}
+
+.editmuse-concierge-step-title {
+  margin: 0 0 1.5rem 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #1a1a1a;
+  text-align: center;
+}
+
+.editmuse-concierge-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.editmuse-concierge-radio-label {
+  display: flex;
+  align-items: center;
+  padding: 0.875rem 1rem;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: 1rem;
+}
+
+.editmuse-concierge-radio-label:hover {
+  border-color: rgba(0, 0, 0, 0.25);
+  background-color: rgba(0, 0, 0, 0.02);
+}
+
+.editmuse-concierge-radio-label input[type="radio"] {
+  margin-right: 0.75rem;
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.editmuse-concierge-radio-label span {
+  flex: 1;
+  color: #1a1a1a;
+}
+
+.editmuse-concierge-results {
+  padding: 3rem 2rem;
+  text-align: center;
+}
+
+.editmuse-concierge-results-placeholder {
+  margin: 0;
+  font-size: 1rem;
+  color: rgba(0, 0, 0, 0.6);
+}
+
+.editmuse-concierge-navigation {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.editmuse-concierge-nav-btn {
+  flex: 1;
+  padding: 0.875rem 1.5rem;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background-color: transparent;
+  color: #1a1a1a;
+}
+
+.editmuse-concierge-nav-btn:hover {
+  border-color: rgba(0, 0, 0, 0.25);
+  background-color: rgba(0, 0, 0, 0.02);
+}
+
+.editmuse-concierge-submit {
+  background-color: #1a1a1a;
+  color: #ffffff;
+  border-color: #1a1a1a;
+}
+
+.editmuse-concierge-submit:hover {
+  background-color: #333333;
+  border-color: #333333;
+}
+
