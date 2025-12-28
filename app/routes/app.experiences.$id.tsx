@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, redirect, useLoaderData, useActionData, useNavigation, notFound } from "react-router";
+import { Form, redirect, useLoaderData, useActionData, useNavigation } from "react-router";
 import { authenticate } from "~/shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import type { HeadersFunction } from "react-router";
@@ -14,7 +14,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
 
   if (!shop) {
-    throw notFound();
+    throw new Response("Not Found", { status: 404 });
   }
 
   const experience = await prisma.experience.findFirst({
@@ -25,7 +25,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
 
   if (!experience) {
-    throw notFound();
+    throw new Response("Not Found", { status: 404 });
   }
 
   return {
@@ -46,7 +46,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   });
 
   if (!shop) {
-    throw notFound();
+    throw new Response("Not Found", { status: 404 });
   }
 
   const existing = await prisma.experience.findFirst({
@@ -57,7 +57,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   });
 
   if (!existing) {
-    throw notFound();
+    throw new Response("Not Found", { status: 404 });
   }
 
   const formData = await request.formData();
