@@ -136,6 +136,16 @@ npm run start:prod
 
 This will run database migrations and then start the server.
 
+### App Proxy Testing
+
+To test the App Proxy ping endpoint, first reset your app configuration:
+
+```shell
+shopify app dev --reset
+```
+
+Then visit: `https://{store}/apps/editmuse/ping` (replace `{store}` with your store domain).
+
 When you're ready to set up your app in production, you can follow [our deployment documentation](https://shopify.dev/docs/apps/launch/deployment) to host it externally. From there, you have a few options:
 
 - [Google Cloud Run](https://shopify.dev/docs/apps/launch/deployment/deploy-to-google-cloud-run): This tutorial is written specifically for this example repo, and is compatible with the extended steps included in the subsequent [**Build your app**](tutorial) in the **Getting started** docs. It is the most detailed tutorial for taking a React Router-based Shopify app and deploying it to production. It includes configuring permissions and secrets, setting up a production database, and even hosting your apps behind a load balancer across multiple regions. 
