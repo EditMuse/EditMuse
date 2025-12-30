@@ -19,7 +19,9 @@
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
-    "typecheck": "react-router typegen && tsc --noEmit"
+    "typecheck": "react-router typegen && tsc --noEmit",
+    "guard:blocks": "node scripts/guard-blocks.cjs",
+    "prebuild": "npm run guard:blocks"
   },
   "type": "module",
   "engines": {

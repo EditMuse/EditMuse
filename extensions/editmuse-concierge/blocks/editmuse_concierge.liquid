@@ -1,0 +1,106 @@
+{{ 'editmuse-concierge.css' | asset_url | stylesheet_tag }}
+
+<div class="editmuse-concierge-block" 
+     data-editmuse-concierge
+     data-start-mode="{{ block.settings.start_mode | default: 'hybrid' }}"
+     data-result-url="{{ block.settings.result_url | default: '/pages/editmuse-results' }}"
+     data-result-count="{{ block.settings.result_count | default: '8' }}">
+  <button type="button" class="editmuse-concierge-button" data-editmuse-concierge-trigger>
+    {{ block.settings.button_label | default: "Start Style Quiz" }}
+  </button>
+  
+  <div class="editmuse-concierge-modal" id="editmuse-concierge-modal-{{ block.id }}" style="display: none;">
+    <div class="editmuse-concierge-modal-overlay"></div>
+    <div class="editmuse-concierge-modal-content">
+      <button type="button" class="editmuse-concierge-modal-close" aria-label="Close">&times;</button>
+      
+      <!-- Guided Quiz Mode -->
+      <div class="editmuse-concierge-steps" data-editmuse-mode="quiz" style="display: none;">
+        <div class="editmuse-concierge-step" data-step="0">
+          <h2 class="editmuse-concierge-step-title" data-editmuse-question-title>What are you looking for?</h2>
+          <div class="editmuse-concierge-input-wrapper">
+            <input type="text" 
+                   class="editmuse-concierge-input" 
+                   data-editmuse-concierge-input
+                   placeholder="Describe what you need..."
+                   required>
+          </div>
+          <div class="editmuse-concierge-error" data-editmuse-concierge-error style="display: none;"></div>
+        </div>
+      </div>
+      
+      <!-- Chat Mode -->
+      <div class="editmuse-concierge-chat" data-editmuse-mode="chat" style="display: none;">
+        <div class="editmuse-concierge-chat-messages" data-editmuse-chat-messages></div>
+        <div class="editmuse-concierge-chat-input-wrapper">
+          <input type="text" 
+                 class="editmuse-concierge-input" 
+                 data-editmuse-chat-input
+                 placeholder="Type your message..."
+                 required>
+          <button type="button" class="editmuse-concierge-nav-btn" data-editmuse-chat-send>Send</button>
+        </div>
+        <div class="editmuse-concierge-error" data-editmuse-chat-error style="display: none;"></div>
+      </div>
+      
+      <div class="editmuse-concierge-navigation" data-editmuse-mode="quiz">
+        <button type="button" class="editmuse-concierge-nav-btn editmuse-concierge-next" data-editmuse-concierge-next>
+          Next
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{{ 'editmuse-concierge.js' | asset_url | script_tag }}
+
+{% schema %}
+{
+  "name": "EditMuse Concierge",
+  "target": "section",
+  "settings": [
+    {
+      "type": "text",
+      "id": "button_label",
+      "label": "Button Label",
+      "default": "Start Style Quiz"
+    },
+    {
+      "type": "select",
+      "id": "start_mode",
+      "label": "Start Mode",
+      "options": [
+        {
+          "value": "quiz",
+          "label": "Guided quiz"
+        },
+        {
+          "value": "chat",
+          "label": "Chat"
+        },
+        {
+          "value": "hybrid",
+          "label": "Hybrid (quiz then chat)"
+        }
+      ],
+      "default": "hybrid",
+      "info": "How the concierge interaction starts"
+    },
+    {
+      "type": "text",
+      "id": "result_url",
+      "label": "Results Page URL",
+      "default": "/pages/editmuse-results",
+      "info": "URL to redirect to after submitting"
+    },
+    {
+      "type": "number",
+      "id": "result_count",
+      "label": "Result Count",
+      "default": 8,
+      "info": "Number of recommendations to return (8, 12, or 16)"
+    }
+  ]
+}
+{% endschema %}
+

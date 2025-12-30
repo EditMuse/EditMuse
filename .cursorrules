@@ -1,0 +1,32 @@
+# EditMuse Theme App Extension - Block Rules
+
+## CRITICAL: Never Create New Block Files
+
+**NEVER create new files in `extensions/editmuse-concierge/blocks/`**
+
+The Theme App Extension must have EXACTLY 3 blocks. No more, no less.
+
+## Allowed Block Files (ONLY these 3):
+
+1. `extensions/editmuse-concierge/blocks/editmuse_launcher.liquid`
+2. `extensions/editmuse-concierge/blocks/editmuse_concierge.liquid`
+3. `extensions/editmuse-concierge/blocks/editmuse_results.liquid`
+
+## Rules:
+
+- **If asked to create a new block**: Refuse and modify one of the existing 3 blocks instead.
+- **If asked to add functionality**: Edit the appropriate existing block file.
+- **If asked to "replace" a block**: Modify the existing block, do NOT create a new file.
+- **All UI changes**: Must be done by editing ONLY the 3 kept block files above.
+
+## Block Purposes:
+
+- **editmuse_launcher.liquid**: Button that starts a session and opens the concierge widget
+- **editmuse_concierge.liquid**: Main interactive widget (quiz/chat modes)
+- **editmuse_results.liquid**: Displays product recommendations
+
+## Enforcement:
+
+- A build-time guard script (`scripts/guard-blocks.cjs`) will fail if extra block files are detected.
+- The `prebuild` script runs the guard automatically.
+

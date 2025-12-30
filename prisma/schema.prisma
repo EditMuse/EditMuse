@@ -40,6 +40,7 @@ model Shop {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
   experiences Experience[]
+  conciergeSessions ConciergeSession[]
 }
 
 model Experience {
@@ -55,6 +56,60 @@ model Experience {
   inStockOnly       Boolean @default(false)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+  conciergeSessions ConciergeSession[]
 
   @@index([shopId])
+}
+
+enum ConciergeSessionStatus {
+  COLLECTING
+  PROCESSING
+  COMPLETE
+  FAILED
+}
+
+enum ConciergeRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+model ConciergeSession {
+  id          String   @id @default(cuid())
+  publicToken String   @unique
+  shopId      String
+  shop        Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  experienceId String?
+  experience  Experience? @relation(fields: [experienceId], references: [id], onDelete: Cascade)
+  status      ConciergeSessionStatus @default(COLLECTING)
+  resultCount Int      @default(8)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  messages    ConciergeMessage[]
+  result      ConciergeResult?
+
+  @@index([shopId])
+  @@index([publicToken])
+}
+
+model ConciergeMessage {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   ConciergeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role      ConciergeRole @default(USER)
+  text      String?
+  imageUrl  String?
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+}
+
+model ConciergeResult {
+  id            String   @id @default(cuid())
+  sessionId     String   @unique
+  session       ConciergeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  productHandles Json
+  productIds    Json?
+  reasoning     String?
+  createdAt     DateTime @default(now())
 }
