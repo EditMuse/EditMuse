@@ -54,6 +54,9 @@ redirect_urls = [ "https://editmuse-production.up.railway.app" ]
 # to the URL specified here.
 # For dev: set to your dev tunnel URL (will be auto-updated by CLI)
 # For production: update this to your production URL
-url = "https://shakira-regulations-compromise-mining.trycloudflare.com/apps/editmuse"
+# CURRENT DEV TUNNEL (update this when tunnel changes):
+# NOTE: The URL should be the BASE URL only (without /apps/editmuse)
+# Shopify will automatically append the subpath when proxying
+url = "https://pay-cellular-increasing-dialogue.trycloudflare.com"
 subpath = "editmuse"
 prefix = "apps"

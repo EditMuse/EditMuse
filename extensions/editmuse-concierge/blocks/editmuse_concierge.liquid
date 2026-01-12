@@ -75,6 +75,7 @@
   assign button_label = block.settings.button_label | default: 'Ask EditMuse'
   assign primary_cta_text = block.settings.primary_cta_text | default: ''
   assign open_on_load = block.settings.open_on_load | default: false
+  assign chat_placeholder = block.settings.chat_placeholder | default: ''
   
   # Use primary_cta_text if provided, otherwise fall back to button_label
   if primary_cta_text != blank and primary_cta_text != ''
@@ -144,6 +145,9 @@
     {%- endif -%}
     button-label="{{ final_button_label }}"
     open-on-load="{{ open_on_load }}"
+    {%- if chat_placeholder != blank and chat_placeholder != '' -%}
+    chat-placeholder="{{ chat_placeholder }}"
+    {%- endif -%}
   ></editmuse-concierge>
 
   {{ 'editmuse-concierge.js' | asset_url | script_tag }}
@@ -480,6 +484,13 @@
       "label": "Open Modal on Page Load",
       "default": false
     },
+    {
+      "type": "text",
+      "id": "chat_placeholder",
+      "label": "Chat Placeholder Text",
+      "default": "Tell us what you need",
+      "info": "Custom placeholder text for chat mode"
+    }
   ]
 }
 {% endschema %}

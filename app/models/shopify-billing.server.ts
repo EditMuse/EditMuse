@@ -411,13 +411,46 @@ export async function updateSubscriptionFromCharge(
   const newCreditsIncludedX2 = creditsToX2(newPlan.includedCredits);
   const newExperiencesIncluded = newPlan.experiences || 0;
 
-  // Check if plan tier is actually changing
-  const existingSubscription = await prisma.subscription.findUnique({
+  // Get current subscription to check if plan tier changed and for grace period restoration
+  const currentSubscription = await prisma.subscription.findUnique({
     where: { shopId },
-    select: { planTier: true },
   });
 
-  const planTierChanged = existingSubscription?.planTier !== finalPlanTier;
+  const planTierChanged = currentSubscription?.planTier !== finalPlanTier;
+
+  // Check if resubscribing within grace period (30 days) and restore preserved credits and recurring add-ons
+  let restoredCreditsAddonX2 = 0;
+  let restoredExperiencesAddon = 0;
+  let restoredAdvancedReporting = false;
+  
+  if (currentSubscription?.cancelledAt) {
+    const cancelledAt = currentSubscription.cancelledAt;
+    const now = new Date();
+    const daysSinceCancellation = (now.getTime() - cancelledAt.getTime()) / (1000 * 60 * 60 * 24);
+    const GRACE_PERIOD_DAYS = 30;
+
+    if (daysSinceCancellation <= GRACE_PERIOD_DAYS) {
+      // Restore preserved one-time credits
+      restoredCreditsAddonX2 = currentSubscription.preservedCreditsAddonX2 || 0;
+      // Restore preserved recurring add-ons
+      restoredExperiencesAddon = currentSubscription.preservedExperiencesAddon || 0;
+      restoredAdvancedReporting = currentSubscription.preservedAdvancedReporting || false;
+      
+      console.log("[Billing] Restoring preserved add-ons within grace period", {
+        shop: shopDomain,
+        preservedCredits: restoredCreditsAddonX2 / 2, // Convert X2 to actual credits for logging
+        preservedExperiencesAddon: restoredExperiencesAddon,
+        preservedAdvancedReporting: restoredAdvancedReporting,
+        daysSinceCancellation: Math.floor(daysSinceCancellation),
+      });
+    } else {
+      console.log("[Billing] Grace period expired, not restoring preserved add-ons", {
+        shop: shopDomain,
+        daysSinceCancellation: Math.floor(daysSinceCancellation),
+        gracePeriodDays: GRACE_PERIOD_DAYS,
+      });
+    }
+  }
 
   // Normalize status to lowercase for DB convention
   const normalizedStatus = activeCharge.normalizedStatus || (activeCharge.status || "").toString().toLowerCase();
@@ -433,10 +466,29 @@ export async function updateSubscriptionFromCharge(
       status: dbStatus,
       currentPeriodStart: new Date(),
       currentPeriodEnd,
+      // Restore preserved credits and recurring add-ons if within grace period
+      ...(currentSubscription?.cancelledAt && {
+        creditsAddonX2: restoredCreditsAddonX2,
+        experiencesAddon: restoredExperiencesAddon,
+        advancedReportingAddon: restoredAdvancedReporting,
+        // Restore enable dates for monthly billing from enable date
+        experiencesAddonEnabledAt: currentSubscription.preservedExperiencesAddonEnabledAt,
+        advancedReportingEnabledAt: currentSubscription.preservedAdvancedReportingEnabledAt,
+        preservedCreditsAddonX2: 0, // Clear preserved credits after restoration
+        preservedExperiencesAddon: 0, // Clear preserved experiences addon after restoration
+        preservedAdvancedReporting: false, // Clear preserved advanced reporting after restoration
+        preservedExperiencesAddonEnabledAt: null, // Clear preserved enable date after restoration
+        preservedAdvancedReportingEnabledAt: null, // Clear preserved enable date after restoration
+        cancelledAt: null, // Clear cancellation date
+      }),
       // Update plan-specific fields when tier changes
+      // Also reset usage on upgrade (new cycle starts)
+      // creditsAddonX2 persists across upgrades - customers keep their purchased credits
       ...(planTierChanged && {
         creditsIncludedX2: newCreditsIncludedX2,
         experiencesIncluded: newExperiencesIncluded,
+        creditsUsedX2: 0, // Reset usage on plan upgrade (new cycle)
+        // creditsAddonX2 is NOT reset - one-time add-on credits persist until used up
       }),
     },
   });
@@ -448,7 +500,55 @@ export async function updateSubscriptionFromCharge(
     hasUsage: Boolean(usageLineItemGid),
     creditsIncludedX2: planTierChanged ? newCreditsIncludedX2 : undefined,
     experiencesIncluded: planTierChanged ? newExperiencesIncluded : undefined,
+    restoredCreditsAddonX2: restoredCreditsAddonX2 > 0 ? restoredCreditsAddonX2 : undefined,
+    restoredExperiencesAddon: restoredExperiencesAddon > 0 ? restoredExperiencesAddon : undefined,
+    restoredAdvancedReporting: restoredAdvancedReporting ? true : undefined,
   });
+}
+
+/**
+ * Cancel a Shopify subscription
+ * Uses appSubscriptionCancel mutation
+ */
+export async function cancelSubscription(
+  shopDomain: string,
+  subscriptionGid: string,
+  opts?: { admin?: any; accessToken?: string }
+): Promise<{ success: boolean }> {
+  const mutation = `
+    mutation appSubscriptionCancel($id: ID!) {
+      appSubscriptionCancel(id: $id) {
+        appSubscription {
+          id
+          status
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    id: subscriptionGid,
+  };
+
+  const data = await runGraphQL(shopDomain, mutation, variables, opts);
+  const payload = data?.appSubscriptionCancel;
+  const userErrors = payload?.userErrors || [];
+
+  if (userErrors.length > 0) {
+    throw new Error(userErrors[0]?.message || "Failed to cancel subscription");
+  }
+
+  if (!payload?.appSubscription) {
+    throw new Error("Subscription cancellation failed");
+  }
+
+  return {
+    success: true,
+  };
 }
 
 /**

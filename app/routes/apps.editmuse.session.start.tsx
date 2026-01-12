@@ -228,6 +228,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   console.log("[App Proxy] POST /apps/editmuse/session/start");
+  console.log("[App Proxy] Request URL:", request.url);
 
   if (request.method !== "POST") {
     console.log("[App Proxy] Method not allowed:", request.method);
@@ -236,16 +237,28 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const url = new URL(request.url);
   const query = url.searchParams;
+  console.log("[App Proxy] Query params:", {
+    shop: query.get("shop"),
+    signature: query.has("signature") ? "present" : "missing",
+    timestamp: query.get("timestamp"),
+  });
 
   // Parse JSON body early to determine if this is a question-only request
   let body;
   try {
     body = await request.json();
-  } catch {
+  } catch (error) {
+    console.error("[App Proxy] Failed to parse JSON body:", error);
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   const { experienceId, resultCount, answers, clientRequestId } = body;
+  console.log("[App Proxy] Request body:", {
+    experienceId,
+    resultCount,
+    hasAnswers: !!answers,
+    clientRequestId,
+  });
 
   // For question-only requests (no answers), signature validation is optional
   // This allows storefront JavaScript to fetch questions directly
@@ -311,27 +324,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  if (!shopDomain) {
-    if (isQuestionOnlyRequest && experienceId) {
-      // For question-only requests, try one more time to get shop from experience
-      try {
-        const experience = await prisma.experience.findUnique({
-          where: { id: experienceId },
-          include: { shop: true },
-        });
-        if (experience?.shop?.domain) {
-          shopDomain = experience.shop.domain;
-          console.log("[App Proxy] Got shop domain from experience on retry:", shopDomain);
-        }
-      } catch (error) {
-        console.error("[App Proxy] Error fetching experience for shop domain on retry:", error);
+  // For question-only requests without shop domain, get shop from experience first
+  if (!shopDomain && isQuestionOnlyRequest && experienceId) {
+    try {
+      const experienceForShop = await prisma.experience.findUnique({
+        where: { id: experienceId },
+        include: { shop: true },
+      });
+      if (experienceForShop?.shop?.domain) {
+        shopDomain = experienceForShop.shop.domain;
+        console.log("[App Proxy] Got shop domain from experience for question-only request:", shopDomain);
       }
+    } catch (error) {
+      console.error("[App Proxy] Error fetching experience for shop domain:", error);
     }
-    
-    if (!shopDomain) {
-      console.log("[App Proxy] Cannot determine shop domain - returning error");
-      return Response.json({ error: "Cannot determine shop domain. Please provide shop parameter or valid experienceId." }, { status: 400 });
-    }
+  }
+
+  // If we still don't have shop domain, we can't proceed
+  if (!shopDomain) {
+    console.log("[App Proxy] Cannot determine shop domain - returning error");
+    return Response.json({ error: "Cannot determine shop domain. Please provide shop parameter or valid experienceId." }, { status: 400 });
   }
 
   console.log("[App Proxy] Shop domain:", shopDomain);
@@ -339,9 +351,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // Upsert shop (create if doesn't exist, but don't create infinite new shops)
   // At this point shopDomain is guaranteed to be non-null
   const shop = await prisma.shop.upsert({
-    where: { domain: shopDomain! },
+    where: { domain: shopDomain },
     create: {
-      domain: shopDomain!,
+      domain: shopDomain,
       accessToken: "", // Placeholder - should be set via OAuth
     },
     update: {},
@@ -596,6 +608,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   // Answers provided - proceed with session creation and result processing
   console.log("[App Proxy] Answers provided - creating session and processing");
+
+  // Block access if subscription is cancelled or trial expired
+  if (entitlements.planTier === "TRIAL" && !entitlements.showTrialBadge) {
+    // If planTier is TRIAL but trial has expired (showTrialBadge is false), block access
+    return Response.json({
+      ok: false,
+      error: "Subscription required to use EditMuse. Please subscribe via the app admin.",
+      errorCode: "SUBSCRIPTION_REQUIRED",
+    }, { status: 403 });
+  }
 
   // Validate and determine resultCount (must be 8/12/16)
   // Prefer body.resultCount if valid, else experience.resultCount if valid, else 8
@@ -1022,9 +1044,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
 
       if (ai1.rankedHandles?.length) {
-        for (const h of ai1.rankedHandles) used.add(h);
-        finalHandles = [...ai1.rankedHandles];
+        // Filter cached handles against current product availability
+        // This ensures out-of-stock products from cache are excluded
+        const validHandles = ai1.rankedHandles.filter((handle: string) => {
+          const candidate = allCandidates.find(c => c.handle === handle);
+          if (!candidate) {
+            console.log("[App Proxy] Cached handle not found in current candidates:", handle);
+            return false; // Product no longer exists or was filtered out
+          }
+          // If inStockOnly is enabled, filter out unavailable products
+          if (experience.inStockOnly && !candidate.available) {
+            console.log("[App Proxy] Cached handle is out of stock, excluding:", handle);
+            return false;
+          }
+          return true;
+        });
+        
+        for (const h of validHandles) used.add(h);
+        finalHandles = [...validHandles];
         reasoningParts.push(ai1.reasoning);
+        
+        // Log if any cached handles were filtered out
+        if (validHandles.length < ai1.rankedHandles.length) {
+          const filteredCount = ai1.rankedHandles.length - validHandles.length;
+          console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
+        }
       } else {
         // if AI fails completely, we will fallback at the end
         reasoningParts.push("Products selected using default ranking.");
@@ -1052,8 +1096,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         );
 
         if (aiTopUp.rankedHandles?.length) {
+          // Filter cached handles against current product availability
+          const validTopUpHandles = aiTopUp.rankedHandles.filter((handle: string) => {
+            const candidate = allCandidates.find(c => c.handle === handle);
+            if (!candidate) return false;
+            // If inStockOnly is enabled, filter out unavailable products
+            if (experience.inStockOnly && !candidate.available) return false;
+            return true;
+          });
+          
           let added = 0;
-          for (const h of aiTopUp.rankedHandles) {
+          for (const h of validTopUpHandles) {
             if (!used.has(h) && finalHandles.length < targetCount) {
               used.add(h);
               finalHandles.push(h);
@@ -1157,6 +1210,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       console.log("[App Proxy] Results saved, session marked COMPLETE");
 
       // Charge session once for the final result count (prevents duplicate charges from multi-pass AI)
+      // NOTE: Credits are charged regardless of cache hit/miss - you're paying for the ranking service, not the OpenAI API call
       const deliveredCount = productHandles.length;
       if (deliveredCount === 0) {
         console.log("[Billing] Skipping charge: deliveredCount=0");
@@ -1175,6 +1229,42 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             try {
               // Convert x2 units to credits
               const overageCredits = chargeResult.overageCreditsX2Delta / 2;
+              const overageAmountUsd = overageCredits * entitlements.overageRatePerCredit;
+              
+              // Check if overage would exceed cap (best-effort check using cached balanceUsed)
+              // Note: balanceUsed may be stale, but this prevents obvious cap violations
+              const { getActiveCharge } = await import("~/models/shopify-billing.server");
+              try {
+                const activeCharge = await getActiveCharge(shopDomain);
+                if (activeCharge?.usageCapAmountUsd && activeCharge?.usageBalanceUsedUsd !== null) {
+                  const projectedBalance = activeCharge.usageBalanceUsedUsd + overageAmountUsd;
+                  if (projectedBalance > activeCharge.usageCapAmountUsd) {
+                    // Cap would be exceeded - block the request
+                    console.warn("[Billing] Overage charge would exceed cap", {
+                      currentBalance: activeCharge.usageBalanceUsedUsd,
+                      cap: activeCharge.usageCapAmountUsd,
+                      overageAmount: overageAmountUsd,
+                      projected: projectedBalance,
+                    });
+                    // Delete the session results since billing would fail
+                    await saveConciergeResult({
+                      sessionToken,
+                      productHandles: [],
+                      productIds: null,
+                      reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
+                    });
+                    return Response.json({
+                      ok: false,
+                      error: "Your usage cap has been reached. Please contact support or wait for the next billing cycle to continue using EditMuse.",
+                      errorCode: "USAGE_CAP_REACHED",
+                    }, { status: 403 });
+                  }
+                }
+              } catch (capCheckError) {
+                // If cap check fails, proceed anyway (best-effort)
+                console.warn("[Billing] Could not check usage cap, proceeding:", capCheckError);
+              }
+              
               // Note: No admin session in app proxy context - will use offline token fallback
               await createOverageUsageCharge({
                 shopDomain,
@@ -1190,12 +1280,48 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 sid: sessionToken, 
                 err: String(error) 
               });
-              // Never throw - this should not fail the request
+              // If overage charge fails due to cap being reached, return error to user
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              if (errorMessage.includes("capped") || errorMessage.includes("cap") || errorMessage.includes("limit") || errorMessage.includes("exceeded")) {
+                // Delete the session results since billing failed
+                await saveConciergeResult({
+                  sessionToken,
+                  productHandles: [],
+                  productIds: null,
+                  reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
+                });
+                return Response.json({
+                  ok: false,
+                  error: "Your usage cap has been reached. Please contact support or wait for the next billing cycle to continue using EditMuse.",
+                  errorCode: "USAGE_CAP_REACHED",
+                }, { status: 403 });
+              }
+              // Never throw for other overage errors - this should not fail the request
             }
           }
         } catch (error) {
           console.error("[App Proxy] Error charging session:", error);
-          // Don't fail the request if billing fails
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          
+          // If subscription is cancelled or trial expired, return error to user
+          if (errorMessage.includes("cancelled") || errorMessage.includes("subscribe")) {
+            // Delete the session results since billing failed
+            await saveConciergeResult({
+              sessionToken,
+              productHandles: [],
+              productIds: null,
+              reasoning: errorMessage,
+            });
+            return Response.json({
+              ok: false,
+              error: errorMessage,
+              errorCode: "SUBSCRIPTION_REQUIRED",
+            }, { status: 403 });
+          }
+          
+          // For other billing errors, still return success but log the error
+          // (This allows the session to complete even if billing tracking fails)
+          console.warn("[App Proxy] Billing error (non-blocking):", errorMessage);
         }
       }
     } catch (error) {

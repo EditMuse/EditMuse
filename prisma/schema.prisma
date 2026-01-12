@@ -9,7 +9,7 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -157,6 +157,10 @@ model Subscription {
 
   // Add-ons
   advancedReportingAddon Boolean @default(false)
+  
+  // Recurring add-on enable dates (for monthly billing from enable date, not cycle rollover)
+  experiencesAddonEnabledAt    DateTime? // When experiences add-on was first enabled
+  advancedReportingEnabledAt   DateTime? // When advanced reporting was first enabled
 
   // Shopify subscription IDs for usage billing
   shopifySubscriptionGid      String? // AppSubscription gid
@@ -165,6 +169,14 @@ model Subscription {
 
   // Billing cycle anchor
   billingIntervalAnchor DateTime? // when we anchor cycle if Shopify dates missing
+
+  // Cancellation grace period (for preserving unused add-on credits and recurring add-ons)
+  cancelledAt                          DateTime? // when subscription was cancelled
+  preservedCreditsAddonX2             Int      @default(0) // unused add-on credits preserved at cancellation
+  preservedExperiencesAddon           Int      @default(0) // recurring experience pack preserved at cancellation (0, 3, or 10)
+  preservedAdvancedReporting          Boolean @default(false) // recurring advanced reporting preserved at cancellation
+  preservedExperiencesAddonEnabledAt   DateTime? // enable date preserved at cancellation (for monthly billing restoration)
+  preservedAdvancedReportingEnabledAt DateTime? // enable date preserved at cancellation (for monthly billing restoration)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

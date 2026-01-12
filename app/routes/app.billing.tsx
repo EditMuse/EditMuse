@@ -21,10 +21,11 @@ import {
   disableRecurringExperiencePack,
   disableRecurringAdvancedReporting,
   getOrCreateSubscription,
-  chargeRecurringAddonsOnRollover,
+  chargeRecurringAddonsMonthly,
+  markSubscriptionAsCancelled,
   PLANS
 } from "~/models/billing.server";
-import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge } from "~/models/shopify-billing.server";
+import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, cancelSubscription } from "~/models/shopify-billing.server";
 
 type PlanTier = "TRIAL" | "LITE" | "GROWTH" | "SCALE" | "PRO";
 
@@ -68,8 +69,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Ensure subscription exists and handle rollover (this may trigger rollover)
   await getOrCreateSubscription(shop.id);
   
-  // Charge recurring add-ons if rollover just occurred
-  await chargeRecurringAddonsOnRollover(shop.id);
+  // Charge recurring add-ons monthly from their enable date (not cycle rollover)
+  await chargeRecurringAddonsMonthly(shop.id);
 
   const currentPlan = await getCurrentPlan(shop.id);
   const inTrial = await isInTrial(shop.id);
@@ -90,9 +91,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const usageCapAmountUsd = activeCharge?.usageCapAmountUsd ?? null;
 
   // Calculate available plans in the loader (server-side)
-  const availablePlans = Object.values(PLANS).filter(
-    (plan) => plan.tier !== "TRIAL" && plan.tier !== currentPlan.tier
-  );
+  // If cancelled, show all paid plans. Otherwise, show plans above current tier
+  const availablePlans = subscription?.status === "cancelled"
+    ? Object.values(PLANS).filter((plan) => plan.tier !== "TRIAL")
+    : Object.values(PLANS).filter(
+        (plan) => plan.tier !== "TRIAL" && plan.tier !== currentPlan.tier
+      );
 
   // Check for success/error params from redirect
   const approved = url.searchParams.get("approved") === "true";
@@ -207,6 +211,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ error: "Subscription not found. Please upgrade to a paid plan first." }, { status: 400 });
     }
 
+    // Block add-on purchases if subscription is cancelled
+    if (subscription.status === "cancelled") {
+      return json({ 
+        error: "Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons." 
+      }, { status: 400 });
+    }
+
     // Check if shop has an active Shopify subscription (not TRIAL)
     if (subscription.planTier === "TRIAL") {
       return json({ 
@@ -264,17 +275,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }, { status: 400 });
     }
 
-    // Generate cycle key using billing cycle
-    const cycleKey = getBillingCycleKey({
-      currentPeriodStart: subscription?.currentPeriodStart || null,
-      now: new Date(),
-    });
-
     try {
       let usageRecordId: string;
       
       if (addon.type === "one-time") {
         // ONE-TIME credit top-ups: charge immediately, add to creditsAddonX2 (resets each cycle)
+        // Use billing cycle key for one-time add-ons
+        const cycleKey = getBillingCycleKey({
+          currentPeriodStart: subscription?.currentPeriodStart || null,
+          now: new Date(),
+        });
+        
         const result = await purchaseAddonUsageCharge({
           shopDomain: session.shop,
           addonKey: addon.key,
@@ -342,7 +353,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           });
         }
       } else {
-        // RECURRING add-ons: charge for current cycle, persist state for future cycles
+        // RECURRING add-ons: charge immediately when enabled, then monthly from enable date
+        // Use current date as cycle key for initial charge (YYYY-MM-DD format)
+        const now = new Date();
+        const cycleKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        
         const result = await chargeRecurringAddonForCycle({
           shopDomain: session.shop,
           addonKey: addon.key as "exp_3" | "exp_10" | "advanced_reporting",
@@ -437,6 +452,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { shopId: shop.id },
     });
 
+    // Block add-on purchases if subscription is cancelled
+    if (subscription?.status === "cancelled") {
+      return json({ 
+        error: "Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons." 
+      }, { status: 400 });
+    }
+
     // Generate cycle key using billing cycle
     const cycleKey = getBillingCycleKey({
       currentPeriodStart: subscription?.currentPeriodStart || null,
@@ -493,12 +515,51 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  // Cancel subscription
+  if (actionType === "cancel_subscription") {
+    const subscription = await prisma.subscription.findUnique({
+      where: { shopId: shop.id },
+    });
+
+    if (!subscription) {
+      return json({ error: "Subscription not found" });
+    }
+
+    // Can't cancel if already TRIAL
+    if (subscription.planTier === "TRIAL") {
+      return json({ error: "You are already on the free trial plan" });
+    }
+
+    try {
+      // Cancel Shopify subscription if it exists
+      if (subscription.shopifySubscriptionGid) {
+        await cancelSubscription(
+          session.shop,
+          subscription.shopifySubscriptionGid,
+          { admin }
+        );
+      }
+
+      // Mark subscription as cancelled - blocks all access
+      await markSubscriptionAsCancelled(shop.id);
+
+      return json({ 
+        cancelled: true, 
+        message: "Subscription cancelled. You'll need to subscribe again to continue using the service." 
+      });
+    } catch (error) {
+      console.error("[Billing] Error cancelling subscription:", error);
+      const errorMessage = error instanceof Error ? error.message : "Failed to cancel subscription";
+      return json({ error: errorMessage }, { status: 400 });
+    }
+  }
+
   return json({ error: "Invalid action" });
 };
 
 export default function Billing() {
   const { currentPlan, inTrial, usage, entitlements, subscription, experienceCount, shopDomain, availablePlans, approved: loaderApproved, errorParam, usageBalanceUsedUsd, usageCapAmountUsd, currentPeriodEnd } = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>() as { approved?: boolean; addonPurchased?: boolean; usageRecordId?: string; disabled?: string; error?: string; ok?: boolean; confirmationUrl?: string } | undefined;
+  const actionData = useActionData<typeof action>() as { approved?: boolean; addonPurchased?: boolean; usageRecordId?: string; disabled?: string; error?: string; ok?: boolean; confirmationUrl?: string; cancelled?: boolean; message?: string } | undefined;
   const navigation = useNavigation();
   const app = useAppBridge();
   
@@ -536,22 +597,14 @@ export default function Billing() {
   const addonDisabled = actionData?.disabled || null;
   const error = errorParam === "sync_failed" ? "Failed to sync subscription. Please contact support." : (actionData?.error || null);
   
-  // Refresh page after disable action
+  // Refresh page after disable action, add-on purchase, or cancellation
   useEffect(() => {
-    if (addonDisabled) {
-      // Reload to show updated state
-      window.location.reload();
-    }
-  }, [addonDisabled]);
-
-  // Close modal and reload page after successful add-on purchase to show updated data
-  useEffect(() => {
-    if (addonPurchased) {
+    if (addonDisabled || addonPurchased || actionData?.cancelled) {
       closeConfirm();
       // Reload to show updated subscription, entitlements, and add-on state
       window.location.reload();
     }
-  }, [addonPurchased]);
+  }, [addonDisabled, addonPurchased, actionData?.cancelled]);
 
   // Handle confirmationUrl redirect for embedded app using App Bridge
   useEffect(() => {
@@ -628,6 +681,21 @@ export default function Billing() {
           </s-text>
         </div>
       )}
+      {actionData?.cancelled && (
+        <div style={{
+          padding: "1rem",
+          background: "linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(6, 182, 212, 0.1))",
+          border: "2px solid rgba(16, 185, 129, 0.3)",
+          borderRadius: "12px",
+          marginBottom: "1rem",
+          color: "#059669",
+          boxShadow: "0 4px 12px rgba(16, 185, 129, 0.2)"
+        }}>
+          <s-text>
+            {actionData.message || "Subscription cancelled successfully. You've been reverted to the free plan."}
+          </s-text>
+        </div>
+      )}
       {actionData?.error && (
         <div style={{
           padding: "1rem",
@@ -645,6 +713,27 @@ export default function Billing() {
       <s-section>
         <h2 style={{ marginBottom: "1rem" }}>Current Plan</h2>
         
+        {subscription?.status === "cancelled" && (
+          <div style={{
+            padding: "1.5rem",
+            background: "linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(220, 38, 38, 0.1))",
+            border: "2px solid rgba(239, 68, 68, 0.3)",
+            borderRadius: "12px",
+            marginBottom: "2rem",
+            color: "#DC2626",
+            boxShadow: "0 4px 12px rgba(239, 68, 68, 0.2)"
+          }}>
+            <s-text>
+              <strong>Subscription Cancelled</strong>
+            </s-text>
+            <div style={{ marginTop: "0.5rem", color: "#991b1b" }}>
+              <s-paragraph>
+                Your subscription has been cancelled. You no longer have access to EditMuse. Please subscribe to a plan below to continue using the service.
+              </s-paragraph>
+            </div>
+          </div>
+        )}
+        
         <div style={{
           padding: "1.5rem",
           backgroundColor: "#FFFFFF",
@@ -656,6 +745,16 @@ export default function Billing() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div>
               <h3 style={{ margin: 0, fontSize: "1.5rem" }}>{currentPlan.name}</h3>
+              {subscription?.status === "cancelled" && (
+                <div style={{ 
+                  marginTop: "0.5rem", 
+                  color: "#DC2626",
+                  fontSize: "0.875rem",
+                  fontWeight: "500"
+                }}>
+                  Cancelled - No Access
+                </div>
+              )}
               {inTrial && (
                 <div style={{ 
                   marginTop: "0.5rem", 
@@ -686,20 +785,53 @@ export default function Billing() {
               )}
             </div>
             {subscription?.status === "active" && !inTrial && (
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: "0.875rem", color: "#666" }}>Status</div>
-                <div style={{ 
-                  marginTop: "0.25rem",
-                  padding: "0.5rem 1rem",
-                  background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
-                  color: "white",
-                  borderRadius: "12px",
-                  display: "inline-block",
-                  fontWeight: "500",
-                  boxShadow: "0 2px 8px rgba(124, 58, 237, 0.3)"
-                }}>
-                  Active
+              <div style={{ textAlign: "right", display: "flex", flexDirection: "column", gap: "0.75rem", alignItems: "flex-end" }}>
+                <div>
+                  <div style={{ fontSize: "0.875rem", color: "#666" }}>Status</div>
+                  <div style={{ 
+                    marginTop: "0.25rem",
+                    padding: "0.5rem 1rem",
+                    background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                    color: "white",
+                    borderRadius: "12px",
+                    display: "inline-block",
+                    fontWeight: "500",
+                    boxShadow: "0 2px 8px rgba(124, 58, 237, 0.3)"
+                  }}>
+                    Active
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => openConfirm({
+                    actionType: "cancel_subscription",
+                    label: "Cancel Subscription",
+                    priceText: "Free",
+                    note: "Your subscription will be cancelled and you'll lose access to the service. You'll need to subscribe again to continue using EditMuse."
+                  })}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    backgroundColor: "#EF4444",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "8px",
+                    cursor: "pointer",
+                    fontSize: "0.875rem",
+                    fontWeight: "500",
+                    boxShadow: "0 2px 8px rgba(239, 68, 68, 0.3)",
+                    transition: "all 0.2s ease"
+                  }}
+                  onMouseOver={(e) => {
+                    e.currentTarget.style.backgroundColor = "#DC2626";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }}
+                  onMouseOut={(e) => {
+                    e.currentTarget.style.backgroundColor = "#EF4444";
+                    e.currentTarget.style.transform = "translateY(0)";
+                  }}
+                >
+                  Cancel Subscription
+                </button>
               </div>
             )}
           </div>
@@ -889,27 +1021,37 @@ export default function Billing() {
             </div>
             <button
               type="button"
-              onClick={() => openConfirm({
-                actionType: "buy_addon_credits_2000",
-                label: "2,000 Credits top-up",
-                priceText: "$49 (one-time)",
-                note: "This is charged as a usage charge and will appear on your Shopify bill."
-              })}
+              onClick={() => {
+                if (subscription?.status === "cancelled") {
+                  alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
+                  return;
+                }
+                openConfirm({
+                  actionType: "buy_addon_credits_2000",
+                  label: "2,000 Credits top-up",
+                  priceText: "$49 (one-time)",
+                  note: "This is charged as a usage charge and will appear on your Shopify bill."
+                });
+              }}
+              disabled={subscription?.status === "cancelled"}
               style={{
                 width: "100%",
                 padding: "0.75rem",
-                background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                background: subscription?.status === "cancelled"
+                  ? "rgba(11,11,15,0.2)"
+                  : "linear-gradient(135deg, #7C3AED, #06B6D4)",
                 color: "white",
                 border: "none",
                 borderRadius: "12px",
-                cursor: "pointer",
+                cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
                 fontSize: "0.875rem",
                 fontWeight: "500",
-                boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                transition: "all 0.2s ease"
+                boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                transition: "all 0.2s ease",
+                opacity: subscription?.status === "cancelled" ? 0.6 : 1
               }}
             >
-              Purchase
+              {subscription?.status === "cancelled" ? "Subscribe to Purchase" : "Purchase"}
             </button>
           </div>
 
@@ -928,27 +1070,37 @@ export default function Billing() {
             </div>
             <button
               type="button"
-              onClick={() => openConfirm({
-                actionType: "buy_addon_credits_5000",
-                label: "5,000 Credits top-up",
-                priceText: "$99 (one-time)",
-                note: "This is charged as a usage charge and will appear on your Shopify bill."
-              })}
+              onClick={() => {
+                if (subscription?.status === "cancelled") {
+                  alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
+                  return;
+                }
+                openConfirm({
+                  actionType: "buy_addon_credits_5000",
+                  label: "5,000 Credits top-up",
+                  priceText: "$99 (one-time)",
+                  note: "This is charged as a usage charge and will appear on your Shopify bill."
+                });
+              }}
+              disabled={subscription?.status === "cancelled"}
               style={{
                 width: "100%",
                 padding: "0.75rem",
-                background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                background: subscription?.status === "cancelled"
+                  ? "rgba(11,11,15,0.2)"
+                  : "linear-gradient(135deg, #7C3AED, #06B6D4)",
                 color: "white",
                 border: "none",
                 borderRadius: "12px",
-                cursor: "pointer",
+                cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
                 fontSize: "0.875rem",
                 fontWeight: "500",
-                boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                transition: "all 0.2s ease"
+                boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                transition: "all 0.2s ease",
+                opacity: subscription?.status === "cancelled" ? 0.6 : 1
               }}
             >
-              Purchase
+              {subscription?.status === "cancelled" ? "Subscribe to Purchase" : "Purchase"}
             </button>
           </div>
 
@@ -991,27 +1143,37 @@ export default function Billing() {
             ) : (
               <button
                 type="button"
-                onClick={() => openConfirm({
-                  actionType: "buy_addon_exp_3",
-                  label: "+3 Experiences",
-                  priceText: "$15/month",
-                  note: "Renews monthly until disabled. Charged as usage billing."
-                })}
+                onClick={() => {
+                  if (subscription?.status === "cancelled") {
+                    alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
+                    return;
+                  }
+                  openConfirm({
+                    actionType: "buy_addon_exp_3",
+                    label: "+3 Experiences",
+                    priceText: "$15/month",
+                    note: "Renews monthly until disabled. Charged as usage billing."
+                  });
+                }}
+                disabled={subscription?.status === "cancelled"}
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                  background: subscription?.status === "cancelled"
+                    ? "rgba(11,11,15,0.2)"
+                    : "linear-gradient(135deg, #7C3AED, #06B6D4)",
                   color: "white",
                   border: "none",
                   borderRadius: "12px",
-                  cursor: "pointer",
+                  cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
                   fontSize: "0.875rem",
                   fontWeight: "500",
-                  boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                  transition: "all 0.2s ease"
+                  boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                  transition: "all 0.2s ease",
+                  opacity: subscription?.status === "cancelled" ? 0.6 : 1
                 }}
               >
-                Enable
+                {subscription?.status === "cancelled" ? "Subscribe to Enable" : "Enable"}
               </button>
             )}
           </div>
@@ -1054,27 +1216,37 @@ export default function Billing() {
             ) : (
               <button
                 type="button"
-                onClick={() => openConfirm({
-                  actionType: "buy_addon_exp_10",
-                  label: "+10 Experiences",
-                  priceText: "$39/month",
-                  note: "Renews monthly until disabled. Charged as usage billing."
-                })}
+                onClick={() => {
+                  if (subscription?.status === "cancelled") {
+                    alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
+                    return;
+                  }
+                  openConfirm({
+                    actionType: "buy_addon_exp_10",
+                    label: "+10 Experiences",
+                    priceText: "$39/month",
+                    note: "Renews monthly until disabled. Charged as usage billing."
+                  });
+                }}
+                disabled={subscription?.status === "cancelled"}
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                  background: subscription?.status === "cancelled"
+                    ? "rgba(11,11,15,0.2)"
+                    : "linear-gradient(135deg, #7C3AED, #06B6D4)",
                   color: "white",
                   border: "none",
                   borderRadius: "12px",
-                  cursor: "pointer",
+                  cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
                   fontSize: "0.875rem",
                   fontWeight: "500",
-                  boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                  transition: "all 0.2s ease"
+                  boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                  transition: "all 0.2s ease",
+                  opacity: subscription?.status === "cancelled" ? 0.6 : 1
                 }}
               >
-                Enable
+                {subscription?.status === "cancelled" ? "Subscribe to Enable" : "Enable"}
               </button>
             )}
           </div>
@@ -1139,27 +1311,37 @@ export default function Billing() {
               // Not PRO, add-on not active: show Enable
               <button
                 type="button"
-                onClick={() => openConfirm({
-                  actionType: "buy_addon_advanced_reporting",
-                  label: "Advanced Reporting",
-                  priceText: "$29/month",
-                  note: "Renews monthly until disabled. Charged as usage billing."
-                })}
+                onClick={() => {
+                  if (subscription?.status === "cancelled") {
+                    alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
+                    return;
+                  }
+                  openConfirm({
+                    actionType: "buy_addon_advanced_reporting",
+                    label: "Advanced Reporting",
+                    priceText: "$29/month",
+                    note: "Renews monthly until disabled. Charged as usage billing."
+                  });
+                }}
+                disabled={subscription?.status === "cancelled"}
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  background: "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                  background: subscription?.status === "cancelled"
+                    ? "rgba(11,11,15,0.2)"
+                    : "linear-gradient(135deg, #7C3AED, #06B6D4)",
                   color: "white",
                   border: "none",
                   borderRadius: "12px",
-                  cursor: "pointer",
+                  cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
                   fontSize: "0.875rem",
                   fontWeight: "500",
-                  boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                  transition: "all 0.2s ease"
+                  boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                  transition: "all 0.2s ease",
+                  opacity: subscription?.status === "cancelled" ? 0.6 : 1
                 }}
               >
-                Enable
+                {subscription?.status === "cancelled" ? "Subscribe to Enable" : "Enable"}
               </button>
             )}
           </div>
@@ -1189,17 +1371,21 @@ export default function Billing() {
             border: "2px solid rgba(124, 58, 237, 0.2)",
             boxShadow: "0 10px 40px rgba(124, 58, 237, 0.3)"
           }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: 0, marginBottom: "1rem" }}>Confirm Purchase</h3>
+            <h3 style={{ margin: 0, marginBottom: "1rem" }}>
+              {pendingAction.actionType === "cancel_subscription" ? "Cancel Subscription" : "Confirm Purchase"}
+            </h3>
             <s-paragraph>
               <s-text>
                 <strong>{pendingAction.label}</strong>
               </s-text>
             </s-paragraph>
-            <s-paragraph>
-              <s-text>
-                Price: {pendingAction.priceText}
-              </s-text>
-            </s-paragraph>
+            {pendingAction.actionType !== "cancel_subscription" && (
+              <s-paragraph>
+                <s-text>
+                  Price: {pendingAction.priceText}
+                </s-text>
+              </s-paragraph>
+            )}
             <div style={{ color: "#666", fontSize: "0.875rem", marginTop: "0.5rem" }}>
               {pendingAction.note}
             </div>
@@ -1237,7 +1423,7 @@ export default function Billing() {
                   transition: "all 0.2s ease"
                 }}
               >
-                Cancel
+                {pendingAction.actionType === "cancel_subscription" ? "Keep Subscription" : "Cancel"}
               </button>
               <Form method="post">
                 <input type="hidden" name="actionType" value={pendingAction.actionType} />
@@ -1251,19 +1437,27 @@ export default function Billing() {
                     padding: "0.75rem 1.5rem",
                     background: isSubmitting 
                       ? "rgba(11,11,15,0.2)" 
-                      : "linear-gradient(135deg, #7C3AED, #06B6D4)",
+                      : (pendingAction.actionType === "cancel_subscription"
+                          ? "linear-gradient(135deg, #EF4444, #DC2626)"
+                          : "linear-gradient(135deg, #7C3AED, #06B6D4)"),
                     color: "white",
                     border: "none",
                     borderRadius: "12px",
                     cursor: isSubmitting ? "not-allowed" : "pointer",
                     fontSize: "0.875rem",
                     fontWeight: "500",
-                    boxShadow: isSubmitting ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
+                    boxShadow: isSubmitting ? "none" : (pendingAction.actionType === "cancel_subscription"
+                        ? "0 4px 12px rgba(239, 68, 68, 0.3)"
+                        : "0 4px 12px rgba(124, 58, 237, 0.3)"),
                     transition: "all 0.2s ease",
                     opacity: isSubmitting ? 0.7 : 1
                   }}
                 >
-                  {isSubmitting ? "Processing..." : "Confirm Purchase"}
+                  {isSubmitting 
+                    ? "Processing..." 
+                    : (pendingAction.actionType === "cancel_subscription" 
+                        ? "Yes, Cancel Subscription" 
+                        : "Confirm Purchase")}
                 </button>
               </Form>
             </div>

@@ -1833,6 +1833,10 @@
       return this.getAttribute('start-mode') || 'hybrid';
     }
 
+    getChatPlaceholder() {
+      return this.getAttribute('chat-placeholder') || null;
+    }
+
     getButtonLabel() {
       return this.getAttribute('button-label') || 'Start Style Quiz';
     }
@@ -1924,11 +1928,14 @@
       }
       
       // Chat question constants
+      // Get custom placeholder from component attribute, or use default
+      var customChatPlaceholder = this.getChatPlaceholder();
+      var defaultChatPlaceholder = 'Tell us what you need';
       var EM_CHAT_QUESTION = {
         type: 'textarea',
         question: 'Start a chat',
         prompt: 'Start a chat',
-        placeholder: 'Tell us what you need help editing. Include platform, vibe, and any constraints…'
+        placeholder: customChatPlaceholder || defaultChatPlaceholder
       };
       
       var EM_HYBRID_CHAT_QUESTION = {

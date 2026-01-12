@@ -260,11 +260,33 @@ export async function getOrCreateSubscription(shopId: string) {
         newPeriodEnd = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59, 999);
       }
 
+      // Calculate remaining add-on credits after rollover
+      // Credits are consumed in order: first from plan (creditsIncludedX2), then from add-on (creditsAddonX2)
+      // On rollover: plan credits reset to plan amount, add-on credits persist (only unused portion)
+      const prevIncludedX2 = subscription.creditsIncludedX2 || 0;
+      const prevAddonX2 = subscription.creditsAddonX2 || 0;
+      const prevUsedX2 = subscription.creditsUsedX2 || 0;
+      
+      // Calculate how many credits were used from plan vs add-on
+      // Plan credits are consumed first, then add-on credits
+      const usedFromPlanX2 = Math.min(prevUsedX2, prevIncludedX2);
+      const usedFromAddonX2 = Math.max(0, prevUsedX2 - prevIncludedX2);
+      
+      // Remaining add-on credits = original add-on - used from add-on
+      const remainingAddonX2 = Math.max(0, prevAddonX2 - usedFromAddonX2);
+      
+      // New plan credits for this cycle
+      const newCreditsIncludedX2 = creditsToX2(plan.includedCredits);
+      
+      // Preserve only the remaining add-on credits (not all remaining credits)
+      const newCreditsAddonX2 = remainingAddonX2;
+
       await prisma.subscription.update({
         where: { shopId },
         data: {
-          creditsUsedX2: 0,
-          creditsAddonX2: 0, // Reset one-time credit top-ups (do NOT carry over)
+          creditsUsedX2: 0, // Reset usage counter
+          creditsIncludedX2: newCreditsIncludedX2, // Reset to plan amount
+          creditsAddonX2: newCreditsAddonX2, // Adjust to remaining add-on credits
           // experiencesAddon is NOT reset (recurring add-on persists across cycles)
           // advancedReportingAddon is NOT reset (recurring add-on persists across cycles)
           currentPeriodStart: newPeriodStart,
@@ -274,7 +296,8 @@ export async function getOrCreateSubscription(shopId: string) {
       });
 
       subscription.creditsUsedX2 = 0;
-      subscription.creditsAddonX2 = 0;
+      subscription.creditsIncludedX2 = newCreditsIncludedX2;
+      subscription.creditsAddonX2 = newCreditsAddonX2;
       // experiencesAddon and advancedReportingAddon persist (recurring)
       subscription.currentPeriodStart = newPeriodStart;
       subscription.currentPeriodEnd = newPeriodEnd;
@@ -338,9 +361,57 @@ export async function getOrCreateSubscription(shopId: string) {
 
 /**
  * Get entitlements for a shop
+ * Returns zero access if subscription is cancelled
  */
 export async function getEntitlements(shopId: string) {
   const subscription = await getOrCreateSubscription(shopId);
+  
+  // If subscription is cancelled, block all access
+  if (subscription.status === "cancelled") {
+    return {
+      planTier: subscription.planTier,
+      includedCreditsX2: 0,
+      addonCreditsX2: 0,
+      usedCreditsX2: 0,
+      totalCreditsX2: 0,
+      remainingX2: 0,
+      experiencesLimit: 0,
+      candidateCap: 0,
+      canBasicReporting: false,
+      canMidReporting: false,
+      canAdvancedReporting: false,
+      overageRatePerCredit: 0,
+      showTrialBadge: false,
+    };
+  }
+
+  // Check if trial has expired (block access if TRIAL plan but trial ended)
+  if (subscription.planTier === PLAN_TIER.TRIAL) {
+    const shop = await prisma.shop.findUnique({
+      where: { id: shopId },
+      select: { trialEndsAt: true },
+    });
+    
+    if (shop?.trialEndsAt && new Date() >= shop.trialEndsAt) {
+      // Trial expired - block access
+      return {
+        planTier: subscription.planTier,
+        includedCreditsX2: 0,
+        addonCreditsX2: 0,
+        usedCreditsX2: 0,
+        totalCreditsX2: 0,
+        remainingX2: 0,
+        experiencesLimit: 0,
+        candidateCap: 0,
+        canBasicReporting: false,
+        canMidReporting: false,
+        canAdvancedReporting: false,
+        overageRatePerCredit: 0,
+        showTrialBadge: false,
+      };
+    }
+  }
+
   const plan = PLANS[subscription.planTier as PlanTierType] || PLANS[PLAN_TIER.TRIAL];
 
   const includedCreditsX2 = subscription.creditsIncludedX2 || 0;
@@ -570,6 +641,11 @@ export async function chargeConciergeSessionOnce(params: {
       throw new Error(`Subscription not found for shop: ${shopId}`);
     }
 
+    // Block access if subscription is cancelled
+    if (sub.status === "cancelled") {
+      throw new Error("Subscription has been cancelled. Please subscribe to continue using EditMuse.");
+    }
+
     const totalCreditsX2 = (sub.creditsIncludedX2 || 0) + (sub.creditsAddonX2 || 0);
     const prevUsed = sub.creditsUsedX2 || 0;
     const newUsed = prevUsed + burnX2;
@@ -619,7 +695,7 @@ export async function chargeConciergeSessionOnce(params: {
  * Apply add-on to subscription
  * Updates subscription fields based on add-on type
  * 
- * ONE-TIME add-ons (credits): Add to creditsAddonX2 (resets each cycle)
+ * ONE-TIME add-ons (credits): Add to creditsAddonX2 (persists until used up, does NOT reset on cycle rollover)
  * RECURRING add-ons (experiences, reporting): Set persistent state
  */
 export async function applyAddonToSubscription(params: {
@@ -644,7 +720,7 @@ export async function applyAddonToSubscription(params: {
     const updateData: any = {};
 
     switch (addonKey) {
-      // ONE-TIME credit top-ups (reset each cycle)
+      // ONE-TIME credit top-ups (persist until used up, do NOT reset on cycle rollover)
       case "credits_2000":
         updateData.creditsAddonX2 = (sub.creditsAddonX2 || 0) + creditsToX2(2000);
         break;
@@ -685,10 +761,13 @@ export async function setRecurringExperiencePack(params: {
 }): Promise<{ ok: true }> {
   const { shopId, pack } = params;
 
+  const now = new Date();
   await prisma.subscription.update({
     where: { shopId },
     data: {
       experiencesAddon: pack === "NONE" ? 0 : pack === "EXP_3" ? 3 : 10,
+      // Store enable date for monthly billing from enable date (not cycle rollover)
+      experiencesAddonEnabledAt: pack === "NONE" ? null : now,
     },
   });
 
@@ -704,10 +783,13 @@ export async function setRecurringAdvancedReporting(params: {
 }): Promise<{ ok: true }> {
   const { shopId, enabled } = params;
 
+  const now = new Date();
   await prisma.subscription.update({
     where: { shopId },
     data: {
       advancedReportingAddon: enabled,
+      // Store enable date for monthly billing from enable date (not cycle rollover)
+      advancedReportingEnabledAt: enabled ? now : null,
     },
   });
 
@@ -720,7 +802,10 @@ export async function setRecurringAdvancedReporting(params: {
 export async function disableRecurringExperiencePack(shopId: string): Promise<{ ok: true }> {
   await prisma.subscription.update({
     where: { shopId },
-    data: { experiencesAddon: 0 },
+    data: { 
+      experiencesAddon: 0,
+      experiencesAddonEnabledAt: null, // Clear enable date when disabled
+    },
   });
 
   return { ok: true };
@@ -732,18 +817,98 @@ export async function disableRecurringExperiencePack(shopId: string): Promise<{ 
 export async function disableRecurringAdvancedReporting(shopId: string): Promise<{ ok: true }> {
   await prisma.subscription.update({
     where: { shopId },
-    data: { advancedReportingAddon: false },
+    data: { 
+      advancedReportingAddon: false,
+      advancedReportingEnabledAt: null, // Clear enable date when disabled
+    },
   });
 
   return { ok: true };
 }
 
 /**
- * Check if a rollover just occurred and charge recurring add-ons if needed
- * This should be called after getOrCreateSubscription() to charge recurring add-ons on rollover
- * Returns true if rollover was detected and charges were attempted
+ * Mark subscription as cancelled - blocks access until they subscribe again
+ * Does NOT revert to TRIAL - they lose access completely
  */
-export async function chargeRecurringAddonsOnRollover(shopId: string): Promise<boolean> {
+export async function markSubscriptionAsCancelled(shopId: string): Promise<{ ok: true }> {
+  // Get current subscription to calculate unused add-on credits
+  const subscription = await prisma.subscription.findUnique({
+    where: { shopId },
+  });
+
+  if (!subscription) {
+    throw new Error("Subscription not found");
+  }
+
+  // Calculate unused add-on credits (only positive values)
+  // Credits are consumed in order: plan first, then add-on
+  // So we need to calculate how much was used from add-on credits specifically
+  const creditsIncludedX2 = subscription.creditsIncludedX2 || 0;
+  const creditsAddonX2 = subscription.creditsAddonX2 || 0;
+  const creditsUsedX2 = subscription.creditsUsedX2 || 0;
+  
+  // If total used is less than or equal to plan credits, no add-on credits were used
+  // Otherwise, calculate how much was used from add-on credits
+  const usedFromAddonX2 = creditsUsedX2 > creditsIncludedX2 
+    ? creditsUsedX2 - creditsIncludedX2 
+    : 0;
+  
+  // Unused add-on credits = original add-on - used from add-on
+  const unusedAddonCreditsX2 = Math.max(0, creditsAddonX2 - usedFromAddonX2);
+
+  // Preserve recurring add-on state and enable dates for grace period restoration
+  const preservedExperiencesAddon = subscription.experiencesAddon || 0;
+  const preservedAdvancedReporting = subscription.advancedReportingAddon || false;
+  const preservedExperiencesAddonEnabledAt = subscription.experiencesAddonEnabledAt;
+  const preservedAdvancedReportingEnabledAt = subscription.advancedReportingEnabledAt;
+
+  // Mark subscription as cancelled - keep planTier but set status to cancelled
+  // This blocks all access until they subscribe again
+  await prisma.subscription.update({
+    where: { shopId },
+    data: {
+      status: "cancelled", // Mark as cancelled - blocks access
+      creditsAddonX2: 0, // Reset add-on credits (will be restored if resubscribe within grace period)
+      creditsUsedX2: 0, // Reset usage
+      experiencesAddon: 0, // Disable recurring experience packs (will be restored if resubscribe within grace period)
+      advancedReportingAddon: false, // Disable advanced reporting (will be restored if resubscribe within grace period)
+      // Preserve unused add-on credits and recurring add-on state for grace period restoration
+      preservedCreditsAddonX2: unusedAddonCreditsX2,
+      preservedExperiencesAddon: preservedExperiencesAddon,
+      preservedAdvancedReporting: preservedAdvancedReporting,
+      // Preserve enable dates so we can restore monthly billing from enable date
+      preservedExperiencesAddonEnabledAt: preservedExperiencesAddonEnabledAt,
+      preservedAdvancedReportingEnabledAt: preservedAdvancedReportingEnabledAt,
+      experiencesAddonEnabledAt: null, // Clear on cancellation (will be restored from preserved state)
+      advancedReportingEnabledAt: null, // Clear on cancellation (will be restored from preserved state)
+      cancelledAt: new Date(), // Store cancellation timestamp
+      // Clear Shopify subscription IDs (subscription is cancelled)
+      shopifySubscriptionGid: null,
+      shopifyRecurringLineItemGid: null,
+      shopifyUsageLineItemGid: null,
+      // Clear billing period dates (no active subscription)
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+    },
+  });
+
+  console.log("[Billing] Subscription marked as cancelled", {
+    shopId,
+    preservedCredits: unusedAddonCreditsX2 / 2, // Convert X2 to actual credits for logging
+    preservedExperiencesAddon: preservedExperiencesAddon,
+    preservedAdvancedReporting: preservedAdvancedReporting,
+    note: "Access blocked - must subscribe to continue. Unused add-on credits and recurring add-ons preserved for 30-day grace period.",
+  });
+
+  return { ok: true };
+}
+
+/**
+ * Charge recurring add-ons monthly from their enable date (not cycle rollover)
+ * This should be called periodically (e.g., daily cron job or on app access)
+ * Returns true if any charges were attempted
+ */
+export async function chargeRecurringAddonsMonthly(shopId: string): Promise<boolean> {
   // Dynamic import to avoid circular dependency
   const { chargeRecurringAddonForCycle } = await import("./shopify-billing.server");
   
@@ -755,74 +920,132 @@ export async function chargeRecurringAddonsOnRollover(shopId: string): Promise<b
     return false;
   }
 
+  // Don't charge recurring add-ons if subscription is cancelled
+  if (subscription.status === "cancelled") {
+    return false;
+  }
+
   // Get shop domain
   const shop = await prisma.shop.findUnique({
     where: { id: shopId },
     select: { domain: true },
   });
 
-  if (!shop?.domain || !subscription.currentPeriodStart) {
+  if (!shop?.domain) {
     return false;
   }
 
-  // Check if we're in a new cycle (within first day of period)
   const now = new Date();
-  const periodStart = subscription.currentPeriodStart;
-  const daysSincePeriodStart = (now.getTime() - periodStart.getTime()) / (1000 * 60 * 60 * 24);
-
-  // Only charge if we're within the first day of the new period (to avoid duplicate charges)
-  if (daysSincePeriodStart > 1) {
-    return false;
-  }
-
-  const cycleKey = getBillingCycleKey({
-    currentPeriodStart: subscription.currentPeriodStart,
-    now,
-  });
-
   let charged = false;
 
-  // Charge recurring experience pack if enabled
-  if (subscription.experiencesAddon === 3) {
-    try {
-      await chargeRecurringAddonForCycle({
-        shopDomain: shop.domain,
-        addonKey: "exp_3",
-        priceUsd: 15,
-        cycleKey,
-      });
-      charged = true;
-    } catch (error) {
-      console.error("[Billing] Error charging recurring exp_3 on rollover:", error);
+  // Helper function to check if monthly anniversary has passed (same day of month)
+  // NOTE: First charge happens when enabled (in action handler), so we only charge on subsequent months
+  const isMonthlyAnniversary = (enabledAt: Date | null): boolean => {
+    if (!enabledAt) return false;
+    
+    const enabledDate = new Date(enabledAt);
+    const enabledDay = enabledDate.getDate();
+    const enabledMonth = enabledDate.getMonth();
+    const enabledYear = enabledDate.getFullYear();
+    
+    const nowDay = now.getDate();
+    const nowMonth = now.getMonth();
+    const nowYear = now.getFullYear();
+    
+    // Only charge on subsequent months (not the same day when enabled - that's handled in action handler)
+    // Check if we're in a later month and on or past the anniversary day
+    if (nowYear > enabledYear || (nowYear === enabledYear && nowMonth > enabledMonth)) {
+      // We're in a later month, check if we're on or past the anniversary day
+      if (nowDay >= enabledDay) {
+        return true;
+      }
     }
-  } else if (subscription.experiencesAddon === 10) {
-    try {
-      await chargeRecurringAddonForCycle({
-        shopDomain: shop.domain,
-        addonKey: "exp_10",
-        priceUsd: 39,
-        cycleKey,
-      });
-      charged = true;
-    } catch (error) {
-      console.error("[Billing] Error charging recurring exp_10 on rollover:", error);
+    // If same month/year, don't charge (first charge already happened when enabled)
+    
+    return false;
+  };
+
+  // Helper function to get cycle key for monthly billing (current month + enable day)
+  // Uses current month/year + enable day to ensure unique idempotency per month
+  const getMonthlyCycleKey = (enabledAt: Date): string => {
+    const enabledDay = enabledAt.getDate();
+    const nowYear = now.getFullYear();
+    const nowMonth = now.getMonth() + 1;
+    // Format: YYYY-MM-DD where DD is the enable day, MM/YYYY is current month
+    return `${nowYear}-${nowMonth.toString().padStart(2, '0')}-${enabledDay.toString().padStart(2, '0')}`;
+  };
+
+  // Charge recurring experience pack if enabled and monthly anniversary has passed
+  if (subscription.experiencesAddon === 3 && subscription.experiencesAddonEnabledAt) {
+    if (isMonthlyAnniversary(subscription.experiencesAddonEnabledAt)) {
+      try {
+        const cycleKey = getMonthlyCycleKey(subscription.experiencesAddonEnabledAt);
+        await chargeRecurringAddonForCycle({
+          shopDomain: shop.domain,
+          addonKey: "exp_3",
+          priceUsd: 15,
+          cycleKey,
+        });
+        charged = true;
+        console.log("[Billing] Charged recurring exp_3 on monthly anniversary", {
+          shop: shop.domain,
+          enabledAt: subscription.experiencesAddonEnabledAt,
+        });
+      } catch (error) {
+        console.error("[Billing] Error charging recurring exp_3 on monthly anniversary:", error);
+      }
+    }
+  } else if (subscription.experiencesAddon === 10 && subscription.experiencesAddonEnabledAt) {
+    if (isMonthlyAnniversary(subscription.experiencesAddonEnabledAt)) {
+      try {
+        const cycleKey = getMonthlyCycleKey(subscription.experiencesAddonEnabledAt);
+        await chargeRecurringAddonForCycle({
+          shopDomain: shop.domain,
+          addonKey: "exp_10",
+          priceUsd: 39,
+          cycleKey,
+        });
+        charged = true;
+        console.log("[Billing] Charged recurring exp_10 on monthly anniversary", {
+          shop: shop.domain,
+          enabledAt: subscription.experiencesAddonEnabledAt,
+        });
+      } catch (error) {
+        console.error("[Billing] Error charging recurring exp_10 on monthly anniversary:", error);
+      }
     }
   }
 
-  // Charge recurring advanced reporting if enabled
-  if (subscription.advancedReportingAddon === true) {
-    try {
-      await chargeRecurringAddonForCycle({
-        shopDomain: shop.domain,
-        addonKey: "advanced_reporting",
-        priceUsd: 29,
-        cycleKey,
-      });
-      charged = true;
-    } catch (error) {
-      console.error("[Billing] Error charging recurring advanced_reporting on rollover:", error);
+  // Charge recurring advanced reporting if enabled and monthly anniversary has passed
+  if (subscription.advancedReportingAddon === true && subscription.advancedReportingEnabledAt) {
+    if (isMonthlyAnniversary(subscription.advancedReportingEnabledAt)) {
+      try {
+        const cycleKey = getMonthlyCycleKey(subscription.advancedReportingEnabledAt);
+        await chargeRecurringAddonForCycle({
+          shopDomain: shop.domain,
+          addonKey: "advanced_reporting",
+          priceUsd: 29,
+          cycleKey,
+        });
+        charged = true;
+        console.log("[Billing] Charged recurring advanced_reporting on monthly anniversary", {
+          shop: shop.domain,
+          enabledAt: subscription.advancedReportingEnabledAt,
+        });
+      } catch (error) {
+        console.error("[Billing] Error charging recurring advanced_reporting on monthly anniversary:", error);
+      }
     }
   }
 
   return charged;
+}
+
+/**
+ * @deprecated Use chargeRecurringAddonsMonthly instead - charges monthly from enable date, not cycle rollover
+ * Kept for backward compatibility but should not be used
+ */
+export async function chargeRecurringAddonsOnRollover(shopId: string): Promise<boolean> {
+  // No longer charge on rollover - recurring add-ons are charged monthly from enable date
+  return false;
 }
