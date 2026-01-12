@@ -2,6 +2,8 @@
 
 client_id = "7b6c9f6df8b736639e9f5ff3db8ce680"
 name = "EditMuse"
+# TODO: Update with your production URL when you set up new hosting
+# This should match your SHOPIFY_APP_URL environment variable
 application_url = "https://editmuse-production.up.railway.app"
 embedded = true
 
@@ -19,14 +21,39 @@ api_version = "2026-01"
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
 
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create" ]
+  uri = "/webhooks/orders/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "carts/create" ]
+  uri = "/webhooks/carts/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "checkouts/create" ]
+  uri = "/webhooks/checkouts/create"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_app_proxy"
+# Required scopes:
+# - read_products: Required to fetch products from Shopify Admin API (already used in app)
+# - write_products: Already used for product operations
+# - read_orders: Required for orders/create webhook to access order data
+# - write_app_proxy: Required for app proxy to function correctly
+scopes = "read_products,write_products,read_orders,write_app_proxy"
 
 [auth]
+# TODO: Update with your production URL when you set up new hosting
 redirect_urls = [ "https://editmuse-production.up.railway.app" ]
 
 [app_proxy]
-url = "/apps/editmuse"
+# NOTE: With automatically_update_urls_on_dev = true, Shopify CLI will automatically
+# update this URL to your dev tunnel when running `shopify app dev`.
+# The `url` field should be the full URL to your app proxy endpoint.
+# Shopify will proxy requests from {shop}.myshopify.com/{prefix}/{subpath}/* 
+# to the URL specified here.
+# For dev: set to your dev tunnel URL (will be auto-updated by CLI)
+# For production: update this to your production URL
+url = "https://shakira-regulations-compromise-mining.trycloudflare.com/apps/editmuse"
 subpath = "editmuse"
 prefix = "apps"

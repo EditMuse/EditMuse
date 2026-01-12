@@ -50,6 +50,32 @@ export function validateEnv() {
     );
   }
 
+  // Validate OpenAI API key if AI ranking is enabled
+  const featureAIRanking = process.env.FEATURE_AI_RANKING;
+  const aiRankingEnabled = featureAIRanking !== "false" && featureAIRanking !== "0";
+  const openaiKey = process.env.OPENAI_API_KEY;
+  const openaiModel = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  
+  console.log("[ENV] ===== OpenAI Configuration =====");
+  console.log("[ENV] FEATURE_AI_RANKING:", featureAIRanking || "(not set, default: enabled)");
+  console.log("[ENV] OPENAI_API_KEY:", openaiKey ? "SET (length: " + openaiKey.length + ")" : "NOT SET");
+  console.log("[ENV] OPENAI_MODEL:", openaiModel);
+  
+  if (aiRankingEnabled) {
+    if (!openaiKey) {
+      console.warn(
+        "[ENV] ⚠️  WARNING: FEATURE_AI_RANKING is enabled but OPENAI_API_KEY is not set.\n" +
+        "AI ranking will be disabled. Set OPENAI_API_KEY in your .env file to enable."
+      );
+    } else {
+      console.log("[ENV] ✅ OpenAI AI ranking ENABLED");
+      console.log("[ENV] ✅ OpenAI model:", openaiModel);
+    }
+  } else {
+    console.log("[ENV] ❌ AI ranking DISABLED via FEATURE_AI_RANKING");
+  }
+  console.log("[ENV] =====================================");
+
   return {
     appUrl,
     parsedOrigin,

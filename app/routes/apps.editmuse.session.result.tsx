@@ -95,7 +95,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         handle: product.handle,
         title: product.title,
         image: product.image,
-        price: product.price,
+        price: product.price, // Keep for backwards compatibility
+        priceAmount: product.priceAmount || product.price,
+        currencyCode: product.currencyCode || null,
       }));
 
     console.log("[App Proxy] Returning placeholder results:", recommendations.length, "products");

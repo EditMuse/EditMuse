@@ -1,69 +1,419 @@
-{{ 'editmuse-concierge.css' | asset_url | stylesheet_tag }}
-
-<div class="editmuse-concierge-block" 
-     data-editmuse-concierge
-     data-start-mode="{{ block.settings.start_mode | default: 'hybrid' }}"
-     data-result-url="{{ block.settings.result_url | default: '/pages/editmuse-results' }}"
-     data-result-count="{{ block.settings.result_count | default: '8' }}">
-  <button type="button" class="editmuse-concierge-button" data-editmuse-concierge-trigger>
-    {{ block.settings.button_label | default: "Start Style Quiz" }}
-  </button>
+{%- comment -%} V2 Design Tokens {%- endcomment -%}
+{%- liquid
+  # V2 Design Tokens (shared)
+  assign v2_brand_style = block.settings.v2_brand_style | default: 'pop'
   
-  <div class="editmuse-concierge-modal" id="editmuse-concierge-modal-{{ block.id }}" style="display: none;">
-    <div class="editmuse-concierge-modal-overlay"></div>
-    <div class="editmuse-concierge-modal-content">
-      <button type="button" class="editmuse-concierge-modal-close" aria-label="Close">&times;</button>
-      
-      <!-- Guided Quiz Mode -->
-      <div class="editmuse-concierge-steps" data-editmuse-mode="quiz" style="display: none;">
-        <div class="editmuse-concierge-step" data-step="0">
-          <h2 class="editmuse-concierge-step-title" data-editmuse-question-title>What are you looking for?</h2>
-          <div class="editmuse-concierge-input-wrapper">
-            <input type="text" 
-                   class="editmuse-concierge-input" 
-                   data-editmuse-concierge-input
-                   placeholder="Describe what you need..."
-                   required>
-          </div>
-          <div class="editmuse-concierge-error" data-editmuse-concierge-error style="display: none;"></div>
-        </div>
-      </div>
-      
-      <!-- Chat Mode -->
-      <div class="editmuse-concierge-chat" data-editmuse-mode="chat" style="display: none;">
-        <div class="editmuse-concierge-chat-messages" data-editmuse-chat-messages></div>
-        <div class="editmuse-concierge-chat-input-wrapper">
-          <input type="text" 
-                 class="editmuse-concierge-input" 
-                 data-editmuse-chat-input
-                 placeholder="Type your message..."
-                 required>
-          <button type="button" class="editmuse-concierge-nav-btn" data-editmuse-chat-send>Send</button>
-        </div>
-        <div class="editmuse-concierge-error" data-editmuse-chat-error style="display: none;"></div>
-      </div>
-      
-      <div class="editmuse-concierge-navigation" data-editmuse-mode="quiz">
-        <button type="button" class="editmuse-concierge-nav-btn editmuse-concierge-next" data-editmuse-concierge-next>
-          Next
-        </button>
-      </div>
-    </div>
-  </div>
-</div>
+  # Derive advanced settings from brand style
+  case v2_brand_style
+    when 'pop'
+      assign v2_use_gradient = true
+      assign v2_shadow_strength = 'soft'
+      assign v2_option_style = 'pills'
+      assign v2_option_columns = 2
+      assign v2_btn_variant = 'solid'
+    when 'minimal'
+      assign v2_use_gradient = false
+      assign v2_shadow_strength = 'none'
+      assign v2_option_style = 'pills'
+      assign v2_option_columns = 1
+      assign v2_btn_variant = 'outline'
+    when 'luxe'
+      assign v2_use_gradient = false
+      assign v2_shadow_strength = 'medium'
+      assign v2_option_style = 'cards'
+      assign v2_option_columns = 2
+      assign v2_btn_variant = 'solid'
+    else
+      # Default to pop values
+      assign v2_use_gradient = true
+      assign v2_shadow_strength = 'soft'
+      assign v2_option_style = 'pills'
+      assign v2_option_columns = 2
+      assign v2_btn_variant = 'solid'
+  endcase
+  
+  # Locked internal values (not exposed in Theme Editor)
+  assign v2_show_progress = true
+  assign v2_show_close = true
+  assign v2_sticky_nav = true
+  if v2_brand_style == 'minimal'
+    assign v2_sticky_nav = false
+  endif
+  
+  assign v2_accent_color = block.settings.v2_accent_color
+  assign v2_accent_color_2 = block.settings.v2_accent_color_2
+  assign v2_surface_color = block.settings.v2_surface_color
+  assign v2_text_color = block.settings.v2_text_color
+  assign v2_muted_text_color = block.settings.v2_muted_text_color
+  assign v2_muted_text_opacity_percent = block.settings.v2_muted_text_opacity | default: 62
+  assign v2_border_color = block.settings.v2_border_color
+  assign v2_border_opacity_percent = block.settings.v2_border_opacity | default: 12
+  assign v2_radius = block.settings.v2_radius | default: 18
+  assign v2_spacing = block.settings.v2_spacing | default: 16
+  assign v2_font_scale = block.settings.v2_font_scale | default: 102
+  assign v2_modal_z_index = block.settings.v2_modal_z_index | default: 999999
+  assign v2_overlay_opacity_percent = block.settings.v2_overlay_opacity | default: 45
+  assign v2_overlay_opacity = v2_overlay_opacity_percent | times: 1.0 | divided_by: 100.0
+  assign v2_overlay_blur = block.settings.v2_overlay_blur | default: 10
+  assign v2_motion = block.settings.v2_motion | default: 'normal'
+  assign v2_btn_radius = block.settings.v2_btn_radius | default: 14
+  assign v2_btn_size = block.settings.v2_btn_size | default: 'md'
+  assign v2_btn_full_width = block.settings.v2_btn_full_width | default: false
+  assign v2_btn_bg = block.settings.v2_btn_bg
+  assign v2_btn_text = block.settings.v2_btn_text
+  
+  # Concierge-specific V2 settings
+  assign v2_modal_style = block.settings.v2_modal_style | default: 'centered'
+  assign v2_modal_max_width = block.settings.v2_modal_max_width | default: 760
+  assign header_badge_text = block.settings.header_badge_text
+  
+  # Functional settings (keep for app logic)
+  assign experience_id = block.settings.experience_id | default: ''
+  assign start_mode = block.settings.start_mode | default: 'hybrid'
+  assign result_url = block.settings.result_url | default: '/pages/editmuse-results'
+  assign result_count = block.settings.result_count | default: 'auto'
+  assign button_label = block.settings.button_label | default: 'Ask EditMuse'
+  assign primary_cta_text = block.settings.primary_cta_text | default: ''
+  assign open_on_load = block.settings.open_on_load | default: false
+  
+  # Use primary_cta_text if provided, otherwise fall back to button_label
+  if primary_cta_text != blank and primary_cta_text != ''
+    assign final_button_label = primary_cta_text
+  else
+    assign final_button_label = button_label
+  endif
+  
+  # Button background: use v2_btn_bg if provided, otherwise will be handled by JS presets
+  if v2_btn_bg != blank and v2_btn_bg != ''
+    assign final_btn_bg = v2_btn_bg
+  else
+    assign final_btn_bg = ''
+  endif
+-%}
 
-{{ 'editmuse-concierge.js' | asset_url | script_tag }}
+<div {{ block.shopify_attributes }}
+     class="editmuse-concierge-root editmuse-concierge-wrapper{% if v2_motion == 'reduced' %} em-motion--reduced{% endif %}"
+     data-editmuse-concierge
+     data-editmuse-block-id="{{ block.id }}"
+     data-em-brand="{{ v2_brand_style }}"
+     data-em-brand-style="{{ v2_brand_style }}"
+     data-brand-style="{{ v2_brand_style }}"
+     data-v2-brand-style="{{ v2_brand_style }}"
+     data-em-accent-color="{{ v2_accent_color }}"
+     data-em-accent-color-2="{{ v2_accent_color_2 }}"
+     data-em-surface-color="{{ v2_surface_color }}"
+     data-em-text-color="{{ v2_text_color }}"
+     data-em-muted-text-color="{{ v2_muted_text_color }}"
+     data-em-border-color="{{ v2_border_color }}"
+     data-em-radius="{{ v2_radius }}"
+     data-em-spacing="{{ v2_spacing }}"
+     data-em-font-scale="{{ v2_font_scale }}"
+     data-em-shadow-strength="{{ v2_shadow_strength }}"
+     data-em-overlay-opacity="{{ v2_overlay_opacity_percent }}"
+     data-em-overlay-blur="{{ v2_overlay_blur }}"
+     data-em-modal-z="{{ v2_modal_z_index }}"
+     data-em-modal-maxw="{{ v2_modal_max_width }}"
+     data-em-btn-variant="{{ v2_btn_variant }}"
+     data-em-btn-size="{{ v2_btn_size }}"
+     data-em-btn-radius="{{ v2_btn_radius }}"
+     data-em-btn-full-width="{{ v2_btn_full_width }}"
+     data-em-btn-bg="{{ v2_btn_bg }}"
+     data-em-btn-text="{{ v2_btn_text }}"
+     data-em-open-on-load="{{ open_on_load }}"
+     data-em-modal-style="{{ v2_modal_style }}"
+     data-em-option-style="{{ v2_option_style }}"
+     data-em-sticky-nav="{{ v2_sticky_nav }}"
+     data-em-show-progress="{{ v2_show_progress }}"
+     data-em-show-close="{{ v2_show_close }}"
+     data-em-use-gradient="{{ v2_use_gradient }}"
+     data-em-motion="{{ v2_motion }}"
+     data-em-header-badge="{{ header_badge_text | escape }}"
+     style="{% if v2_accent_color != blank %}--em-accent: {{ v2_accent_color }}; {% endif %}{% if v2_accent_color_2 != blank %}--em-accent2: {{ v2_accent_color_2 }}; --em-accent-2: {{ v2_accent_color_2 }}; {% endif %}{% if v2_surface_color != blank %}--em-surface: {{ v2_surface_color }}; {% endif %}{% if v2_text_color != blank %}--em-text: {{ v2_text_color }}; {% endif %}{% if v2_muted_text_color != blank %}--em-muted-color: {{ v2_muted_text_color }}; {% endif %}--em-muted-opacity: {{ v2_muted_text_opacity_percent }}%; {% if v2_border_color != blank %}--em-border-color: {{ v2_border_color }}; {% endif %}--em-border-opacity: {{ v2_border_opacity_percent }}%; --em-radius: {{ v2_radius }}px; --em-spacing: {{ v2_spacing }}px; --em-space: {{ v2_spacing }}px; --em-font-scale: {{ v2_font_scale }}%; --em-shadow: {{ v2_shadow_strength }}; --em-motion: {{ v2_motion }}; --em-gradient-on: {% if v2_use_gradient %}1{% else %}0{% endif %}; --em-overlay-opacity: {{ v2_overlay_opacity }}; --em-overlay-blur: {{ v2_overlay_blur }}px; --em-modal-z: {{ v2_modal_z_index }}; --em-modal-maxw: {{ v2_modal_max_width }}px; --em-btn-variant: {{ v2_btn_variant }}; --em-btn-size: {{ v2_btn_size }}; --em-btn-radius: {{ v2_btn_radius }}px; {% if v2_btn_full_width %}--em-btn-full: true; {% endif %}{% if v2_btn_bg != blank %}--em-btn-bg: {{ v2_btn_bg }}; {% endif %}{% if v2_btn_text != blank %}--em-btn-text: {{ v2_btn_text }}; {% endif %}">
+
+  {{ 'editmuse-concierge.css' | asset_url | stylesheet_tag }}
+
+  <editmuse-concierge
+    id="editmuse-concierge-{{ block.id }}"
+    start-mode="{{ start_mode }}"
+    result-url="{{ result_url }}"
+    {%- if experience_id != blank and experience_id != '' -%}
+    experience-id="{{ experience_id }}"
+    {%- endif -%}
+    {%- if result_count == '8' or result_count == '12' or result_count == '16' -%}
+    result-count="{{ result_count }}"
+    {%- endif -%}
+    button-label="{{ final_button_label }}"
+    open-on-load="{{ open_on_load }}"
+  ></editmuse-concierge>
+
+  {{ 'editmuse-concierge.js' | asset_url | script_tag }}
+</div>
 
 {% schema %}
 {
-  "name": "EditMuse Concierge",
+  "name": "EditMuse Concierge V2",
   "target": "section",
   "settings": [
     {
+      "type": "header",
+      "content": "V2 Design Tokens"
+    },
+    {
+      "type": "select",
+      "id": "v2_brand_style",
+      "label": "Brand Style",
+      "options": [
+        {
+          "value": "pop",
+          "label": "Pop (Gen-Z)"
+        },
+        {
+          "value": "minimal",
+          "label": "Minimal"
+        },
+        {
+          "value": "luxe",
+          "label": "Luxe"
+        }
+      ],
+      "default": "pop"
+    },
+    {
+      "type": "color",
+      "id": "v2_accent_color",
+      "label": "Accent Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "color",
+      "id": "v2_accent_color_2",
+      "label": "Accent Color 2",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "color",
+      "id": "v2_surface_color",
+      "label": "Surface Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "color",
+      "id": "v2_text_color",
+      "label": "Text Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "color",
+      "id": "v2_muted_text_color",
+      "label": "Muted Text Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "range",
+      "id": "v2_muted_text_opacity",
+      "label": "Muted Text Opacity",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "default": 62,
+      "unit": "%",
+      "info": "Controls opacity of Muted Text Color.",
+    },
+    {
+      "type": "color",
+      "id": "v2_border_color",
+      "label": "Border Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "range",
+      "id": "v2_border_opacity",
+      "label": "Border Opacity",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "default": 12,
+      "unit": "%",
+      "info": "Controls opacity of Border Color.",
+    },
+    {
+      "type": "range",
+      "id": "v2_radius",
+      "label": "Border Radius",
+      "min": 0,
+      "max": 32,
+      "step": 1,
+      "default": 18,
+      "unit": "px",
+      "info": "Overrides preset corner radius for button + modal components."
+    },
+    {
+      "type": "range",
+      "id": "v2_spacing",
+      "label": "Spacing",
+      "min": 8,
+      "max": 32,
+      "step": 1,
+      "default": 16,
+      "unit": "px",
+      "info": "Overrides preset spacing scale used for gaps/padding."
+    },
+    {
+      "type": "range",
+      "id": "v2_font_scale",
+      "label": "Font Scale",
+      "min": 90,
+      "max": 120,
+      "step": 1,
+      "default": 102,
+      "unit": "%"
+    },
+    {
+      "type": "number",
+      "id": "v2_modal_z_index",
+      "label": "Modal Z-Index",
+      "default": 999999,
+      "info": "Higher values ensure modal appears above other elements",
+    },
+    {
+      "type": "range",
+      "id": "v2_overlay_opacity",
+      "label": "Overlay Opacity",
+      "min": 0,
+      "max": 90,
+      "step": 5,
+      "default": 45,
+      "unit": "%",
+    },
+    {
+      "type": "range",
+      "id": "v2_overlay_blur",
+      "label": "Overlay Blur",
+      "min": 0,
+      "max": 20,
+      "step": 1,
+      "default": 10,
+      "unit": "px",
+    },
+    {
+      "type": "select",
+      "id": "v2_motion",
+      "label": "Motion",
+      "options": [
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "reduced",
+          "label": "Reduced"
+        }
+      ],
+      "default": "normal",
+    },
+    {
+      "type": "header",
+      "content": "V2 Buttons"
+    },
+    {
+      "type": "range",
+      "id": "v2_btn_radius",
+      "label": "Button Radius",
+      "min": 0,
+      "max": 32,
+      "step": 1,
+      "default": 14,
+      "unit": "px",
+    },
+    {
+      "type": "select",
+      "id": "v2_btn_size",
+      "label": "Button Size",
+      "options": [
+        {
+          "value": "sm",
+          "label": "Small"
+        },
+        {
+          "value": "md",
+          "label": "Medium"
+        },
+        {
+          "value": "lg",
+          "label": "Large"
+        }
+      ],
+      "default": "md",
+    },
+    {
+      "type": "checkbox",
+      "id": "v2_btn_full_width",
+      "label": "Full Width Buttons",
+      "default": false,
+    },
+    {
+      "type": "color",
+      "id": "v2_btn_bg",
+      "label": "Button Background",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "color",
+      "id": "v2_btn_text",
+      "label": "Button Text Color",
+      "info": "Leave blank to use the selected Brand Style preset.",
+    },
+    {
+      "type": "header",
+      "content": "V2 Concierge UX"
+    },
+    {
+      "type": "select",
+      "id": "v2_modal_style",
+      "label": "Modal Style",
+      "options": [
+        {
+          "value": "centered",
+          "label": "Centered"
+        },
+        {
+          "value": "bottom_sheet",
+          "label": "Bottom Sheet"
+        }
+      ],
+      "default": "centered",
+    },
+    {
+      "type": "range",
+      "id": "v2_modal_max_width",
+      "label": "Modal Max Width",
+      "min": 320,
+      "max": 920,
+      "step": 20,
+      "default": 760,
+      "unit": "px",
+    },
+    {
       "type": "text",
-      "id": "button_label",
-      "label": "Button Label",
-      "default": "Start Style Quiz"
+      "id": "header_badge_text",
+      "label": "Header Badge Text",
+      "default": "Curated in 60s • Tap your vibe"
+    },
+    {
+      "type": "text",
+      "id": "primary_cta_text",
+      "label": "Primary CTA Text",
+      "info": "Leave blank to use Button Label"
+    },
+    {
+      "type": "header",
+      "content": "Experience Settings"
+    },
+    {
+      "type": "text",
+      "id": "experience_id",
+      "label": "Experience ID",
+      "info": "Paste the Experience ID from the app admin. Leave blank to use the default experience."
     },
     {
       "type": "select",
@@ -94,13 +444,42 @@
       "info": "URL to redirect to after submitting"
     },
     {
-      "type": "number",
+      "type": "select",
       "id": "result_count",
       "label": "Result Count",
-      "default": 8,
-      "info": "Number of recommendations to return (8, 12, or 16)"
-    }
+      "options": [
+        {
+          "value": "auto",
+          "label": "Auto (use Experience default)"
+        },
+        {
+          "value": "8",
+          "label": "8"
+        },
+        {
+          "value": "12",
+          "label": "12"
+        },
+        {
+          "value": "16",
+          "label": "16"
+        }
+      ],
+      "default": "auto",
+      "info": "Auto uses the Experience default. Choose 8/12/16 to force a fixed count."
+    },
+    {
+      "type": "text",
+      "id": "button_label",
+      "label": "Button Label",
+      "default": "Ask EditMuse"
+    },
+    {
+      "type": "checkbox",
+      "id": "open_on_load",
+      "label": "Open Modal on Page Load",
+      "default": false
+    },
   ]
 }
 {% endschema %}
-

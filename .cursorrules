@@ -6,11 +6,10 @@
 
 The Theme App Extension must have EXACTLY 3 blocks. No more, no less.
 
-## Allowed Block Files (ONLY these 3):
+## Allowed Block Files (ONLY these 2):
 
-1. `extensions/editmuse-concierge/blocks/editmuse_launcher.liquid`
-2. `extensions/editmuse-concierge/blocks/editmuse_concierge.liquid`
-3. `extensions/editmuse-concierge/blocks/editmuse_results.liquid`
+1. `extensions/editmuse-concierge/blocks/editmuse_concierge.liquid`
+2. `extensions/editmuse-concierge/blocks/editmuse_results.liquid`
 
 ## Rules:
 
@@ -21,8 +20,7 @@ The Theme App Extension must have EXACTLY 3 blocks. No more, no less.
 
 ## Block Purposes:
 
-- **editmuse_launcher.liquid**: Button that starts a session and opens the concierge widget
-- **editmuse_concierge.liquid**: Main interactive widget (quiz/chat modes)
+- **editmuse_concierge.liquid**: Main interactive widget (quiz/chat/hybrid modes) with button trigger
 - **editmuse_results.liquid**: Displays product recommendations
 
 ## Enforcement:

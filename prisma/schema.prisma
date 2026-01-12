@@ -10,55 +10,71 @@ generator client {
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "sqlite"
-  url      = "file:dev.sqlite"
+  url      = env("DATABASE_URL")
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
 
+enum PlanTier {
+  TRIAL
+  LITE
+  GROWTH
+  SCALE
+  PRO
+}
+
 model Shop {
-  id          String       @id @default(cuid())
-  domain      String       @unique
-  accessToken String
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  experiences Experience[]
+  id                String             @id @default(cuid())
+  domain            String             @unique
+  accessToken       String
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  experiences       Experience[]
   conciergeSessions ConciergeSession[]
+  subscription      Subscription?
+  trialStartedAt    DateTime?
+  trialEndsAt       DateTime?
+  usageEvents       UsageEvent[]
+  aiRankingCaches   AIRankingCache[]
 }
 
 model Experience {
-  id                String   @id @default(cuid())
-  shopId            String
-  shop              Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  name              String
-  mode              String   // "modal" | "embedded" | "drawer"
-  resultCount       Int      @default(8) // 8 | 12 | 16
-  tone              String?
-  includedCollections String @default("[]") // JSON array of collection IDs
-  excludedTags      String  @default("[]") // JSON array of tag strings
-  inStockOnly       Boolean @default(false)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
-  conciergeSessions ConciergeSession[]
+  id                  String             @id @default(cuid())
+  shopId              String
+  shop                Shop               @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  name                String
+  mode                String // "quiz" | "chat" | "hybrid"
+  resultCount         Int                @default(8) // 8 | 12 | 16
+  tone                String?
+  includedCollections String             @default("[]") // JSON array of collection IDs
+  excludedTags        String             @default("[]") // JSON array of tag strings
+  inStockOnly         Boolean            @default(false)
+  isDefault           Boolean            @default(false)
+  questionsJson       String             @default("[]") // JSON array of question objects
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  conciergeSessions   ConciergeSession[]
 
   @@index([shopId])
+  @@index([shopId, isDefault])
 }
 
 enum ConciergeSessionStatus {
@@ -75,41 +91,120 @@ enum ConciergeRole {
 }
 
 model ConciergeSession {
-  id          String   @id @default(cuid())
-  publicToken String   @unique
-  shopId      String
-  shop        Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  experienceId String?
-  experience  Experience? @relation(fields: [experienceId], references: [id], onDelete: Cascade)
-  status      ConciergeSessionStatus @default(COLLECTING)
-  resultCount Int      @default(8)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  messages    ConciergeMessage[]
-  result      ConciergeResult?
+  id              String                 @id @default(cuid())
+  publicToken     String                 @unique
+  shopId          String
+  shop            Shop                   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  experienceId    String?
+  experience      Experience?            @relation(fields: [experienceId], references: [id], onDelete: Cascade)
+  status          ConciergeSessionStatus @default(COLLECTING)
+  resultCount     Int                    @default(8)
+  answersJson     String                 @default("[]") // JSON array of user answers/messages
+  clientRequestId String?
+  chargedAt       DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  messages        ConciergeMessage[]
+  result          ConciergeResult?
 
+  @@unique([shopId, clientRequestId])
   @@index([shopId])
   @@index([publicToken])
+  @@index([shopId, clientRequestId])
 }
 
 model ConciergeMessage {
-  id        String   @id @default(cuid())
+  id        String           @id @default(cuid())
   sessionId String
   session   ConciergeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  role      ConciergeRole @default(USER)
+  role      ConciergeRole    @default(USER)
   text      String?
   imageUrl  String?
-  createdAt DateTime @default(now())
+  createdAt DateTime         @default(now())
 
   @@index([sessionId])
 }
 
 model ConciergeResult {
-  id            String   @id @default(cuid())
-  sessionId     String   @unique
-  session       ConciergeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  id             String           @id @default(cuid())
+  sessionId      String           @unique
+  session        ConciergeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   productHandles Json
-  productIds    Json?
-  reasoning     String?
+  productIds     Json?
+  reasoning      String?
+  createdAt      DateTime         @default(now())
+}
+
+model Subscription {
+  id                    String    @id @default(cuid())
+  shopId                String    @unique
+  shop                  Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  planTier              PlanTier  @default(TRIAL)
+  shopifySubscriptionId String? // Shopify billing subscription ID
+  shopifyChargeId       String? // Shopify billing charge ID
+  status                String    @default("active") // active, cancelled, expired
+  currentPeriodStart    DateTime?
+  currentPeriodEnd      DateTime?
+
+  // Credits (using x2 multiplier to avoid float drift: 0.5 credit = 1 unit)
+  creditsIncludedX2 Int @default(0)
+  creditsAddonX2    Int @default(0)
+  creditsUsedX2     Int @default(0)
+
+  // Experience limits
+  experiencesIncluded Int @default(0)
+  experiencesAddon    Int @default(0)
+
+  // Add-ons
+  advancedReportingAddon Boolean @default(false)
+
+  // Shopify subscription IDs for usage billing
+  shopifySubscriptionGid      String? // AppSubscription gid
+  shopifyRecurringLineItemGid String? // recurring line item gid
+  shopifyUsageLineItemGid     String? // usage line item gid (needed for appUsageRecordCreate)
+
+  // Billing cycle anchor
+  billingIntervalAnchor DateTime? // when we anchor cycle if Shopify dates missing
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum UsageEventType {
+  SESSION_STARTED
+  AI_RANKING_EXECUTED
+  RESULTS_VIEWED
+  RECOMMENDATION_CLICKED
+  ADD_TO_CART_CLICKED
+}
+
+model UsageEvent {
+  id            String         @id @default(cuid())
+  shopId        String
+  shop          Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  eventType     UsageEventType
+  metadata      String? // JSON metadata (e.g., sessionId, experienceId)
+  creditsBurned Float          @default(0)
+  createdAt     DateTime       @default(now())
+
+  @@index([shopId, createdAt])
+  @@index([shopId, eventType, createdAt])
+}
+
+model AIRankingCache {
+  id            String   @id @default(cuid())
+  cacheKey      String   @unique // Hash of userIntent + product catalog
+  shopId        String
+  shop          Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  userIntent    String   // Normalized user intent for debugging
+  productHash   String // Hash of product handles (for cache key generation)
+  rankedHandles String // Cached ranked handles array (JSON string for SQLite)
+  reasoning     String? // Cached reasoning
+  resultCount   Int // Number of results cached
   createdAt     DateTime @default(now())
+  expiresAt     DateTime // Cache expiration (24-48 hours)
+
+  @@index([shopId, expiresAt])
+  @@index([cacheKey, expiresAt])
+  @@index([expiresAt]) // For cleanup of expired entries
 }

@@ -9,10 +9,14 @@ export async function createConciergeSession({
   shopId,
   experienceId,
   resultCount = 8,
+  answersJson,
+  clientRequestId,
 }: {
   shopId: string;
   experienceId?: string | null;
   resultCount?: number;
+  answersJson?: string;
+  clientRequestId?: string | null;
 }): Promise<string> {
   // Generate a unique public token
   const publicToken = randomBytes(32).toString("base64url");
@@ -24,6 +28,8 @@ export async function createConciergeSession({
       experienceId: experienceId || null,
       status: ConciergeSessionStatus.COLLECTING,
       resultCount,
+      answersJson: answersJson || "[]",
+      clientRequestId: clientRequestId || null,
     },
   });
 

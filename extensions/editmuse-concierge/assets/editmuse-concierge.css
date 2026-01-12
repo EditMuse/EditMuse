@@ -1,57 +1,1492 @@
-/* Launcher Block */
-.editmuse-launcher {
-  text-align: center;
-  padding: 2rem 1rem;
+/* ============================================
+   V2 EditMuse Concierge - Gen-Z Pop Style
+   ============================================ */
+
+/* CSS Variable Defaults */
+:root,
+.editmuse-concierge-root {
+  --em-accent: #7C3AED;
+  --em-text: #0B0B0F;
+  --em-surface: #fff;
+  --em-radius: 18px;
+  --em-spacing: 16px;
+  --em-shadow: soft;
 }
 
-[data-editmuse-launcher-btn] {
-  cursor: pointer;
-  pointer-events: auto;
+/* Spacing alias: ensure --em-space works even if only --em-spacing is set */
+.editmuse-concierge-root,
+.editmuse-concierge-modal {
+  --em-space: var(--em-spacing, 16px);
 }
 
-.editmuse-launcher-button {
-  background-color: #1a1a1a;
-  color: #ffffff;
-  border: 1px solid #1a1a1a;
-  border-radius: 8px;
-  padding: 0.875rem 2rem;
-  font-size: 1rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s ease;
+/* Muted and Border computed aliases: combine color + opacity */
+.editmuse-concierge-wrapper,
+.editmuse-concierge-modal {
+  --em-muted: color-mix(in srgb, var(--em-muted-color, var(--em-text, #0B0B0F)) var(--em-muted-opacity, 62%), transparent);
+  --em-border: color-mix(in srgb, var(--em-border-color, var(--em-text, #0B0B0F)) var(--em-border-opacity, 12%), transparent);
+}
+
+/* ============================================
+   BRAND STYLE PRESETS
+   ============================================ */
+
+.editmuse-concierge-root[data-em-brand="pop"] {
+  --em-accent: #7C3AED;
+  --em-accent2: #06B6D4;
+  --em-surface: #FFFFFF;
+  --em-text: #0B0B0F;
+  --em-radius: 22px;
+  --em-spacing: 16px;
+}
+
+.editmuse-concierge-root[data-em-brand="minimal"] {
+  --em-accent: #111827;
+  --em-accent2: #111827;
+  --em-surface: #FFFFFF;
+  --em-text: #0B0B0F;
+  --em-radius: 14px;
+  --em-spacing: 14px;
+}
+
+.editmuse-concierge-root[data-em-brand="luxe"] {
+  --em-accent: #B68C5A;
+  --em-accent2: #6B1D3B;
+  --em-surface: #FFF8EF;
+  --em-text: #1A0F0A;
+  --em-radius: 18px;
+  --em-spacing: 16px;
+}
+
+/* ============================================
+   BRAND-SPECIFIC MODAL STYLING
+   ============================================ */
+
+.editmuse-concierge-root[data-em-brand="pop"] .editmuse-concierge-modal-content {
+  border: 2px solid var(--em-accent);
+  box-shadow: 0 10px 40px rgba(124, 58, 237, 0.3);
+}
+
+.editmuse-concierge-root[data-em-brand="minimal"] .editmuse-concierge-modal-content {
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  box-shadow: none;
+}
+
+.editmuse-concierge-root[data-em-brand="luxe"] .editmuse-concierge-modal-content {
+  border: 1px solid rgba(182, 140, 90, 0.2);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+}
+
+/* Motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Portal root - singleton container for all modals */
+#editmuse-modal-root {
+  position: fixed;
+  inset: 0;
+  z-index: var(--em-modal-z, 999999);
+  pointer-events: none;
+}
+
+/* Body scroll lock when modal is open */
+html.editmuse-modal-open {
+  overflow: hidden;
+}
+
+html.editmuse-modal-open body {
+  overflow: hidden;
+}
+
+/* ============================================
+   CONCIERGE BLOCK - Trigger Button
+   ============================================ */
+
+.editmuse-concierge-wrapper,
+.editmuse-concierge-root {
   font-family: inherit;
-  min-width: 200px;
 }
 
-.editmuse-launcher-button:hover:not(:disabled) {
-  background-color: #333333;
-  border-color: #333333;
+.editmuse-concierge-button {
+  background: var(--em-accent);
+  color: white;
+  border: none;
+  padding: 1rem 1.5rem;
+  border-radius: var(--em-radius);
+  cursor: pointer;
+  transition: background 0.25s ease;
 }
 
-.editmuse-launcher-button:disabled {
+.editmuse-concierge-button:hover {
+  filter: brightness(1.1);
+}
+
+/* ============================================
+   GRADIENT SWITCH
+   ============================================ */
+
+.editmuse-concierge-root[data-em-use-gradient="true"] .editmuse-concierge-button,
+.editmuse-concierge-root[data-em-use-gradient="true"] .editmuse-navigation [data-editmuse-next],
+.editmuse-concierge-root[data-em-use-gradient="true"] .editmuse-navigation [data-editmuse-submit] {
+  background: linear-gradient(90deg, var(--em-accent), var(--em-accent2));
+}
+
+.editmuse-concierge-root[data-em-use-gradient="false"] .editmuse-concierge-button,
+.editmuse-concierge-root[data-em-use-gradient="false"] .editmuse-navigation [data-editmuse-next],
+.editmuse-concierge-root[data-em-use-gradient="false"] .editmuse-navigation [data-editmuse-submit] {
+  background: var(--em-accent);
+}
+
+/* Motion: reduced */
+.editmuse-concierge-wrapper.em-motion--reduced .editmuse-concierge-button,
+.editmuse-concierge-wrapper.em-motion--reduced *,
+.editmuse-concierge-wrapper.em-motion--reduced *::before,
+.editmuse-concierge-wrapper.em-motion--reduced *::after,
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] .editmuse-concierge-button,
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] *,
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] *::before,
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] *::after {
+  transition: none !important;
+  animation: none !important;
+  transform: none !important;
+}
+
+/* Motion: reduced (portal-safe for modals moved to <body>) */
+.editmuse-concierge-modal.em-motion--reduced,
+.editmuse-concierge-modal.em-motion--reduced *,
+.editmuse-concierge-modal.em-motion--reduced *::before,
+.editmuse-concierge-modal.em-motion--reduced *::after,
+.editmuse-concierge-modal[style*="--em-motion: reduced"],
+.editmuse-concierge-modal[style*="--em-motion: reduced"] *,
+.editmuse-concierge-modal[style*="--em-motion: reduced"] *::before,
+.editmuse-concierge-modal[style*="--em-motion: reduced"] *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* Button size variants */
+.editmuse-concierge-wrapper[style*="--em-btn-size: sm"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-size: sm"] .editmuse-concierge-button {
+  padding: calc(var(--em-space, 16px) * 0.4) calc(var(--em-space, 16px) * 1);
+  font-size: calc(var(--em-font-scale, 102%) * 0.875rem / 100);
+  min-height: 40px;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-size: md"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-size: md"] .editmuse-concierge-button {
+  padding: calc(var(--em-space, 16px) * 0.5) calc(var(--em-space, 16px) * 1.25);
+  min-height: 48px;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-size: lg"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-size: lg"] .editmuse-concierge-button {
+  padding: calc(var(--em-space, 16px) * 0.625) calc(var(--em-space, 16px) * 1.5);
+  font-size: calc(var(--em-font-scale, 102%) * 1.125rem / 100);
+  min-height: 56px;
+}
+
+/* Button variant: solid */
+.editmuse-concierge-wrapper[style*="--em-btn-variant: solid"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-variant: solid"] .editmuse-concierge-button {
+  background: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  color: var(--em-btn-text, #ffffff);
+  border-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+}
+
+/* Gradient support for solid buttons */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"][style*="--em-btn-variant: solid"] .editmuse-concierge-button,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"][style*="--em-btn-variant: solid"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-gradient-on: 1"][style*="--em-btn-variant: solid"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-gradient-on: true"][style*="--em-btn-variant: solid"] .editmuse-concierge-button {
+  background: linear-gradient(135deg, var(--em-accent, #7C3AED), var(--em-accent-2, #06B6D4));
+  border-color: transparent;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-variant: solid"] .editmuse-concierge-button:hover:not(:disabled),
+.editmuse-concierge-root[style*="--em-btn-variant: solid"] .editmuse-concierge-button:hover:not(:disabled) {
+  opacity: 0.95;
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 30%, transparent);
+}
+
+/* Pop brand style: add glow on hover */
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"][style*="--em-btn-variant: solid"] .editmuse-concierge-button:hover:not(:disabled) {
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 40%, transparent),
+              0 0 0 1px color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 20%, transparent);
+}
+
+/* Button variant: outline */
+.editmuse-concierge-wrapper[style*="--em-btn-variant: outline"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-variant: outline"] .editmuse-concierge-button {
+  background: transparent;
+  color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  border-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  border-width: 2px;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-variant: outline"] .editmuse-concierge-button:hover:not(:disabled),
+.editmuse-concierge-root[style*="--em-btn-variant: outline"] .editmuse-concierge-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 10%, transparent);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 20%, transparent);
+}
+
+/* Button variant: glass */
+.editmuse-concierge-wrapper[style*="--em-btn-variant: glass"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-variant: glass"] .editmuse-concierge-button {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-variant: glass"] .editmuse-concierge-button:hover:not(:disabled),
+.editmuse-concierge-root[style*="--em-btn-variant: glass"] .editmuse-concierge-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.9);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+/* Full width */
+.editmuse-concierge-wrapper[style*="--em-btn-full: true"] .editmuse-concierge-button,
+.editmuse-concierge-root[style*="--em-btn-full: true"] .editmuse-concierge-button,
+.editmuse-concierge-button.em-btn--full {
+  width: 100%;
+  min-width: auto;
+}
+
+/* ============================================
+   BRAND STYLE POLISH
+   ============================================ */
+
+/* POP: punchy glow */
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-concierge-button,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-concierge-button {
+  box-shadow: 0 14px 34px color-mix(in srgb, var(--em-accent2) 35%, transparent);
+}
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-concierge-button:hover,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-concierge-button:hover {
+  transform: translateY(-1px);
+}
+
+/* MINIMAL: flat + crisp */
+.editmuse-concierge-wrapper[data-v2-brand-style="minimal"] .editmuse-concierge-button,
+.editmuse-concierge-wrapper[data-em-brand-style="minimal"] .editmuse-concierge-button {
+  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--em-accent) 18%, transparent);
+}
+
+/* LUXE: refined border + subtle shadow */
+.editmuse-concierge-wrapper[data-v2-brand-style="luxe"] .editmuse-concierge-button,
+.editmuse-concierge-wrapper[data-em-brand-style="luxe"] .editmuse-concierge-button {
+  border: 1px solid color-mix(in srgb, var(--em-accent2) 55%, transparent);
+  box-shadow: 0 10px 26px rgba(0,0,0,.12);
+  letter-spacing: 0.2px;
+  font-weight: 600;
+}
+
+.editmuse-concierge-button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+  transform: none !important;
 }
 
-/* Results Block */
+.editmuse-concierge-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent);
+}
+
+/* ============================================
+   MODAL - Portal System
+   ============================================ */
+
+.editmuse-concierge-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  display: none;
+}
+
+.editmuse-concierge-modal.show {
+  display: flex;
+}
+
+/* ============================================
+   MODAL STYLE (Centered vs Bottom Sheet)
+   ============================================ */
+
+.editmuse-concierge-root[data-em-modal-style="centered"] .editmuse-concierge-modal.show {
+  align-items: center;
+  justify-content: center;
+}
+
+.editmuse-concierge-root[data-em-modal-style="bottom_sheet"] .editmuse-concierge-modal.show,
+.editmuse-concierge-root[data-em-modal-style="bottom"] .editmuse-concierge-modal.show {
+  align-items: flex-end;
+  justify-content: center;
+}
+
+/* Portal-safe modal alignment (when modal is moved to body) */
+.editmuse-concierge-modal.em-modal-centered.show {
+  align-items: center;
+  justify-content: center;
+}
+
+.editmuse-concierge-modal.em-modal-bottom_sheet.show,
+.editmuse-concierge-modal.em-modal-sheet.show {
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.editmuse-concierge-root[data-em-modal-style="bottom_sheet"] .editmuse-concierge-modal-content,
+.editmuse-concierge-root[data-em-modal-style="bottom"] .editmuse-concierge-modal-content {
+  width: min(100%, 760px);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-top-left-radius: var(--em-radius);
+  border-top-right-radius: var(--em-radius);
+  margin-bottom: 0;
+}
+
+.editmuse-concierge-modal-content {
+  background: var(--em-surface);
+  color: var(--em-text);
+  border-radius: var(--em-radius);
+  width: min(90%, 700px);
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+}
+
+/* ============================================
+   BRAND STYLE MODAL PANEL POLISH
+   ============================================ */
+
+/* POP modal vibe */
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-concierge-modal-content,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-concierge-modal-content {
+  box-shadow: 0 24px 70px color-mix(in srgb, var(--em-accent2) 18%, transparent);
+}
+
+/* MINIMAL modal vibe */
+.editmuse-concierge-wrapper[data-v2-brand-style="minimal"] .editmuse-concierge-modal-content,
+.editmuse-concierge-wrapper[data-em-brand-style="minimal"] .editmuse-concierge-modal-content {
+  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--em-accent) 14%, transparent);
+}
+
+/* LUXE modal vibe */
+.editmuse-concierge-wrapper[data-v2-brand-style="luxe"] .editmuse-concierge-modal-content,
+.editmuse-concierge-wrapper[data-em-brand-style="luxe"] .editmuse-concierge-modal-content {
+  border: 1px solid color-mix(in srgb, var(--em-accent2) 45%, transparent);
+  box-shadow: 0 18px 50px rgba(0,0,0,.16);
+  position: relative;
+  overflow: hidden;
+}
+.editmuse-concierge-wrapper[data-v2-brand-style="luxe"] .editmuse-concierge-modal-content::before,
+.editmuse-concierge-wrapper[data-em-brand-style="luxe"] .editmuse-concierge-modal-content::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--em-accent2) 10%, transparent),
+    transparent 55%);
+  pointer-events: none;
+}
+
+/* Motion: reduced */
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] .editmuse-concierge-modal {
+  transition: none !important;
+}
+
+.editmuse-concierge-wrapper[style*="--em-motion: reduced"] .editmuse-concierge-modal.show {
+  transition: none !important;
+}
+
+/* Overlay - reads opacity and blur from modal CSS variables */
+.editmuse-concierge-modal-overlay,
+.editmuse-concierge-overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, var(--em-overlay-opacity, 0.45));
+  backdrop-filter: blur(var(--em-overlay-blur, 10px));
+  -webkit-backdrop-filter: blur(var(--em-overlay-blur, 10px));
+  pointer-events: auto;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: calc(var(--em-modal-z, 999999) + 1);
+}
+
+/* Ensure overlay inherits variables from parent modal */
+.editmuse-concierge-modal .editmuse-concierge-modal-overlay {
+  background-color: rgba(0, 0, 0, var(--em-overlay-opacity, 0.45));
+  backdrop-filter: blur(var(--em-overlay-blur, 10px));
+  -webkit-backdrop-filter: blur(var(--em-overlay-blur, 10px));
+}
+
+.editmuse-concierge-modal.show .editmuse-concierge-modal-overlay {
+  opacity: 1;
+}
+
+/* Modal Content */
+.editmuse-concierge-modal-content {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(0.96);
+  background: var(--em-surface, #ffffff);
+  color: var(--em-text, #0b0b0f);
+  border-radius: var(--em-radius, 18px);
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  padding: 0;
+  max-width: var(--em-modal-maxw, 760px);
+  width: 100%;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  font-family: inherit;
+  overflow: hidden;
+  pointer-events: auto;
+  z-index: calc(var(--em-modal-z, 999999) + 1);
+  opacity: 0;
+  transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), 
+              transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.24), 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+/* Shadow strength variations - class-based for portaled modals */
+.editmuse-concierge-wrapper[style*="--em-shadow: soft"] .editmuse-concierge-modal-content,
+.editmuse-concierge-root[style*="--em-shadow: soft"] .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-shadow-soft .editmuse-concierge-modal-content {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+
+.editmuse-concierge-wrapper[style*="--em-shadow: medium"] .editmuse-concierge-modal-content,
+.editmuse-concierge-root[style*="--em-shadow: medium"] .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-shadow-medium .editmuse-concierge-modal-content {
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+.editmuse-concierge-wrapper[style*="--em-shadow: strong"] .editmuse-concierge-modal-content,
+.editmuse-concierge-root[style*="--em-shadow: strong"] .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-shadow-strong .editmuse-concierge-modal-content {
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.24), 0 0 0 1px rgba(0, 0, 0, 0.1);
+}
+
+.editmuse-concierge-wrapper[style*="--em-shadow: none"] .editmuse-concierge-modal-content,
+.editmuse-concierge-root[style*="--em-shadow: none"] .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-shadow-none .editmuse-concierge-modal-content {
+  box-shadow: none;
+}
+
+/* Brand Style: Pop (Gen-Z) - bigger radius (20-22px), stronger shadow, higher font scale, accent-filled button, gradient */
+.editmuse-concierge-block.em-style-pop .editmuse-concierge-modal-content,
+.em-style-pop .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-style-pop {
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.32), 
+              0 0 0 1px rgba(255, 255, 255, 0.6),
+              0 0 40px color-mix(in srgb, var(--em-accent, #7C3AED) 35%, transparent) !important;
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+
+.editmuse-concierge-block.em-style-pop .em-modal-title,
+.em-style-pop .em-modal-title,
+.editmuse-concierge-modal.em-style-pop .em-modal-title {
+  font-weight: 700 !important;
+  letter-spacing: -0.04em;
+  line-height: 1.2;
+}
+
+.editmuse-concierge-block.em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+/* Pop style: gradient next button (only when gradient is enabled) */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-root[style*="--em-gradient-on: 1"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-root[style*="--em-gradient-on: true"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-modal[style*="--em-gradient-on: 1"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-modal[style*="--em-gradient-on: true"].em-style-pop .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background: linear-gradient(135deg, var(--em-accent, #7C3AED), var(--em-accent2, #06B6D4)) !important;
+  box-shadow: 0 12px 32px color-mix(in srgb, var(--em-accent, #7C3AED) 50%, transparent) !important;
+  font-weight: 600 !important;
+  padding: 14px 28px !important;
+  border: none !important;
+}
+
+/* Pop style: gradient header accent (only when gradient is enabled) */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"].em-style-pop .editmuse-concierge-modal .em-modal-header,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"].em-style-pop .editmuse-concierge-modal .em-modal-header,
+.editmuse-concierge-root[style*="--em-gradient-on: 1"].em-style-pop .editmuse-concierge-modal .em-modal-header,
+.editmuse-concierge-root[style*="--em-gradient-on: true"].em-style-pop .editmuse-concierge-modal .em-modal-header,
+.editmuse-concierge-modal[style*="--em-gradient-on: 1"].em-style-pop .em-modal-header,
+.editmuse-concierge-modal[style*="--em-gradient-on: true"].em-style-pop .em-modal-header {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--em-accent, #7C3AED) 5%, transparent), color-mix(in srgb, var(--em-accent2, #06B6D4) 3%, transparent));
+  border-radius: 22px 22px 0 0;
+}
+
+.editmuse-concierge-block.em-style-pop .editmuse-option-pill:hover,
+.em-style-pop .editmuse-option-pill:hover,
+.editmuse-concierge-modal.em-style-pop .editmuse-option-pill:hover {
+  transform: translateY(-4px) scale(1.03);
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--em-accent, #7C3AED) 25%, transparent);
+}
+
+/* Brand Style: Minimal - radius 10-12px, minimal shadow or none, thin borders, neutral button */
+.editmuse-concierge-block.em-style-minimal .editmuse-concierge-modal-content,
+.em-style-minimal .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-style-minimal {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12)) !important;
+}
+
+
+.editmuse-concierge-block.em-style-minimal .em-modal-title,
+.em-style-minimal .em-modal-title,
+.editmuse-concierge-modal.em-style-minimal .em-modal-title {
+  font-weight: 500 !important;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+
+.editmuse-concierge-block.em-style-minimal .editmuse-concierge-button,
+.em-style-minimal .editmuse-concierge-button,
+.editmuse-concierge-modal.em-style-minimal .editmuse-concierge-button {
+  box-shadow: none;
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+}
+
+.editmuse-concierge-block.em-style-minimal .editmuse-option-pill,
+.em-style-minimal .editmuse-option-pill,
+.editmuse-concierge-modal.em-style-minimal .editmuse-option-pill {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+}
+
+.editmuse-concierge-block.em-style-minimal .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.em-style-minimal .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-modal.em-style-minimal .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  box-shadow: none !important;
+  border: 1.5px solid var(--em-accent, #7C3AED) !important;
+  background: var(--em-accent, #7C3AED) !important;
+  font-weight: 500 !important;
+  padding: 12px 24px !important;
+}
+
+/* Brand Style: Luxe - radius 16px, soft shadow, more spacing, elegant button (outline or subtle fill), refined typography */
+.editmuse-concierge-block.em-style-luxe .editmuse-concierge-modal-content,
+.em-style-luxe .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-style-luxe {
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15),
+              0 0 0 1px rgba(0, 0, 0, 0.05) !important;
+  background: color-mix(in srgb, var(--em-surface, #ffffff) 98%, #000000) !important;
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12)) !important;
+}
+
+
+.editmuse-concierge-block.em-style-luxe .em-modal-title,
+.em-style-luxe .em-modal-title,
+.editmuse-concierge-modal.em-style-luxe .em-modal-title {
+  font-weight: 600 !important;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  margin-bottom: 24px !important;
+}
+
+.editmuse-concierge-block.em-style-luxe .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.em-style-luxe .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-modal.em-style-luxe .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--em-accent, #7C3AED) 20%, transparent) !important;
+  padding: 13px 26px !important;
+  font-weight: 500 !important;
+  background: var(--em-accent, #7C3AED) !important;
+  border: 1px solid var(--em-accent, #7C3AED) !important;
+  transition: all 0.2s ease !important;
+}
+
+.editmuse-concierge-modal.em-style-luxe .editmuse-concierge-nav-btn.editmuse-concierge-next:hover {
+  background: color-mix(in srgb, var(--em-accent, #7C3AED) 90%, white) !important;
+  transform: translateY(-1px);
+}
+
+.editmuse-concierge-modal.show .editmuse-concierge-modal-content {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Modal Style: Centered - modal centered with max-width, overlay */
+.editmuse-concierge-block.em-modal-centered .editmuse-concierge-modal-content,
+.em-modal-centered .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-centered .editmuse-concierge-modal-content {
+  margin: auto;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.96);
+  position: absolute;
+  max-width: var(--em-modal-maxw, 760px);
+  width: calc(100% - calc(var(--em-space, 16px) * 2));
+}
+
+.editmuse-concierge-block.em-modal-centered .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.em-modal-centered .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-centered.show .editmuse-concierge-modal-content {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Modal Style: Bottom Sheet - fixed bottom, rounded top corners, mobile-first */
+.editmuse-concierge-block.em-modal-sheet .editmuse-concierge-modal-content,
+.editmuse-concierge-block.em-modal-bottom_sheet .editmuse-concierge-modal-content,
+.em-modal-sheet .editmuse-concierge-modal-content,
+.em-modal-bottom_sheet .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-sheet .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-bottom_sheet .editmuse-concierge-modal-content {
+  margin: 0;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  transform: translateY(100%);
+  width: 100%;
+  max-width: var(--em-modal-maxw, 760px);
+  margin-left: auto;
+  margin-right: auto;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-top-left-radius: var(--em-radius, 18px);
+  border-top-right-radius: var(--em-radius, 18px);
+  max-height: 90vh;
+  overflow-y: auto;
+  top: auto;
+}
+
+.editmuse-concierge-block.em-modal-sheet .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.editmuse-concierge-block.em-modal-bottom_sheet .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.em-modal-sheet .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.em-modal-bottom_sheet .editmuse-concierge-modal.show .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-sheet.show .editmuse-concierge-modal-content,
+.editmuse-concierge-modal.em-modal-bottom_sheet.show .editmuse-concierge-modal-content {
+  transform: translateY(0);
+}
+
+/* Mobile: always bottom sheet */
+@media (max-width: 640px) {
+  .editmuse-concierge-modal-content {
+    max-width: 100%;
+    border-radius: var(--em-radius, 18px) var(--em-radius, 18px) 0 0;
+    max-height: 85vh;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    transform: translateY(100%);
+  }
+  
+  .editmuse-concierge-modal.show .editmuse-concierge-modal-content {
+    transform: translateY(0);
+  }
+}
+
+/* ============================================
+   MODAL HEADER
+   ============================================ */
+
+.em-modal-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(var(--em-space, 16px) * 0.5);
+  padding: calc(var(--em-space, 16px) * 1.25) calc(var(--em-space, 16px) * 1.25) calc(var(--em-space, 16px) * 1);
+  border-bottom: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  flex-shrink: 0;
+  background: var(--em-surface, #ffffff);
+  position: relative;
+}
+
+.em-modal-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.em-modal-title {
+  font-size: calc(var(--em-font-scale, 102%) * 1.25rem / 100);
+  font-weight: 600;
+  color: var(--em-text, #0B0B0F);
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+
+/* Header Badge */
+.em-modal-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--em-space, 16px) * 0.375);
+  padding: calc(var(--em-space, 16px) * 0.25) calc(var(--em-space, 16px) * 0.625);
+  background: color-mix(in srgb, var(--em-surface, #ffffff) 80%, transparent);
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  border-radius: calc(var(--em-radius, 18px) * 0.5);
+  font-size: calc(var(--em-font-scale, 102%) * 0.75rem / 100);
+  font-weight: 500;
+  color: var(--em-muted, rgba(11,11,15,0.62));
+  letter-spacing: 0.01em;
+}
+
+.em-modal-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--em-accent, #7C3AED);
+  flex-shrink: 0;
+}
+
+/* Gradient badge dot */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"] .em-modal-badge::before,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"] .em-modal-badge::before,
+.editmuse-concierge-root[style*="--em-gradient-on: 1"] .em-modal-badge::before,
+.editmuse-concierge-root[style*="--em-gradient-on: true"] .em-modal-badge::before,
+.editmuse-concierge-modal[style*="--em-gradient-on: 1"] .em-modal-badge::before,
+.editmuse-concierge-modal[style*="--em-gradient-on: true"] .em-modal-badge::before {
+  background: linear-gradient(135deg, var(--em-accent, #7C3AED), var(--em-accent-2, #06B6D4));
+}
+
+.editmuse-concierge-modal-close {
+  background: none;
+  border: none;
+  font-size: 1.75rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--em-text, #0B0B0F);
+  opacity: 0.6;
+  padding: calc(var(--em-space, 16px) * 0.25);
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: calc(var(--em-radius, 18px) * 0.2);
+  transition: all 0.2s ease;
+  margin: calc(var(--em-space, 16px) * -0.25);
+}
+
+.editmuse-concierge-modal-close:hover {
+  background-color: color-mix(in srgb, var(--em-text, #0B0B0F) 8%, transparent);
+  opacity: 1;
+}
+
+.editmuse-concierge-modal-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent);
+}
+
+/* Hide close button if disabled */
+[data-em-root][data-em-show-close="false"] .editmuse-concierge-modal-close,
+.editmuse-concierge-wrapper[data-em-show-close="false"] .editmuse-concierge-modal-close,
+.editmuse-concierge-root[data-em-show-close="false"] .editmuse-concierge-modal-close,
+.editmuse-concierge-modal[data-em-show-close="false"] .editmuse-concierge-modal-close,
+.editmuse-concierge-root[data-em-show-close="false"] .editmuse-close {
+  display: none !important;
+  pointer-events: none;
+}
+
+/* ============================================
+   PROGRESS BAR
+   ============================================ */
+
+.em-progress {
+  width: 100%;
+  height: 3px;
+  background-color: color-mix(in srgb, var(--em-border, rgba(11,11,15,0.12)) 40%, transparent);
+  flex-shrink: 0;
+  overflow: hidden;
+  display: block;
+}
+
+/* Hide progress bar if disabled */
+[data-em-root][data-em-show-progress="false"] .editmuse-progress,
+[data-em-root][data-em-show-progress="false"] .em-progress,
+.editmuse-concierge-wrapper[data-em-show-progress="false"] .em-progress,
+.editmuse-concierge-root[data-em-show-progress="false"] .em-progress,
+.editmuse-concierge-modal[data-em-show-progress="false"] .em-progress,
+.editmuse-concierge-root[data-em-show-progress="false"] [data-editmuse-progress] {
+  display: none !important;
+}
+
+/* ============================================
+   PROGRESS BAR STYLING
+   ============================================ */
+
+.editmuse-progress,
+[data-editmuse-progress] {
+  width: 100%;
+  height: 6px;
+  background-color: rgba(0, 0, 0, 0.1);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 0;
+}
+
+.editmuse-progress__bar,
+[data-editmuse-progress-bar] {
+  height: 100%;
+  background: var(--em-accent);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.editmuse-concierge-root[data-em-use-gradient="true"] .editmuse-progress__bar,
+.editmuse-concierge-root[data-em-use-gradient="true"] [data-editmuse-progress-bar] {
+  background: linear-gradient(90deg, var(--em-accent), var(--em-accent2));
+}
+
+.em-progress[aria-hidden="true"] {
+  display: none;
+}
+
+.em-progress-bar {
+  height: 100%;
+  background: var(--em-accent, #7C3AED);
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  width: calc(var(--em-progress, 0) * 100%);
+}
+
+/* Gradient progress bar */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"] .em-progress-bar,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"] .em-progress-bar,
+.editmuse-concierge-root[style*="--em-gradient-on: 1"] .em-progress-bar,
+.editmuse-concierge-root[style*="--em-gradient-on: true"] .em-progress-bar,
+.editmuse-concierge-modal[style*="--em-gradient-on: 1"] .em-progress-bar,
+.editmuse-concierge-modal[style*="--em-gradient-on: true"] .em-progress-bar {
+  background: linear-gradient(90deg, var(--em-accent, #7C3AED), var(--em-accent-2, #06B6D4));
+}
+
+/* Pop brand style: add glow */
+.editmuse-concierge-wrapper.em-style--pop .em-progress-bar,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .em-progress-bar,
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .em-progress-bar {
+  box-shadow: 0 0 8px color-mix(in srgb, var(--em-accent, #7C3AED) 40%, transparent);
+}
+
+/* ============================================
+   CONTENT AREA (Scroll Container)
+   ============================================ */
+
+.em-modal-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+  position: relative;
+  z-index: auto;
+}
+
+.em-modal-content-area {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: calc(var(--em-space, 16px) * 1.25);
+  padding-bottom: calc(var(--em-space, 16px) * 1.5);
+  max-height: calc(80vh - 200px);
+  scrollbar-width: thin;
+  scrollbar-color: var(--em-border, rgba(11,11,15,0.12)) transparent;
+  position: relative;
+  z-index: auto;
+}
+
+/* Ensure option containers don't overlap nav */
+.editmuse-option-pills {
+  position: static;
+  z-index: auto;
+}
+
+.editmuse-concierge-input-wrapper {
+  position: static;
+  z-index: auto;
+}
+
+.em-modal-content-area::-webkit-scrollbar {
+  width: 6px;
+}
+
+.em-modal-content-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.em-modal-content-area::-webkit-scrollbar-thumb {
+  background-color: var(--em-border, rgba(11,11,15,0.12));
+  border-radius: 3px;
+}
+
+.em-modal-content-area::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--em-border, rgba(11,11,15,0.12)) 80%, var(--em-accent, #7C3AED));
+}
+
+@media (max-width: 640px) {
+  .em-modal-content-area {
+    padding: calc(var(--em-space, 16px) * 1);
+  }
+}
+
+.editmuse-concierge-step-title {
+  margin: 0 0 calc(var(--em-space, 16px) * 1) 0;
+  font-weight: 600;
+  color: var(--em-text, #0B0B0F);
+  text-align: left;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  font-size: calc(var(--em-font-scale, 102%) * 1.5rem / 100);
+}
+
+.editmuse-concierge-step-helper {
+  margin: 0 0 calc(var(--em-space, 16px) * 1) 0;
+  font-size: calc(var(--em-font-scale, 102%) * 0.875rem / 100);
+  color: var(--em-muted, rgba(11,11,15,0.62));
+  text-align: left;
+  font-weight: normal;
+  line-height: 1.6;
+}
+
+.editmuse-concierge-input-wrapper {
+  margin-bottom: 0;
+}
+
+/* ============================================
+   OPTION PILLS/CARDS
+   ============================================ */
+
+.editmuse-option-pills {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--em-space, 16px) * 0.75);
+}
+
+/* Option columns */
+/* Option style: Cards - larger card-like selectable blocks with border + larger click target */
+.editmuse-concierge-block.em-options-cards .editmuse-option-pills,
+.em-options-cards .editmuse-option-pills,
+.editmuse-concierge-modal.em-options-cards .editmuse-option-pills,
+.editmuse-concierge-root[data-em-option-style="cards"] .editmuse-option-pills {
+  display: grid;
+  grid-template-columns: repeat(var(--em-option-cols, 2), 1fr);
+  gap: calc(var(--em-space, 16px) * 1);
+}
+
+.editmuse-concierge-block.em-options-cards .editmuse-option-pill,
+.em-options-cards .editmuse-option-pill,
+.editmuse-concierge-modal.em-options-cards .editmuse-option-pill,
+.editmuse-concierge-root[data-em-option-style="cards"] .editmuse-option-pill {
+  padding: 0.9rem 1rem;
+  min-height: 80px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  border: 2px solid var(--em-border, rgba(11,11,15,0.12));
+  border-radius: var(--em-radius, 18px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
+  transition: all 0.2s ease;
+}
+
+.editmuse-concierge-block.em-options-cards .editmuse-option-pill:hover,
+.em-options-cards .editmuse-option-pill:hover,
+.editmuse-concierge-modal.em-options-cards .editmuse-option-pill:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+  border-color: var(--em-accent, #7C3AED);
+}
+
+/* Option style: Pills - compact pill buttons, inline style */
+.editmuse-concierge-block.em-options-pills .editmuse-option-pills,
+.em-options-pills .editmuse-option-pills,
+.editmuse-concierge-modal.em-options-pills .editmuse-option-pills,
+.editmuse-concierge-root[data-em-option-style="pills"] .editmuse-option-pills {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--em-space, 16px) * 0.5);
+}
+
+.editmuse-concierge-block.em-options-pills .editmuse-option-pill,
+.em-options-pills .editmuse-option-pill,
+.editmuse-concierge-modal.em-options-pills .editmuse-option-pill,
+.editmuse-concierge-root[data-em-option-style="pills"] .editmuse-option-pill {
+  padding: 0.55rem 0.8rem;
+  min-height: 44px;
+  border-radius: 999px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(var(--em-font-scale, 102%) * 0.9rem / 100);
+  transition: all 0.15s ease;
+}
+
+.editmuse-concierge-block.em-options-pills .editmuse-option-pill:hover,
+.em-options-pills .editmuse-option-pill:hover,
+.editmuse-concierge-modal.em-options-pills .editmuse-option-pill:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* Mobile: collapse to 1 column */
+@media (max-width: 640px) {
+  .editmuse-concierge-block.em-options-cards .editmuse-option-pills,
+  .em-options-cards .editmuse-option-pills {
+    grid-template-columns: 1;
+  }
+}
+
+/* Legacy support for data-v2-option-cols */
+.editmuse-concierge-modal[data-v2-option-cols="2"] .editmuse-option-pills {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: calc(var(--em-space, 16px) * 0.75);
+}
+
+.editmuse-concierge-modal[data-v2-option-cols="1"] .editmuse-option-pills {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Option style: cards (default) */
+.editmuse-option-pill {
+  display: flex;
+  align-items: center;
+  padding: calc(var(--em-space, 16px) * 0.75) calc(var(--em-space, 16px) * 1);
+  border: 1.5px solid var(--em-border, rgba(11,11,15,0.12));
+  border-radius: var(--em-radius, 18px);
+  background-color: var(--em-surface, #ffffff);
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  font-family: inherit;
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
+  text-align: left;
+  color: var(--em-text, #0B0B0F);
+  position: relative;
+  min-height: 56px;
+  width: 100%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+/* Cards style: more padding, elevated, larger hit area */
+.editmuse-concierge-wrapper.em-options--cards .editmuse-option-pill,
+.editmuse-concierge-wrapper[data-em-option-style="cards"] .editmuse-option-pill,
+.editmuse-concierge-modal[data-em-option-style="cards"] .editmuse-option-pill,
+.editmuse-concierge-modal[data-v2-option-style="cards"] .editmuse-option-pill {
+  padding: calc(var(--em-space, 16px) * 0.875) calc(var(--em-space, 16px) * 1.25);
+  min-height: 64px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  background-color: var(--em-surface, #ffffff);
+  border: 1.5px solid var(--em-border, rgba(11,11,15,0.12));
+}
+
+/* Pills style: less padding, rounded, compact */
+.editmuse-concierge-wrapper.em-options--pills .editmuse-option-pill,
+.editmuse-concierge-wrapper[data-em-option-style="pills"] .editmuse-option-pill,
+.editmuse-concierge-modal[data-em-option-style="pills"] .editmuse-option-pill,
+.editmuse-concierge-modal[data-v2-option-style="pills"] .editmuse-option-pill {
+  padding: calc(var(--em-space, 16px) * 0.625) calc(var(--em-space, 16px) * 1);
+  min-height: 48px;
+  border-radius: calc(var(--em-radius, 18px) * 2);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.editmuse-option-pill:hover {
+  border-color: var(--em-accent, #7C3AED);
+  background-color: color-mix(in srgb, var(--em-accent, #7C3AED) 5%, transparent);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+}
+
+.editmuse-concierge-wrapper.em-options--cards .editmuse-option-pill:hover,
+.editmuse-concierge-wrapper[data-em-option-style="cards"] .editmuse-option-pill:hover,
+.editmuse-concierge-modal[data-em-option-style="cards"] .editmuse-option-pill:hover,
+.editmuse-concierge-modal[data-v2-option-style="cards"] .editmuse-option-pill:hover {
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.14);
+  transform: translateY(-2px);
+}
+
+.editmuse-option-pill.selected,
+.editmuse-option-pill.is-selected {
+  border-color: var(--em-accent, #7C3AED);
+  background-color: color-mix(in srgb, var(--em-accent, #7C3AED) 10%, transparent);
+  font-weight: 500;
+  transform: translateY(0);
+  color: var(--em-accent, #7C3AED);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--em-accent, #7C3AED) 20%, transparent);
+}
+
+/* Gradient selected state */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"] .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"] .editmuse-option-pill.is-selected,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"] .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"] .editmuse-option-pill.is-selected {
+  background: linear-gradient(135deg, 
+    color-mix(in srgb, var(--em-accent, #7C3AED) 10%, transparent),
+    color-mix(in srgb, var(--em-accent-2, #06B6D4) 10%, transparent));
+}
+
+.editmuse-concierge-wrapper.em-options--cards .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper[data-em-option-style="cards"] .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper.em-options--cards .editmuse-option-pill.is-selected,
+.editmuse-concierge-wrapper[data-em-option-style="cards"] .editmuse-option-pill.is-selected,
+.editmuse-concierge-modal[data-em-option-style="cards"] .editmuse-option-pill.selected,
+.editmuse-concierge-modal[data-v2-option-style="cards"] .editmuse-option-pill.selected,
+.editmuse-concierge-modal[data-em-option-style="cards"] .editmuse-option-pill.is-selected,
+.editmuse-concierge-modal[data-v2-option-style="cards"] .editmuse-option-pill.is-selected {
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--em-accent, #7C3AED) 25%, transparent);
+  border-color: var(--em-accent, #7C3AED);
+}
+
+/* Pop brand style: add glow to selected */
+.editmuse-concierge-wrapper.em-style--pop .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper.em-style--pop .editmuse-option-pill.is-selected,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-option-pill.is-selected,
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-option-pill.selected,
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-option-pill.is-selected {
+  box-shadow: 0 6px 24px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent),
+              0 0 0 1px color-mix(in srgb, var(--em-accent, #7C3AED) 20%, transparent);
+}
+
+.editmuse-option-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent);
+}
+
+.editmuse-option-pill-label {
+  flex: 1;
+  cursor: pointer;
+}
+
+/* Mobile: hide pills, show select */
+@media (max-width: 640px) {
+  .editmuse-option-pills {
+    display: none !important;
+  }
+  
+  .editmuse-option-select-mobile {
+    display: block;
+  }
+}
+
+/* Desktop: show pills, hide select */
+@media (min-width: 641px) {
+  .editmuse-option-pills {
+    display: flex;
+  }
+  
+  .editmuse-concierge-modal[data-v2-option-cols="2"] .editmuse-option-pills {
+    display: grid;
+  }
+  
+  .editmuse-option-select-mobile {
+    display: none;
+  }
+}
+
+/* ============================================
+   TEXT INPUTS
+   ============================================ */
+
+.editmuse-concierge-input {
+  width: 100%;
+  padding: calc(var(--em-space, 16px) * 0.625) calc(var(--em-space, 16px) * 0.875);
+  border: 1.5px solid var(--em-border, rgba(11,11,15,0.12));
+  border-radius: var(--em-radius, 18px);
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
+  font-family: inherit;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-sizing: border-box;
+  background-color: var(--em-surface, #ffffff);
+  color: var(--em-text, #0B0B0F);
+  min-height: 48px;
+}
+
+.editmuse-concierge-input:hover {
+  border-color: var(--em-accent, #7C3AED);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.editmuse-concierge-input:focus {
+  outline: none;
+  border-color: var(--em-accent, #7C3AED);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--em-accent, #7C3AED) 15%, transparent), 
+              0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+select.editmuse-concierge-input {
+  background-color: var(--em-surface, #ffffff);
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%230B0B0F' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right calc(var(--em-space, 16px) * 0.75) center;
+  padding-right: calc(var(--em-space, 16px) * 2);
+}
+
+textarea.editmuse-concierge-input {
+  resize: vertical;
+  min-height: 100px;
+  font-family: inherit;
+}
+
+.editmuse-concierge-error {
+  margin-top: calc(var(--em-space, 16px) * 0.5);
+  padding: calc(var(--em-space, 16px) * 0.5);
+  background-color: #fee;
+  color: #c33;
+  border-radius: calc(var(--em-radius, 18px) * 0.25);
+  font-size: calc(var(--em-font-scale, 102%) * 0.875rem / 100);
+  text-align: center;
+}
+
+/* ============================================
+   NAVIGATION (Sticky Footer)
+   ============================================ */
+
+.editmuse-concierge-navigation {
+  display: flex;
+  justify-content: space-between;
+  gap: calc(var(--em-space, 16px) * 0.75);
+  padding: calc(var(--em-space, 16px) * 1.25) calc(var(--em-space, 16px) * 1.25);
+  border-top: 1px solid var(--em-border, rgba(11,11,15,0.12));
+  background: var(--em-surface, #ffffff);
+  flex-shrink: 0;
+  margin-top: auto;
+}
+
+/* Sticky navigation - works for both block and portaled modal */
+.editmuse-concierge-block.em-nav-sticky .editmuse-concierge-navigation,
+.em-nav-sticky .editmuse-concierge-navigation,
+.editmuse-concierge-modal.em-nav-sticky .editmuse-concierge-navigation,
+.editmuse-concierge-root[data-em-sticky-nav="true"] .editmuse-navigation,
+.editmuse-concierge-root[data-em-sticky-nav="true"] .editmuse-concierge-navigation {
+  position: sticky;
+  bottom: 0;
+  z-index: calc(var(--em-modal-z, 999999) + 10);
+  background: var(--em-surface, #fff);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.08);
+  flex-shrink: 0;
+  margin-top: auto;
+  padding-top: calc(var(--em-space, 16px) * 0.5);
+  border-top: 1px solid var(--em-border, rgba(11,11,15,0.08));
+}
+
+/* Ensure options container has padding to prevent nav overlap */
+.editmuse-concierge-block.em-nav-sticky .em-modal-content-area,
+.em-nav-sticky .em-modal-content-area,
+.editmuse-concierge-modal.em-nav-sticky .em-modal-content-area {
+  padding-bottom: calc(var(--em-space, 16px) * 3.5);
+  max-height: calc(100vh - 200px);
+  overflow-y: auto;
+}
+
+/* Static navigation (non-sticky) */
+.editmuse-concierge-block.em-nav-static .editmuse-concierge-navigation,
+.em-nav-static .editmuse-concierge-navigation,
+.editmuse-concierge-modal.em-nav-static .editmuse-concierge-navigation,
+.editmuse-concierge-root[data-em-sticky-nav="false"] .editmuse-navigation,
+.editmuse-concierge-root[data-em-sticky-nav="false"] .editmuse-concierge-navigation {
+  position: relative;
+  margin-top: calc(var(--em-space, 16px) * 1.5);
+}
+
+.editmuse-concierge-nav-btn {
+  border: 1.5px solid;
+  border-radius: var(--em-btn-radius, 14px);
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  flex: 1;
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Button sizes for nav - class-based for portaled modals */
+.editmuse-concierge-wrapper[style*="--em-btn-size: sm"] .editmuse-concierge-nav-btn,
+.editmuse-concierge-modal.em-btn-small .editmuse-concierge-nav-btn {
+  padding: calc(var(--em-space, 16px) * 0.4) calc(var(--em-space, 16px) * 1);
+  font-size: calc(var(--em-font-scale, 102%) * 0.875rem / 100);
+  min-height: 44px;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-size: md"] .editmuse-concierge-nav-btn,
+.editmuse-concierge-modal.em-btn-medium .editmuse-concierge-nav-btn {
+  padding: calc(var(--em-space, 16px) * 0.625) calc(var(--em-space, 16px) * 1.25);
+  min-height: 48px;
+}
+
+.editmuse-concierge-wrapper[style*="--em-btn-size: lg"] .editmuse-concierge-nav-btn,
+.editmuse-concierge-modal.em-btn-large .editmuse-concierge-nav-btn {
+  padding: calc(var(--em-space, 16px) * 0.75) calc(var(--em-space, 16px) * 1.5);
+  font-size: calc(var(--em-font-scale, 102%) * 1.125rem / 100);
+  min-height: 56px;
+}
+
+.editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  color: var(--em-btn-text, #ffffff);
+  border-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+}
+
+/* Button variants - solid (default) */
+.editmuse-concierge-modal.em-btn-solid .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  color: var(--em-btn-text, #ffffff);
+  border-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+}
+
+/* Button variants - outline */
+.editmuse-concierge-modal.em-btn-outline .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background-color: transparent;
+  color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  border-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  border-width: 2px;
+}
+
+.editmuse-concierge-modal.em-btn-outline .editmuse-concierge-nav-btn.editmuse-concierge-next:hover:not(:disabled) {
+  background-color: var(--em-btn-bg, var(--em-accent, #7C3AED));
+  color: var(--em-btn-text, #ffffff);
+}
+
+/* Button variants - glass */
+.editmuse-concierge-modal.em-btn-glass .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background: color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 85%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--em-btn-text, #ffffff);
+  border-color: color-mix(in srgb, var(--em-btn-bg, var(--em-accent, #7C3AED)) 40%, transparent);
+}
+
+/* Gradient next button */
+.editmuse-concierge-wrapper[style*="--em-gradient-on: 1"] .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-wrapper[style*="--em-gradient-on: true"] .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-modal[style*="--em-gradient-on: 1"] .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  background: linear-gradient(135deg, var(--em-accent, #7C3AED), var(--em-accent2, #06B6D4));
+  border-color: transparent;
+}
+
+.editmuse-concierge-nav-btn.editmuse-concierge-next:hover:not(:disabled) {
+  opacity: 0.95;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent);
+}
+
+/* Brand style polish for nav buttons */
+/* POP: punchy glow */
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  box-shadow: 0 14px 34px color-mix(in srgb, var(--em-accent2) 35%, transparent);
+}
+.editmuse-concierge-wrapper[data-v2-brand-style="pop"] .editmuse-concierge-nav-btn.editmuse-concierge-next:hover,
+.editmuse-concierge-wrapper[data-em-brand-style="pop"] .editmuse-concierge-nav-btn.editmuse-concierge-next:hover {
+  transform: translateY(-1px);
+}
+
+/* MINIMAL: flat + crisp */
+.editmuse-concierge-wrapper[data-v2-brand-style="minimal"] .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-wrapper[data-em-brand-style="minimal"] .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--em-accent) 18%, transparent);
+}
+
+/* LUXE: refined border + subtle shadow */
+.editmuse-concierge-wrapper[data-v2-brand-style="luxe"] .editmuse-concierge-nav-btn.editmuse-concierge-next,
+.editmuse-concierge-wrapper[data-em-brand-style="luxe"] .editmuse-concierge-nav-btn.editmuse-concierge-next {
+  border: 1px solid color-mix(in srgb, var(--em-accent2) 55%, transparent);
+  box-shadow: 0 10px 26px rgba(0,0,0,.12);
+  letter-spacing: 0.2px;
+  font-weight: 600;
+}
+
+.editmuse-concierge-nav-btn.editmuse-concierge-back {
+  background-color: transparent;
+  color: var(--em-text, #0B0B0F);
+  border-color: var(--em-border, rgba(11,11,15,0.12));
+  flex: 0 0 auto;
+}
+
+.editmuse-concierge-nav-btn.editmuse-concierge-back:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--em-text, #0B0B0F) 8%, transparent);
+  border-color: var(--em-text, #0B0B0F);
+}
+
+.editmuse-concierge-nav-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--em-accent, #7C3AED) 30%, transparent);
+}
+
+.editmuse-concierge-nav-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+@media (max-width: 640px) {
+  .editmuse-concierge-navigation {
+    padding: calc(var(--em-space, 16px) * 0.875) calc(var(--em-space, 16px) * 1);
+    flex-direction: column;
+    gap: calc(var(--em-space, 16px) * 0.5);
+  }
+  
+  .editmuse-concierge-nav-btn {
+    width: 100%;
+    min-height: 52px;
+  }
+  
+  .editmuse-option-pills {
+    gap: calc(var(--em-space, 16px) * 0.5);
+  }
+  
+  .editmuse-concierge-modal[data-v2-option-cols="2"] .editmuse-option-pills {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================
+   RESULTS BLOCK (Basic styles, detailed in results.css)
+   ============================================ */
+
+.editmuse-results-wrapper {
+  font-family: inherit;
+}
+
 .editmuse-results {
-  padding: 2rem 1rem;
+  padding: calc(var(--em-space, 16px) * 1.5) calc(var(--em-space, 16px) * 1);
   max-width: 1200px;
   margin: 0 auto;
 }
 
 .editmuse-results-loading {
   text-align: center;
-  padding: 3rem 1rem;
+  padding: calc(var(--em-space, 16px) * 2) calc(var(--em-space, 16px) * 1);
 }
 
 .editmuse-spinner {
   width: 40px;
   height: 40px;
-  border: 3px solid rgba(0, 0, 0, 0.1);
-  border-top-color: #1a1a1a;
+  border: 3px solid var(--em-border, rgba(11,11,15,0.12));
+  border-top-color: var(--em-accent, #7C3AED);
   border-radius: 50%;
-  margin: 0 auto 1rem;
+  margin: 0 auto calc(var(--em-space, 16px) * 0.75);
   animation: editmuse-spin 0.8s linear infinite;
 }
 
@@ -61,298 +1496,56 @@
 
 .editmuse-results-loading p {
   margin: 0;
-  color: rgba(0, 0, 0, 0.6);
-  font-size: 1rem;
-}
-
-.editmuse-results-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 1.5rem;
-  margin-top: 2rem;
-}
-
-@media (min-width: 768px) {
-  .editmuse-results-grid {
-    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    gap: 2rem;
-  }
-}
-
-.editmuse-product-card {
-  display: flex;
-  flex-direction: column;
-}
-
-.editmuse-product-link {
-  text-decoration: none;
-  color: inherit;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  transition: transform 0.2s ease;
-}
-
-.editmuse-product-link:hover {
-  transform: translateY(-4px);
-}
-
-.editmuse-product-image {
-  width: 100%;
-  aspect-ratio: 1;
-  object-fit: cover;
-  border-radius: 8px;
-  margin-bottom: 0.75rem;
-  background-color: #f5f5f5;
-}
-
-.editmuse-product-title {
-  margin: 0 0 0.5rem 0;
-  font-size: 1rem;
-  font-weight: 500;
-  color: #1a1a1a;
-  line-height: 1.4;
-}
-
-.editmuse-product-price {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 600;
-  color: #1a1a1a;
+  color: var(--em-muted, rgba(11,11,15,0.62));
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
 }
 
 .editmuse-results-empty,
 .editmuse-results-error {
   text-align: center;
-  padding: 3rem 1rem;
+  padding: calc(var(--em-space, 16px) * 2) calc(var(--em-space, 16px) * 1);
 }
 
 .editmuse-results-empty p,
 .editmuse-results-error p {
   margin: 0;
-  color: rgba(0, 0, 0, 0.6);
-  font-size: 1rem;
+  color: var(--em-muted, rgba(11,11,15,0.62));
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
 }
 
-/* Launcher Error */
-.editmuse-launcher-error {
-  margin-top: 1rem;
-  padding: 0.75rem;
-  background-color: #fee;
-  color: #c33;
-  border-radius: 4px;
-  font-size: 0.875rem;
-  text-align: center;
-}
+/* ============================================
+   DEBUG PANEL (Design Mode Only)
+   ============================================ */
 
-/* Concierge Block */
-.editmuse-concierge-block {
-  text-align: center;
-  padding: 2rem 1rem;
-}
-
-.editmuse-concierge-button {
-  background-color: transparent;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  border-radius: 8px;
-  padding: 0.875rem 2rem;
-  font-size: 1rem;
-  font-weight: 500;
-  color: #1a1a1a;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  font-family: inherit;
-  min-width: 200px;
-}
-
-.editmuse-concierge-button:hover {
-  border-color: rgba(0, 0, 0, 0.25);
-  background-color: rgba(0, 0, 0, 0.02);
-}
-
-.editmuse-concierge-modal {
+.em-debug {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  z-index: 10000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1rem;
-}
-
-.editmuse-concierge-modal-overlay {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background-color: rgba(0, 0, 0, 0.5);
-}
-
-.editmuse-concierge-modal-content {
-  position: relative;
-  background-color: #ffffff;
-  border-radius: 12px;
-  padding: 2rem;
-  max-width: 500px;
-  width: 100%;
-  max-height: 90vh;
-  overflow-y: auto;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
-}
-
-.editmuse-concierge-modal-close {
-  position: absolute;
-  top: 1rem;
-  right: 1rem;
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  cursor: pointer;
-  color: rgba(0, 0, 0, 0.5);
-  padding: 0;
-  width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  transition: all 0.2s ease;
-  z-index: 1;
-}
-
-.editmuse-concierge-modal-close:hover {
-  background-color: rgba(0, 0, 0, 0.05);
-  color: rgba(0, 0, 0, 0.8);
-}
-
-.editmuse-concierge-steps {
-  min-height: 200px;
-  margin-bottom: 2rem;
-}
-
-.editmuse-concierge-step-title {
-  margin: 0 0 1.5rem 0;
-  font-size: 1.5rem;
-  font-weight: 600;
-  color: #1a1a1a;
-  text-align: center;
-}
-
-.editmuse-concierge-input-wrapper {
-  margin-bottom: 1rem;
-}
-
-.editmuse-concierge-input {
-  width: 100%;
-  padding: 0.875rem 1rem;
-  border: 1px solid rgba(0, 0, 0, 0.15);
+  bottom: 20px;
+  right: 20px;
+  background: rgba(0, 0, 0, 0.9);
+  color: #fff;
+  padding: 16px;
   border-radius: 8px;
-  font-size: 1rem;
-  font-family: inherit;
-  transition: border-color 0.2s ease;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  max-width: 400px;
+  max-height: 300px;
+  overflow: auto;
+  z-index: 9999999;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
 }
 
-.editmuse-concierge-input:focus {
-  outline: none;
-  border-color: #1a1a1a;
+.em-debug-title {
+  font-weight: bold;
+  margin-bottom: 8px;
+  color: #4ade80;
+  font-size: 14px;
 }
 
-.editmuse-concierge-error {
-  margin-top: 0.75rem;
-  padding: 0.75rem;
-  background-color: #fee;
-  color: #c33;
-  border-radius: 4px;
-  font-size: 0.875rem;
-  text-align: center;
-}
-
-.editmuse-concierge-navigation {
-  display: flex;
-  justify-content: flex-end;
-  gap: 1rem;
-  padding-top: 1.5rem;
-  border-top: 1px solid rgba(0, 0, 0, 0.08);
-}
-
-.editmuse-concierge-nav-btn {
-  padding: 0.875rem 1.5rem;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  border-radius: 8px;
-  font-size: 1rem;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  background-color: #1a1a1a;
-  color: #ffffff;
-  border-color: #1a1a1a;
-}
-
-.editmuse-concierge-nav-btn:hover:not(:disabled) {
-  background-color: #333333;
-  border-color: #333333;
-}
-
-.editmuse-concierge-nav-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-/* Chat Mode */
-.editmuse-concierge-chat {
-  display: flex;
-  flex-direction: column;
-  min-height: 300px;
-  max-height: 500px;
-}
-
-.editmuse-concierge-chat-messages {
-  flex: 1;
-  overflow-y: auto;
-  padding: 1rem;
-  margin-bottom: 1rem;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 8px;
-  background-color: #fafafa;
-}
-
-.editmuse-concierge-chat-message {
-  margin-bottom: 1rem;
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  max-width: 80%;
+.em-debug-pre {
+  margin: 0;
+  white-space: pre-wrap;
   word-wrap: break-word;
-}
-
-.editmuse-concierge-chat-message.user {
-  background-color: #1a1a1a;
-  color: #ffffff;
-  margin-left: auto;
-  text-align: right;
-}
-
-.editmuse-concierge-chat-message.assistant {
-  background-color: #ffffff;
-  color: #1a1a1a;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-}
-
-.editmuse-concierge-chat-input-wrapper {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 1rem;
-}
-
-.editmuse-concierge-chat-input-wrapper .editmuse-concierge-input {
-  flex: 1;
-  margin-bottom: 0;
-}
-
-.editmuse-concierge-chat-input-wrapper button {
-  min-width: 80px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #e5e7eb;
 }

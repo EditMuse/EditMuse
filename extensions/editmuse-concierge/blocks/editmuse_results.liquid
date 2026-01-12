@@ -1,27 +1,467 @@
 {{ 'editmuse-concierge.css' | asset_url | stylesheet_tag }}
+{{ 'editmuse-results.css' | asset_url | stylesheet_tag }}
 
-<div class="editmuse-results" data-editmuse-results>
-  <div class="editmuse-results-loading" data-editmuse-loading>
-    <div class="editmuse-spinner"></div>
-    <p>Loading your recommendations...</p>
-  </div>
-  <div class="editmuse-results-content" data-editmuse-content style="display: none;">
-    <div class="editmuse-results-grid" data-editmuse-grid></div>
-  </div>
-  <div class="editmuse-results-empty" data-editmuse-empty style="display: none;">
-    <p>No session found. Start from the launcher.</p>
-  </div>
-  <div class="editmuse-results-error" data-editmuse-error style="display: none;">
-    <p>Unable to load results. Please try again.</p>
+{%- comment -%} V2 Design Tokens {%- endcomment -%}
+{%- liquid
+  # V2 Design Tokens (shared)
+  assign v2_brand_style = block.settings.v2_brand_style | default: 'pop'
+  assign v2_accent_color = block.settings.v2_accent_color | default: '#7C3AED'
+  assign v2_accent_color_2 = block.settings.v2_accent_color_2 | default: '#06B6D4'
+  assign v2_use_gradient = block.settings.v2_use_gradient | default: true
+  assign v2_surface_color = block.settings.v2_surface_color | default: '#ffffff'
+  assign v2_text_color = block.settings.v2_text_color | default: '#0B0B0F'
+  assign v2_muted_text_color = block.settings.v2_muted_text_color | default: 'rgba(11,11,15,0.62)'
+  assign v2_border_color = block.settings.v2_border_color | default: 'rgba(11,11,15,0.12)'
+  assign v2_radius = block.settings.v2_radius | default: 18
+  assign v2_spacing = block.settings.v2_spacing | default: 16
+  assign v2_font_scale = block.settings.v2_font_scale | default: 102
+  assign v2_shadow_strength = block.settings.v2_shadow_strength | default: 'soft'
+  assign v2_modal_z_index = block.settings.v2_modal_z_index | default: 999999
+  assign v2_overlay_opacity_percent = block.settings.v2_overlay_opacity | default: 45
+  assign v2_overlay_opacity = v2_overlay_opacity_percent | times: 1.0 | divided_by: 100.0
+  assign v2_overlay_blur = block.settings.v2_overlay_blur | default: 10
+  assign v2_motion = block.settings.v2_motion | default: 'normal'
+  assign v2_btn_variant = block.settings.v2_btn_variant | default: 'solid'
+  assign v2_btn_radius = block.settings.v2_btn_radius | default: 14
+  assign v2_btn_size = block.settings.v2_btn_size | default: 'md'
+  assign v2_btn_full_width = block.settings.v2_btn_full_width | default: false
+  assign v2_btn_bg = block.settings.v2_btn_bg | default: ''
+  assign v2_btn_text = block.settings.v2_btn_text | default: '#ffffff'
+  assign enable_debug = block.settings.enable_debug | default: false
+  assign custom_css = block.settings.custom_css | default: ''
+  
+  # Results-specific V2 settings
+  assign v2_results_heading = block.settings.v2_results_heading | default: 'Recommended for you'
+  assign v2_show_reasoning = block.settings.v2_show_reasoning | default: true
+  assign v2_show_price = block.settings.v2_show_price | default: true
+  assign v2_results_layout = block.settings.v2_results_layout | default: 'grid'
+  assign v2_results_columns_desktop = block.settings.v2_results_columns_desktop | default: 4
+  assign v2_results_columns_mobile = block.settings.v2_results_columns_mobile | default: 1
+  assign v2_card_style = block.settings.v2_card_style | default: 'glass'
+  assign v2_cta_text = block.settings.v2_cta_text | default: 'View product'
+  assign v2_show_reasoning = block.settings.v2_show_reasoning | default: true
+  assign v2_show_price = block.settings.v2_show_price | default: true
+  
+  # Button background: use v2_btn_bg if provided, otherwise use accent (or gradient)
+  if v2_btn_bg != blank and v2_btn_bg != ''
+    assign final_btn_bg = v2_btn_bg
+  else
+    assign final_btn_bg = v2_accent_color
+  endif
+-%}
+
+<div id="editmuse-block-{{ block.id }}" 
+     class="editmuse-results-wrapper em-style--{{ v2_brand_style }} em-motion--{{ v2_motion }}"
+     {{ block.shopify_attributes }}
+     data-editmuse-root
+     data-editmuse-debug="{{ enable_debug }}"
+     data-editmuse-results
+     style="
+       --em-accent: {{ v2_accent_color }};
+       --em-accent-2: {{ v2_accent_color_2 }};
+       --em-gradient-on: {{ v2_use_gradient }};
+       --em-surface: {{ v2_surface_color }};
+       --em-text: {{ v2_text_color }};
+       --em-muted: {{ v2_muted_text_color }};
+       --em-border: {{ v2_border_color }};
+       --em-radius: {{ v2_radius }}px;
+       --em-space: {{ v2_spacing }}px;
+       --em-font-scale: {{ v2_font_scale }}%;
+       --em-shadow: {{ v2_shadow_strength }};
+       --em-z: {{ v2_modal_z_index }};
+       --em-overlay: {{ v2_overlay_opacity }};
+       --em-blur: {{ v2_overlay_blur }}px;
+       --em-motion: {{ v2_motion }};
+       --em-btn-variant: {{ v2_btn_variant }};
+       --em-btn-radius: {{ v2_btn_radius }}px;
+       --em-btn-size: {{ v2_btn_size }};
+       --em-btn-full: {{ v2_btn_full_width }};
+       --em-btn-bg: {{ final_btn_bg }};
+       --em-btn-text: {{ v2_btn_text }};
+       --em-results-heading: '{{ v2_results_heading }}';
+       --em-show-reason: {{ v2_show_reasoning }};
+       --em-show-price: {{ v2_show_price }};
+       --em-results-layout: {{ v2_results_layout }};
+       --em-cols-d: {{ v2_results_columns_desktop }};
+       --em-cols-m: {{ v2_results_columns_mobile }};
+       --em-card-style: {{ v2_card_style }};
+       --em-show-reason: {{ v2_show_reasoning }};
+       --em-show-price: {{ v2_show_price }};
+       --em-cta-text: '{{ v2_cta_text }}';
+     ">
+  {%- if custom_css != blank and custom_css != '' -%}
+    <style>
+      #editmuse-block-{{ block.id }} {
+        {{ custom_css }}
+      }
+    </style>
+  {%- endif -%}
+  
+  <div class="editmuse-results" data-editmuse-results>
+    <div class="editmuse-results-loading" data-editmuse-loading>
+      <div class="editmuse-spinner"></div>
+      <p>Loading your recommendations...</p>
+    </div>
+    <div class="editmuse-results-content" data-editmuse-content style="display: none;">
+      <h2 class="editmuse-results-heading" data-editmuse-title>{{ v2_results_heading }}</h2>
+      <div class="editmuse-results-meta" data-editmuse-meta></div>
+      <div class="editmuse-results-grid" data-editmuse-grid></div>
+      <details class="editmuse-results-reasoning-wrap" data-editmuse-reasoning-wrap style="display: none;">
+        <summary>Why these picks?</summary>
+        <div class="editmuse-results-reasoning" data-editmuse-reasoning></div>
+      </details>
+    </div>
+    <div class="editmuse-results-empty" data-editmuse-empty style="display: none;">
+      <p>No session found. Start from the launcher.</p>
+    </div>
+    <div class="editmuse-results-error" data-editmuse-error style="display: none;">
+      <p>Unable to load results. Please try again.</p>
+    </div>
   </div>
 </div>
 
-{{ 'editmuse-concierge.js' | asset_url | script_tag }}
+{{ 'editmuse-results.js' | asset_url | script_tag }}
 
 {% schema %}
 {
-  "name": "EditMuse Results",
+  "name": "EditMuse Results V2",
   "target": "section",
-  "settings": []
+  "settings": [
+    {
+      "type": "header",
+      "content": "V2 Design Tokens"
+    },
+    {
+      "type": "select",
+      "id": "v2_brand_style",
+      "label": "Brand Style",
+      "options": [
+        {
+          "value": "pop",
+          "label": "Pop (Gen-Z)"
+        },
+        {
+          "value": "minimal",
+          "label": "Minimal"
+        },
+        {
+          "value": "luxe",
+          "label": "Luxe"
+        }
+      ],
+      "default": "pop"
+    },
+    {
+      "type": "color",
+      "id": "v2_accent_color",
+      "label": "Accent Color",
+      "default": "#7C3AED"
+    },
+    {
+      "type": "color",
+      "id": "v2_accent_color_2",
+      "label": "Accent Color 2",
+      "default": "#06B6D4"
+    },
+    {
+      "type": "checkbox",
+      "id": "v2_use_gradient",
+      "label": "Use Gradient",
+      "default": true
+    },
+    {
+      "type": "color",
+      "id": "v2_surface_color",
+      "label": "Surface Color",
+      "default": "#ffffff"
+    },
+    {
+      "type": "color",
+      "id": "v2_text_color",
+      "label": "Text Color",
+      "default": "#0B0B0F"
+    },
+    {
+      "type": "color",
+      "id": "v2_muted_text_color",
+      "label": "Muted Text Color",
+      "default": "rgba(11,11,15,0.62)"
+    },
+    {
+      "type": "color",
+      "id": "v2_border_color",
+      "label": "Border Color",
+      "default": "rgba(11,11,15,0.12)"
+    },
+    {
+      "type": "range",
+      "id": "v2_radius",
+      "label": "Border Radius",
+      "min": 0,
+      "max": 32,
+      "step": 1,
+      "default": 18,
+      "unit": "px"
+    },
+    {
+      "type": "range",
+      "id": "v2_spacing",
+      "label": "Spacing",
+      "min": 8,
+      "max": 32,
+      "step": 1,
+      "default": 16,
+      "unit": "px"
+    },
+    {
+      "type": "range",
+      "id": "v2_font_scale",
+      "label": "Font Scale",
+      "min": 90,
+      "max": 120,
+      "step": 1,
+      "default": 102,
+      "unit": "%"
+    },
+    {
+      "type": "select",
+      "id": "v2_shadow_strength",
+      "label": "Shadow Strength",
+      "options": [
+        {
+          "value": "none",
+          "label": "None"
+        },
+        {
+          "value": "soft",
+          "label": "Soft"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "soft"
+    },
+    {
+      "type": "number",
+      "id": "v2_modal_z_index",
+      "label": "Modal Z-Index",
+      "default": 999999,
+      "info": "Higher values ensure modal appears above other elements"
+    },
+    {
+      "type": "range",
+      "id": "v2_overlay_opacity",
+      "label": "Overlay Opacity",
+      "min": 0,
+      "max": 90,
+      "step": 5,
+      "default": 45,
+      "unit": "%"
+    },
+    {
+      "type": "range",
+      "id": "v2_overlay_blur",
+      "label": "Overlay Blur",
+      "min": 0,
+      "max": 20,
+      "step": 1,
+      "default": 10,
+      "unit": "px"
+    },
+    {
+      "type": "select",
+      "id": "v2_motion",
+      "label": "Motion",
+      "options": [
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "reduced",
+          "label": "Reduced"
+        }
+      ],
+      "default": "normal"
+    },
+    {
+      "type": "header",
+      "content": "V2 Buttons"
+    },
+    {
+      "type": "select",
+      "id": "v2_btn_variant",
+      "label": "Button Variant",
+      "options": [
+        {
+          "value": "solid",
+          "label": "Solid"
+        },
+        {
+          "value": "outline",
+          "label": "Outline"
+        },
+        {
+          "value": "glass",
+          "label": "Glass"
+        }
+      ],
+      "default": "solid"
+    },
+    {
+      "type": "range",
+      "id": "v2_btn_radius",
+      "label": "Button Radius",
+      "min": 0,
+      "max": 32,
+      "step": 1,
+      "default": 14,
+      "unit": "px"
+    },
+    {
+      "type": "select",
+      "id": "v2_btn_size",
+      "label": "Button Size",
+      "options": [
+        {
+          "value": "sm",
+          "label": "Small"
+        },
+        {
+          "value": "md",
+          "label": "Medium"
+        },
+        {
+          "value": "lg",
+          "label": "Large"
+        }
+      ],
+      "default": "md"
+    },
+    {
+      "type": "checkbox",
+      "id": "v2_btn_full_width",
+      "label": "Full Width Buttons",
+      "default": false
+    },
+    {
+      "type": "color",
+      "id": "v2_btn_bg",
+      "label": "Button Background",
+      "info": "Leave blank to use Accent Color"
+    },
+    {
+      "type": "color",
+      "id": "v2_btn_text",
+      "label": "Button Text Color",
+      "default": "#ffffff"
+    },
+    {
+      "type": "header",
+      "content": "V2 Results"
+    },
+    {
+      "type": "select",
+      "id": "v2_results_layout",
+      "label": "Results Layout",
+      "options": [
+        {
+          "value": "grid",
+          "label": "Grid"
+        },
+        {
+          "value": "list",
+          "label": "List"
+        }
+      ],
+      "default": "grid"
+    },
+    {
+      "type": "text",
+      "id": "v2_results_heading",
+      "label": "Results Heading",
+      "default": "Recommended for you"
+    },
+    {
+      "type": "checkbox",
+      "id": "v2_show_reasoning",
+      "label": "Show Reasoning",
+      "default": true
+    },
+    {
+      "type": "checkbox",
+      "id": "v2_show_price",
+      "label": "Show Price",
+      "default": true
+    },
+    {
+      "type": "range",
+      "id": "v2_results_columns_desktop",
+      "label": "Grid Columns (Desktop)",
+      "min": 2,
+      "max": 4,
+      "step": 1,
+      "default": 4,
+      "unit": "col"
+    },
+    {
+      "type": "range",
+      "id": "v2_results_columns_mobile",
+      "label": "Grid Columns (Mobile)",
+      "min": 1,
+      "max": 3,
+      "step": 1,
+      "default": 1,
+      "unit": "col"
+    },
+    {
+      "type": "select",
+      "id": "v2_card_style",
+      "label": "Card Style",
+      "options": [
+        {
+          "value": "solid",
+          "label": "Solid"
+        },
+        {
+          "value": "outline",
+          "label": "Outline"
+        },
+        {
+          "value": "glass",
+          "label": "Glass"
+        }
+      ],
+      "default": "glass"
+    },
+    {
+      "type": "text",
+      "id": "v2_cta_text",
+      "label": "CTA Text",
+      "default": "View product"
+    },
+    {
+      "type": "header",
+      "content": "V2 Advanced"
+    },
+    {
+      "type": "checkbox",
+      "id": "enable_debug",
+      "label": "Enable Debug Logging",
+      "default": false
+    },
+    {
+      "type": "textarea",
+      "id": "custom_css",
+      "label": "Custom CSS",
+      "info": "Add custom CSS scoped to this block"
+    }
+  ]
 }
 {% endschema %}

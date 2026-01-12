@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
-import { addConciergeMessage } from "~/models/concierge.server";
+import { addConciergeMessage, getConciergeSessionByToken } from "~/models/concierge.server";
 import { ConciergeRole } from "@prisma/client";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -38,19 +38,30 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { sessionId, text, imageUrl } = body;
+  const { sessionId, message, step } = body;
 
-  if (!sessionId) {
-    return Response.json({ error: "Missing sessionId" }, { status: 400 });
+  if (!sessionId || !message) {
+    return Response.json({ error: "Missing sessionId or message" }, { status: 400 });
   }
 
-  // Add message using helper (role is always USER for App Proxy)
+  // Get session to check experience and mode
+  const session = await getConciergeSessionByToken(sessionId);
+  if (!session) {
+    return Response.json({ error: "Session not found" }, { status: 404 });
+  }
+
+  // Verify shop matches
+  if (session.shop.domain !== shopDomain) {
+    return Response.json({ error: "Session shop mismatch" }, { status: 403 });
+  }
+
+  // Add message using helper
   try {
     await addConciergeMessage({
       sessionToken: sessionId,
       role: ConciergeRole.USER,
-      text: text || null,
-      imageUrl: imageUrl || null,
+      text: message,
+      imageUrl: null,
     });
   } catch (error) {
     if (error instanceof Error && error.message.includes("Session not found")) {
@@ -59,6 +70,51 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     throw error;
   }
 
-  return Response.json({ ok: true });
+  // Determine next question or completion based on experience flow mode
+  // For MVP: Use block's start_mode (passed as flowMode in start) or default to hybrid
+  // Quiz mode: 3 steps (step 0, 1, 2), then done
+  // Chat mode: After 1-2 messages, done
+  // Hybrid: Quiz then chat
+
+  const currentStep = step !== undefined ? Number(step) : 0;
+  const totalQuizSteps = 3;
+
+  // For quiz mode: return next question until complete
+  if (session.experience?.mode === "modal" || currentStep < totalQuizSteps - 1) {
+    // Quiz flow - return next question
+    const questions = [
+      "What are you looking for?",
+      "What's your budget range?",
+      "Any specific preferences?",
+    ];
+    
+    if (currentStep < questions.length - 1) {
+      return Response.json({
+        ok: true,
+        nextQuestion: questions[currentStep + 1],
+        step: currentStep + 1,
+        done: false,
+      });
+    }
+  }
+
+  // For chat/hybrid: after minimum info, return done
+  // Count user messages
+  const userMessages = session.messages.filter(m => m.role === ConciergeRole.USER);
+  const minMessagesForChat = 2;
+
+  if (userMessages.length >= minMessagesForChat || currentStep >= totalQuizSteps - 1) {
+    return Response.json({
+      ok: true,
+      done: true,
+    });
+  }
+
+  // Default: ask for more info
+  return Response.json({
+    ok: true,
+    nextQuestion: "Tell me more about what you're looking for.",
+    done: false,
+  });
 };
 

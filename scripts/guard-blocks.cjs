@@ -16,14 +16,13 @@ const path = require('path');
 
 const BLOCKS_DIR = path.join(__dirname, '..', 'extensions', 'editmuse-concierge', 'blocks');
 const ALLOWED_FILES = new Set([
-  'editmuse_launcher.liquid',
   'editmuse_concierge.liquid',
   'editmuse_results.liquid'
 ]);
 
 function guardBlocks() {
   console.log('[guard-blocks] Checking blocks directory...');
-  console.log('[guard-blocks] Allowed files:', Array.from(ALLOWED_FILES).join(', '));
+  console.log('[guard-blocks] Allowed files (exactly 2):', Array.from(ALLOWED_FILES).join(', '));
 
   if (!fs.existsSync(BLOCKS_DIR)) {
     console.error(`[guard-blocks] ERROR: Blocks directory not found: ${BLOCKS_DIR}`);
@@ -43,7 +42,7 @@ function guardBlocks() {
     extraFiles.forEach(f => {
       console.error(`  - ${f}`);
     });
-    console.error('\n[guard-blocks] Only these 3 files are allowed:');
+    console.error('\n[guard-blocks] Only these 2 files are allowed:');
     Array.from(ALLOWED_FILES).forEach(f => {
       console.error(`  - ${f}`);
     });
@@ -58,7 +57,12 @@ function guardBlocks() {
     missingFiles.forEach(f => {
       console.error(`  - ${f}`);
     });
-    console.error('[guard-blocks] All 3 required blocks must exist.');
+    console.error('[guard-blocks] All 2 required blocks must exist.');
+  }
+
+  if (liquidFiles.length !== 2) {
+    console.error(`\n[guard-blocks] ❌ ERROR: Expected exactly 2 block files, found ${liquidFiles.length}`);
+    process.exit(1);
   }
 
   console.log('[guard-blocks] ✅ All block files are valid!');
