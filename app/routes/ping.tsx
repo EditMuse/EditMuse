@@ -1,5 +1,4 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { proxyPingLoader } from "~/app-proxy-ping.server";
 
 /**
  * App Proxy Route - Handles requests when Shopify strips the /apps/editmuse prefix
@@ -7,12 +6,19 @@ import { proxyPingLoader } from "~/app-proxy-ping.server";
  * This route handles /ping when Shopify app proxy forwards requests
  * without the full path prefix. Uses the same shared handler as the full path route.
  * 
- * This file uses .server.tsx extension to mark it as server-only, preventing React Router
- * from trying to bundle it for the client.
+ * Uses dynamic imports to prevent React Router from analyzing server-only modules during build.
  */
 const ROUTE_PATH = "/ping";
 
+// Lazy-load server-only module to avoid build-time analysis
+// Using Function constructor to prevent static analysis
+const getHandlers = () => {
+  const modulePath = "~/app-proxy-ping.server";
+  return import(/* @vite-ignore */ modulePath);
+};
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { proxyPingLoader } = await getHandlers();
   return proxyPingLoader(request, ROUTE_PATH);
 };
 

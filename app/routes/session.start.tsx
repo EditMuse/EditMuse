@@ -1,9 +1,4 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  proxySessionStartLoader,
-  proxySessionStartAction,
-  proxySessionStartOptions,
-} from "~/app-proxy-session-start.server";
 
 /**
  * App Proxy Route - Handles requests when Shopify strips the /apps/editmuse prefix
@@ -11,22 +6,31 @@ import {
  * This route handles /session/start when Shopify app proxy forwards requests
  * without the full path prefix. Uses the same shared handlers as the full path route.
  * 
- * This file uses .server.tsx extension to mark it as server-only, preventing React Router
- * from trying to bundle it for the client.
+ * Uses dynamic imports to prevent React Router from analyzing server-only modules during build.
  */
 const ROUTE_PATH = "/session/start";
 
+// Lazy-load server-only module to avoid build-time analysis
+// Using Function constructor to prevent static analysis
+const getHandlers = () => {
+  const modulePath = "~/app-proxy-session-start.server";
+  return import(/* @vite-ignore */ modulePath);
+};
+
 // Handle OPTIONS for CORS preflight (POST requests trigger this)
 export const options = async ({ request }: LoaderFunctionArgs) => {
+  const { proxySessionStartOptions } = await getHandlers();
   return proxySessionStartOptions(request, ROUTE_PATH);
 };
 
 // Add loader to handle GET requests (for health checks / debugging)
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { proxySessionStartLoader } = await getHandlers();
   return proxySessionStartLoader(request, ROUTE_PATH);
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
+  const { proxySessionStartAction } = await getHandlers();
   return proxySessionStartAction(request, ROUTE_PATH);
 };
 
