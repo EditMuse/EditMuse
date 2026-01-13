@@ -22,7 +22,8 @@
     "vite": "vite",
     "typecheck": "react-router typegen && tsc --noEmit",
     "guard:blocks": "node scripts/guard-blocks.cjs",
-    "prebuild": "npm run guard:blocks"
+    "guard:assets": "node scripts/guard-assets.cjs",
+    "prebuild": "npm run guard:blocks && npm run guard:assets"
   },
   "type": "module",
   "engines": {
