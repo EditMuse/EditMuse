@@ -1,6 +1,14 @@
 (function() {
   'use strict';
 
+  // Proxy URL helper - ensures all requests use Shopify app proxy base path
+  const PROXY_BASE = '/apps/editmuse';
+  const proxyUrl = (path) => {
+    // Ensure path starts with /, then combine with PROXY_BASE
+    const normalizedPath = path.startsWith('/') ? path : '/' + path;
+    return PROXY_BASE + normalizedPath;
+  };
+
   // Safe debug helper function
   function debugLog() {
     if (!window.EDITMUSE_DEBUG) return;
@@ -1855,7 +1863,6 @@
         wrapperAttr: this.getWrapperElement() ? this.getWrapperElement().getAttribute('data-experience-id') : null
       });
       
-      var proxyUrl = '/apps/editmuse/session/start';
       var requestBody = {};
       
       // Use the experienceId we already retrieved above
@@ -1871,7 +1878,7 @@
       }
 
       try {
-        var response = await fetch(proxyUrl, {
+        var response = await fetch(proxyUrl('/session/start'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
@@ -2342,7 +2349,6 @@
       this.render();
 
       try {
-          var proxyUrl = '/apps/editmuse/session/start';
           var requestBody = {
             answers: messages,
             clientRequestId: window.__EDITMUSE_SUBMIT_LOCK.requestId
@@ -2361,7 +2367,7 @@
         debugLog('Submitting answers:', messages);
         debugLog('[EditMuse] Submitting with clientRequestId', window.__EDITMUSE_SUBMIT_LOCK);
 
-        var response = await fetch(proxyUrl, {
+        var response = await fetch(proxyUrl('/session/start'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'same-origin',
