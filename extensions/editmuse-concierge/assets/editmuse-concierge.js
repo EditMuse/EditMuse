@@ -1040,7 +1040,11 @@
   }
 
   // Custom Element: EditMuse Concierge
-  customElements.define('editmuse-concierge', class EditMuseConcierge extends HTMLElement {
+  try {
+    if (customElements.get('editmuse-concierge')) {
+      console.warn('[EditMuse] Web component already registered');
+    } else {
+      customElements.define('editmuse-concierge', class EditMuseConcierge extends HTMLElement {
     constructor() {
       super();
       
@@ -2883,6 +2887,12 @@
       return div.innerHTML;
     }
   });
+      console.log('[EditMuse] Web component registration successful');
+    }
+  } catch (error) {
+    console.error('[EditMuse] Failed to register web component:', error);
+    console.error('[EditMuse] Error stack:', error.stack);
+  }
 
   debugLog('EditMuse Concierge Web Component registered');
   
