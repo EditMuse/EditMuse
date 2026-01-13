@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "7b6c9f6df8b736639e9f5ff3db8ce680"
+client_id = "0d5be0973fcd6b60dd1edb5db97a9759"
 name = "EditMuse"
 # Production URL on Render - matches SHOPIFY_APP_URL environment variable
 application_url = "https://editmuse.onrender.com"
@@ -40,10 +40,17 @@ api_version = "2026-01"
 # - read_orders: Required for orders/create webhook to access order data
 # - write_app_proxy: Required for app proxy to function correctly
 scopes = "read_products,write_products,read_orders,write_app_proxy"
+optional_scopes = [ ]
+use_legacy_install_flow = false
 
 [auth]
-# Production redirect URL on Render
-redirect_urls = [ "https://editmuse.onrender.com" ]
+# Production redirect URLs on Render
+# Base URL for app access
+# Callback URL for OAuth authentication
+redirect_urls = [
+  "https://editmuse.onrender.com",
+  "https://editmuse.onrender.com/auth/callback"
+]
 
 [app_proxy]
 # NOTE: With automatically_update_urls_on_dev = true, Shopify CLI will automatically
