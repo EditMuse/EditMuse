@@ -1,0 +1,5 @@
+[33m8ba151d[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Fix app proxy path stripping + init blocks selector
+[33m837d7a3[m Fix app proxy path stripping + init blocks selector
+[33m2f49a6d[m Fix concierge modal fetch / proxy call
+[33m3590839[m Fix app proxy 404 + billing tweaks (redacted secrets)
+[33meef97b0[m Fix app proxy 404 + billing tweaks (redacted secrets)

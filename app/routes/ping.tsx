@@ -1,5 +1,4 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { proxyPingLoader } from "~/app-proxy-ping.server";
 
 /**
  * App Proxy Route - Handles requests when Shopify strips the /apps/editmuse prefix
@@ -10,6 +9,7 @@ import { proxyPingLoader } from "~/app-proxy-ping.server";
 const ROUTE_PATH = "/ping";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { proxyPingLoader } = await import("~/app-proxy-ping.server");
   return proxyPingLoader(request, ROUTE_PATH);
 };
 
