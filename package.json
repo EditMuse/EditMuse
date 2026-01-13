@@ -23,7 +23,9 @@
     "typecheck": "react-router typegen && tsc --noEmit",
     "guard:blocks": "node scripts/guard-blocks.cjs",
     "guard:assets": "node scripts/guard-assets.cjs",
-    "prebuild": "npm run guard:blocks && npm run guard:assets"
+    "verify:extension": "node scripts/verify-extension-deploy.cjs",
+    "prebuild": "npm run guard:blocks && npm run guard:assets",
+    "predeploy": "npm run verify:extension"
   },
   "type": "module",
   "engines": {
