@@ -844,8 +844,8 @@
   
   // Initialize all blocks on page - instance-safe with Theme Editor support
   function initAllBlocks() {
-    // Safe query for all concierge blocks
-    var blocks = document.querySelectorAll('[data-editmuse-concierge][data-editmuse-block-id]');
+    // Safe query for all concierge blocks (loosened selector to work regardless of block-id attribute)
+    var blocks = document.querySelectorAll('[data-editmuse-concierge]');
     
     for (var i = 0; i < blocks.length; i++) {
       var block = blocks[i];
@@ -2925,7 +2925,7 @@
     if (e.detail && e.detail.sectionId) {
       var section = document.querySelector('[data-section-id="' + e.detail.sectionId + '"]');
       if (section) {
-        var blocks = section.querySelectorAll('[data-editmuse-concierge][data-editmuse-block-id]');
+        var blocks = section.querySelectorAll('[data-editmuse-concierge]');
         for (var i = 0; i < blocks.length; i++) {
           var blockId = blocks[i].getAttribute('data-editmuse-block-id') || blocks[i].getAttribute('data-block-id') || blocks[i].getAttribute('data-em-block-id');
       if (blockId) {

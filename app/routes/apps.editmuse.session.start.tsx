@@ -215,20 +215,43 @@ function parsePreferencesFromText(text: string, knownOptionNames: string[]): Var
   return prefs;
 }
 
+// Handle OPTIONS for CORS preflight (POST requests trigger this)
+export const options = async ({ request }: LoaderFunctionArgs) => {
+  console.log("[App Proxy] OPTIONS /apps/editmuse/session/start (CORS preflight)");
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Max-Age": "86400",
+    },
+  });
+};
+
 // Add loader to handle GET requests (for health checks / debugging)
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   console.log("[App Proxy] GET /apps/editmuse/session/start");
+  console.log("[App Proxy] Request method:", request.method);
+  console.log("[App Proxy] Request URL:", request.url);
+  console.log("[App Proxy] Request pathname:", new URL(request.url).pathname);
+  
   return Response.json({ 
     ok: true, 
     route: "session/start",
-    method: "GET",
-    note: "This endpoint requires POST. Use POST to start a session or fetch questions."
+    method: request.method,
+    pathname: new URL(request.url).pathname,
+    note: "This endpoint requires POST. Use POST to start a session or fetch questions.",
+    troubleshooting: "If POST requests return 404, check Shopify app proxy configuration in Partners dashboard."
   });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
+  console.log("[App Proxy] ========== POST REQUEST RECEIVED ==========");
   console.log("[App Proxy] POST /apps/editmuse/session/start");
   console.log("[App Proxy] Request URL:", request.url);
+  console.log("[App Proxy] Request method:", request.method);
+  console.log("[App Proxy] Request headers:", Object.fromEntries(request.headers.entries()));
 
   if (request.method !== "POST") {
     console.log("[App Proxy] Method not allowed:", request.method);
