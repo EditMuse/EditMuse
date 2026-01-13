@@ -2516,15 +2516,29 @@
       }
 
       // Render button (if not open)
+      // Check if there's already a trigger button in the parent wrapper
+      var wrapperEl = this.closest('.editmuse-concierge-root') || this.getWrapperElement();
+      var hasTriggerButton = wrapperEl && wrapperEl.querySelector('[data-editmuse-trigger]');
+      
       if (!this.state.open) {
-        this.innerHTML = `
-          <div class="editmuse-concierge-block">
-            <button type="button" class="${buttonClasses}" data-editmuse-start>
-              ${this.escapeHtml(this.getButtonLabel())}
-            </button>
-            ${poweredByHTML}
-          </div>
-        `;
+        // Only render internal button if no external trigger button exists
+        if (!hasTriggerButton) {
+          this.innerHTML = `
+            <div class="editmuse-concierge-block">
+              <button type="button" class="${buttonClasses}" data-editmuse-start>
+                ${this.escapeHtml(this.getButtonLabel())}
+              </button>
+              ${poweredByHTML}
+            </div>
+          `;
+        } else {
+          // External trigger button exists, just render empty container (hidden)
+          this.innerHTML = `
+            <div class="editmuse-concierge-block" style="display: none;">
+              ${poweredByHTML}
+            </div>
+          `;
+        }
         return;
       }
 
@@ -2953,45 +2967,84 @@
     setTimeout(initAllBlocks, 50);
   }
   
+  // Initialize trigger button handlers
+  function initTriggerButtons() {
+    var triggers = document.querySelectorAll('[data-editmuse-trigger]');
+    debugLog('[EditMuse] Initializing trigger buttons, found:', triggers.length);
+    
+    for (var i = 0; i < triggers.length; i++) {
+      var btn = triggers[i];
+      
+      // Skip if already bound
+      if (btn.dataset.editmuseTriggerBound === '1') {
+        continue;
+      }
+      btn.dataset.editmuseTriggerBound = '1';
+      
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        debugLog('[EditMuse] Trigger button clicked');
+        
+        // Find nearest .editmuse-concierge-root wrapper
+        var root = this.closest('.editmuse-concierge-root');
+        if (!root) {
+          debugLog('[EditMuse] Trigger: root wrapper not found');
+          return;
+        }
+        
+        // Find nearest <editmuse-concierge> element
+        var concierge = root.querySelector('editmuse-concierge');
+        if (concierge && typeof concierge.handleStart === 'function') {
+          debugLog('[EditMuse] Trigger: calling handleStart on concierge element');
+          concierge.handleStart();
+        } else {
+          debugLog('[EditMuse] Trigger: concierge element not found or handleStart not available, dispatching event');
+          // Dispatch custom event as fallback
+          var event = new CustomEvent('editmuse:open', {
+            bubbles: true,
+            cancelable: true,
+            detail: { root: root }
+          });
+          root.dispatchEvent(event);
+        }
+      });
+    }
+  }
+
   // Listen for Shopify theme editor events
   if (typeof document !== 'undefined') {
     // Wrap initialization in DOMContentLoaded
-    document.addEventListener("DOMContentLoaded", function() {
+    if (document.readyState === 'loading') {
+      document.addEventListener("DOMContentLoaded", function() {
+        initAllBlocks();
+        initTriggerButtons();
+      });
+    } else {
+      // DOM already loaded
       initAllBlocks();
-      
-      // Set up trigger button handlers
-      const triggers = document.querySelectorAll("[data-editmuse-concierge-trigger]");
-      triggers.forEach(btn => {
-        btn.addEventListener("click", function() {
-          const block = btn.closest(".editmuse-concierge-root");
-          if (!block) return;
-          
-          // Find the custom element
-          const customEl = block.querySelector("editmuse-concierge");
-          if (customEl && typeof customEl.handleStart === 'function') {
-            customEl.handleStart();
-          }
-        });
-      });
-
-      // Close modal handlers
-      document.addEventListener("click", function(e) {
-        if (e.target.matches("[data-editmuse-close],[data-editmuse-overlay]")) {
-          const modal = e.target.closest("[data-editmuse-modal]");
-          if (modal) {
-            modal.classList.remove("show");
-            modal.hidden = true;
-          }
-        }
-      });
-    });
+      initTriggerButtons();
+    }
     
-    // Theme Editor events
+    // Theme Editor events - re-init trigger buttons on section load
+    function handleSectionLoadWithTriggers() {
+      handleSectionLoad();
+      setTimeout(initTriggerButtons, 100);
+    }
+    
     if (window.Shopify && window.Shopify.designMode) {
-      document.addEventListener('shopify:section:load', handleSectionLoad);
+      document.addEventListener('shopify:section:load', handleSectionLoadWithTriggers);
       document.addEventListener('shopify:block:select', handleBlockSelect);
       document.addEventListener('shopify:block:deselect', handleBlockDeselect);
       document.addEventListener('shopify:section:unload', handleSectionUnload);
+    } else {
+      // Storefront: listen for section load events too
+      document.addEventListener('shopify:section:load', function() {
+        setTimeout(function() {
+          initAllBlocks();
+          initTriggerButtons();
+        }, 50);
+      });
     }
   }
 })();
