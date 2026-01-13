@@ -216,6 +216,28 @@ function parsePreferencesFromText(text: string, knownOptionNames: string[]): Var
 }
 
 /**
+ * Unified handler for session/start route
+ * @param args - React Router LoaderFunctionArgs or ActionFunctionArgs
+ */
+export async function appProxySessionStart(
+  args: { request: Request }
+): Promise<Response> {
+  const { request } = args;
+  const routePath = "/session/start";
+  
+  if (request.method === "GET" || request.method === "HEAD") {
+    return proxySessionStartLoader(request, routePath);
+  }
+  
+  if (request.method === "OPTIONS") {
+    return proxySessionStartOptions(request, routePath);
+  }
+  
+  // POST request
+  return proxySessionStartAction(request, routePath);
+}
+
+/**
  * Shared loader function for session/start endpoint
  * @param request - The incoming request
  * @param routePath - The route path for logging (e.g., "/apps/editmuse/session/start" or "/session/start")
