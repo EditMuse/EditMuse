@@ -1,4 +1,3 @@
 name = "editmuse-concierge"
 type = "theme"
-# UID updated to force new version deployment (ensures assets are re-uploaded)
 uid = "e8233274-198f-7aa9-37cf-50fdc4d939a4782b49aa"

@@ -133,8 +133,6 @@
 
   {{ 'editmuse-concierge.css' | asset_url | stylesheet_tag }}
 
-  <button type="button" class="editmuse-trigger" data-editmuse-trigger style="display: inline-flex; align-items: center; justify-content: center; padding: 12px 24px; background-color: #7C3AED; color: #ffffff; border: none; border-radius: 14px; font-size: 16px; font-weight: 500; cursor: pointer; z-index: 999998; position: relative; min-height: 44px; transition: opacity 0.2s, transform 0.2s;">{{ final_button_label }}</button>
-
   <editmuse-concierge
     id="editmuse-concierge-{{ block.id }}"
     start-mode="{{ start_mode }}"
