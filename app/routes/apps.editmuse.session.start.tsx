@@ -1235,33 +1235,48 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               // Note: balanceUsed may be stale, but this prevents obvious cap violations
               const { getActiveCharge } = await import("~/models/shopify-billing.server");
               try {
-                const activeCharge = await getActiveCharge(shopDomain);
-                if (activeCharge?.usageCapAmountUsd && activeCharge?.usageBalanceUsedUsd !== null) {
-                  const projectedBalance = activeCharge.usageBalanceUsedUsd + overageAmountUsd;
-                  if (projectedBalance > activeCharge.usageCapAmountUsd) {
-                    // Cap would be exceeded - block the request
-                    console.warn("[Billing] Overage charge would exceed cap", {
-                      currentBalance: activeCharge.usageBalanceUsedUsd,
-                      cap: activeCharge.usageCapAmountUsd,
-                      overageAmount: overageAmountUsd,
-                      projected: projectedBalance,
-                    });
-                    // Delete the session results since billing would fail
-                    await saveConciergeResult({
-                      sessionToken,
-                      productHandles: [],
-                      productIds: null,
-                      reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
-                    });
-                    return Response.json({
-                      ok: false,
-                      error: "Your usage cap has been reached. Please contact support or wait for the next billing cycle to continue using EditMuse.",
-                      errorCode: "USAGE_CAP_REACHED",
-                    }, { status: 403 });
+                // Try to get access token for shop (for app proxy context)
+                let accessToken: string | undefined;
+                try {
+                  const token = await getAccessTokenForShop(shopDomain);
+                  accessToken = token || undefined;
+                } catch (tokenError) {
+                  // No access token available - skip cap check (non-fatal)
+                  console.log("[App Proxy] No access token for overage cap check, skipping (non-fatal)");
+                }
+                
+                // Only check cap if we have an access token
+                if (accessToken) {
+                  const activeCharge = await getActiveCharge(shopDomain, { accessToken });
+                  if (activeCharge?.usageCapAmountUsd && activeCharge?.usageBalanceUsedUsd !== null) {
+                    const projectedBalance = activeCharge.usageBalanceUsedUsd + overageAmountUsd;
+                    if (projectedBalance > activeCharge.usageCapAmountUsd) {
+                      // Cap would be exceeded - block the request
+                      console.warn("[Billing] Overage charge would exceed cap", {
+                        currentBalance: activeCharge.usageBalanceUsedUsd,
+                        cap: activeCharge.usageCapAmountUsd,
+                        overageAmount: overageAmountUsd,
+                        projected: projectedBalance,
+                      });
+                      // Delete the session results since billing would fail
+                      await saveConciergeResult({
+                        sessionToken,
+                        productHandles: [],
+                        productIds: null,
+                        reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
+                      });
+                      return Response.json({
+                        ok: false,
+                        error: "Your usage cap has been reached. Please contact support or wait for the next billing cycle to continue using EditMuse.",
+                        errorCode: "USAGE_CAP_REACHED",
+                      }, { status: 403 });
+                    }
                   }
                 }
               } catch (capCheckError) {
-                // If cap check fails, proceed anyway (best-effort)
+                // Non-fatal: if we can't check the cap, proceed anyway (cap check is best-effort)
+                // Log but don't throw - this should never block the request
+                console.warn("[Billing] Could not check usage cap (non-fatal, proceeding):", capCheckError instanceof Error ? capCheckError.message : String(capCheckError));
                 console.warn("[Billing] Could not check usage cap, proceeding:", capCheckError);
               }
               

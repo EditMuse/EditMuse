@@ -82,6 +82,34 @@ async function runGraphQL(
 }
 
 /**
+ * Check if a shop is a development store
+ * Returns true if partnerDevelopment is true
+ */
+export async function isDevelopmentStore(
+  shopDomain: string,
+  opts?: { admin?: any; accessToken?: string }
+): Promise<boolean> {
+  try {
+    const query = `
+      query {
+        shop {
+          plan {
+            partnerDevelopment
+          }
+        }
+      }
+    `;
+
+    const data = await runGraphQL(shopDomain, query, undefined, opts);
+    return data.shop?.plan?.partnerDevelopment === true;
+  } catch (error) {
+    console.warn("[Billing] Failed to check if store is development store:", error);
+    // If we can't check, assume it's not a dev store (safer)
+    return false;
+  }
+}
+
+/**
  * Create a recurring subscription charge via Shopify Billing API (GraphQL)
  * Uses appSubscriptionCreate with recurring and usage line items
  */
@@ -157,6 +185,14 @@ export async function createRecurringCharge(
     }
   `;
 
+  // Check if this is a development store - always use test mode for dev stores
+  const isDevStore = await isDevelopmentStore(shopDomain, opts);
+  
+  // Use test mode if:
+  // 1. Not in production environment, OR
+  // 2. It's a development store (even in production-like environments)
+  const useTestMode = process.env.NODE_ENV !== "production" || isDevStore;
+
   const variables = {
     name: subscriptionName,
     lineItems: [
@@ -184,8 +220,12 @@ export async function createRecurringCharge(
       },
     ],
     returnUrl,
-    test: process.env.NODE_ENV !== "production",
+    test: useTestMode,
   };
+  
+  if (isDevStore) {
+    console.log("[Billing] Development store detected - using test mode for subscription creation");
+  }
 
   const data = await runGraphQL(shopDomain, mutation, variables, opts);
 

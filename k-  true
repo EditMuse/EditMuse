@@ -1,0 +1,26 @@
+[35mCHATGPT_CODEBASE_SUMMARY.md[m[36m:[m[32m88[m[36m:[m- `isAIRankingEnabled()`: Checks `FEATURE_AI_RANKING` env var and `[1;31mOPENAI_API_KEY[m`
+[35mCHATGPT_CODEBASE_SUMMARY.md[m[36m:[m[32m490[m[36m:[m- `[1;31mOPENAI_API_KEY[m`: For AI ranking (optional - feature can be disabled)
+[35mapp/env-validation.server.ts[m[36m:[m[32m56[m[36m:[m  const openaiKey = process.env.[1;31mOPENAI_API_KEY[m;
+[35mapp/env-validation.server.ts[m[36m:[m[32m61[m[36m:[m  console.log("[ENV] [1;31mOPENAI_API_KEY[m:", openaiKey ? "SET (length: " + openaiKey.length + ")" : "NOT SET");
+[35mapp/env-validation.server.ts[m[36m:[m[32m67[m[36m:[m        "[ENV] ⚠️  WARNING: FEATURE_AI_RANKING is enabled but [1;31mOPENAI_API_KEY[m is not set.\n" +
+[35mapp/env-validation.server.ts[m[36m:[m[32m68[m[36m:[m        "AI ranking will be disabled. Set [1;31mOPENAI_API_KEY[m in your .env file to enable."
+[35mapp/models/ai-ranking.server.ts[m[36m:[m[32m49[m[36m:[m  const apiKey = process.env.[1;31mOPENAI_API_KEY[m;
+[35mapp/models/ai-ranking.server.ts[m[36m:[m[32m54[m[36m:[m  console.log("[AI Ranking]   [1;31mOPENAI_API_KEY[m:", hasApiKey ? "SET" : "NOT SET");
+[35mapp/models/ai-ranking.server.ts[m[36m:[m[32m62[m[36m:[m    console.log("[AI Ranking] ❌ DISABLED - [1;31mOPENAI_API_KEY[m not set in environment");
+[35mapp/models/ai-ranking.server.ts[m[36m:[m[32m311[m[36m:[m  const apiKey = process.env.[1;31mOPENAI_API_KEY[m;
+[35mapp/models/ai-ranking.server.ts[m[36m:[m[32m313[m[36m:[m    console.log("[AI Ranking] [1;31mOPENAI_API_KEY[m not set - using deterministic fallback");
+[35mapp/routes/apps.editmuse.session.finish.tsx[m[36m:[m[32m132[m[36m:[m    const openaiApiKey = process.env.[1;31mOPENAI_API_KEY[m;
+[35mdocs/GITHUB_SETUP.md[m[36m:[m[32m143[m[36m:[m[1;31mOPENAI_API_KEY[m=your_openai_key_here
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m46[m[36m:[m[1;31mOPENAI_API_KEY[m=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m52[m[36m:[m- `[1;31mOPENAI_API_KEY[m`: 
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m101[m[36m:[m[1;31mOPENAI_API_KEY[m=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m149[m[36m:[m- [ ] `[1;31mOPENAI_API_KEY[m`
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m176[m[36m:[m### 4. [1;31mOPENAI_API_KEY[m Security
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m227[m[36m:[m| `[1;31mOPENAI_API_KEY[m` | OpenAI Platform → API keys → Create new secret key |
+[35mdocs/PRODUCTION_ENV_VARIABLES.md[m[36m:[m[32m243[m[36m:[m- [ ] `[1;31mOPENAI_API_KEY[m` is valid and not expired
+[35mdocs/PRODUCTION_REQUIREMENTS.md[m[36m:[m[32m123[m[36m:[m- Set `[1;31mOPENAI_API_KEY[m` environment variable
+[35mdocs/PRODUCTION_REQUIREMENTS.md[m[36m:[m[32m219[m[36m:[m[1;31mOPENAI_API_KEY[m=sk-... (required if using AI ranking)
+[35mdocs/PRODUCTION_REQUIREMENTS.md[m[36m:[m[32m265[m[36m:[m- [ ] (Optional) Set `[1;31mOPENAI_API_KEY[m`
+[35mdocs/PRODUCTION_SETUP_GUIDE.md[m[36m:[m[32m167[m[36m:[m[1;31mOPENAI_API_KEY[m=sk-your-openai-api-key
+[35mdocs/PRODUCTION_SETUP_GUIDE.md[m[36m:[m[32m181[m[36m:[m- `[1;31mOPENAI_API_KEY[m`: From OpenAI dashboard → API keys
+[35mdocs/PRODUCTION_SETUP_GUIDE.md[m[36m:[m[32m489[m[36m:[m✅ [1;31mOPENAI_API_KEY[m=sk-...

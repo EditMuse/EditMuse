@@ -1851,7 +1851,7 @@
         wrapperAttr: this.getWrapperElement() ? this.getWrapperElement().getAttribute('data-experience-id') : null
       });
       
-      var proxyUrl = '/apps/editmuse/session/start' + window.location.search;
+      var proxyUrl = '/apps/editmuse/session/start';
       var requestBody = {};
       
       // Use the experienceId we already retrieved above
@@ -2338,7 +2338,7 @@
       this.render();
 
       try {
-          var proxyUrl = '/apps/editmuse/session/start' + window.location.search;
+          var proxyUrl = '/apps/editmuse/session/start';
           var requestBody = {
             answers: messages,
             clientRequestId: window.__EDITMUSE_SUBMIT_LOCK.requestId

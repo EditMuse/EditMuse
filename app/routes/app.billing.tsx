@@ -23,9 +23,10 @@ import {
   getOrCreateSubscription,
   chargeRecurringAddonsMonthly,
   markSubscriptionAsCancelled,
-  PLANS
+  PLANS,
+  creditsToX2
 } from "~/models/billing.server";
-import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, cancelSubscription } from "~/models/shopify-billing.server";
+import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, cancelSubscription, isDevelopmentStore } from "~/models/shopify-billing.server";
 
 type PlanTier = "TRIAL" | "LITE" | "GROWTH" | "SCALE" | "PRO";
 
@@ -150,6 +151,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ approved: true });
     }
 
+    // All paid plans go through Shopify billing (test mode for dev stores, real for production)
     try {
       // Create return URL with proper base (never localhost)
       const origin = process.env.SHOPIFY_APP_URL?.startsWith("https://")
@@ -226,10 +228,45 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     // Check if subscription has an active Shopify subscription GID
+    // For dev stores that skipped Shopify billing, we need to create a test subscription first
     if (!subscription.shopifySubscriptionGid) {
-      return json({ 
-        error: "No active subscription found. Please upgrade to a paid plan first." 
-      }, { status: 400 });
+      const isDevStore = await isDevelopmentStore(session.shop, { admin });
+      
+      if (isDevStore) {
+        // For dev stores, create a test Shopify subscription so add-ons can use test billing
+        console.log("[Billing] Dev store has no Shopify subscription - creating test subscription for add-on billing");
+        
+        try {
+          const origin = process.env.SHOPIFY_APP_URL?.startsWith("https://")
+            ? process.env.SHOPIFY_APP_URL
+            : new URL(request.url).origin;
+          
+          const returnUrl = `${origin}/app/billing?shop=${session.shop}&plan=${subscription.planTier}`;
+          
+          // Create a test subscription with the current plan tier
+          const testSubscription = await createRecurringCharge(
+            session.shop,
+            subscription.planTier as PlanTier,
+            returnUrl,
+            { admin }
+          );
+          
+          // Update subscription with Shopify GIDs
+          await updateSubscriptionFromCharge(shop.id, session.shop, subscription.planTier as PlanTier, { admin });
+          
+          console.log("[Billing] Test subscription created for dev store add-on billing");
+        } catch (error) {
+          console.error("[Billing] Error creating test subscription for dev store:", error);
+          return json({ 
+            error: "Failed to set up billing. Please try upgrading your plan first." 
+          }, { status: 400 });
+        }
+      } else {
+        // Production store without subscription - error
+        return json({ 
+          error: "No active subscription found. Please upgrade to a paid plan first." 
+        }, { status: 400 });
+      }
     }
 
     // Verify subscription is active in Shopify (case-insensitive status check)
