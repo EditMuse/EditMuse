@@ -2,7 +2,6 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { useLoaderData, Form, redirect, useActionData, useNavigation } from "react-router";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
-import { json } from "@remix-run/node";
 import { UsageEventType } from "@prisma/client";
 import { useState, useEffect } from "react";
 
@@ -142,7 +141,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     })
   );
 
-  return json({ experiments: experimentsWithResults });
+  return Response.json({ experiments: experimentsWithResults });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -153,7 +152,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
 
   if (!shop) {
-    return json({ error: "Shop not found" }, { status: 404 });
+    return Response.json({ error: "Shop not found" }, { status: 404 });
   }
 
   const formData = await request.formData();
@@ -165,17 +164,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const variantsJson = formData.get("variants")?.toString();
 
     if (!key || !variantsJson) {
-      return json({ error: "Missing required fields" }, { status: 400 });
+      return Response.json({ error: "Missing required fields" }, { status: 400 });
     }
 
     let variants: any;
     try {
       variants = JSON.parse(variantsJson);
       if (!Array.isArray(variants) || variants.length < 2) {
-        return json({ error: "Variants must be a JSON array with at least 2 variants" }, { status: 400 });
+        return Response.json({ error: "Variants must be a JSON array with at least 2 variants" }, { status: 400 });
       }
     } catch (e) {
-      return json({ error: "Invalid variants JSON" }, { status: 400 });
+      return Response.json({ error: "Invalid variants JSON" }, { status: 400 });
     }
 
     if (actionType === "update" && id) {
@@ -206,7 +205,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     }
 
-    return json({ success: true });
+    return Response.json({ success: true });
   }
 
   if (actionType === "toggle") {
@@ -214,7 +213,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const isActive = formData.get("isActive")?.toString() === "true";
 
     if (!id) {
-      return json({ error: "Missing id" }, { status: 400 });
+      return Response.json({ error: "Missing id" }, { status: 400 });
     }
 
     await prisma.experiment.update({
@@ -222,14 +221,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       data: { isActive, startedAt: isActive ? new Date() : undefined },
     });
 
-    return json({ success: true });
+    return Response.json({ success: true });
   }
 
   if (actionType === "delete") {
     const id = formData.get("id")?.toString();
 
     if (!id) {
-      return json({ error: "Missing id" }, { status: 400 });
+      return Response.json({ error: "Missing id" }, { status: 400 });
     }
 
     await prisma.experiment.delete({
@@ -239,7 +238,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return redirect("/app/experiments");
   }
 
-  return json({ error: "Invalid action" }, { status: 400 });
+  return Response.json({ error: "Invalid action" }, { status: 400 });
 };
 
 export default function ExperimentsPage() {
