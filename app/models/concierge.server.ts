@@ -61,6 +61,16 @@ export async function extractQueryFromMessages(sessionId: string): Promise<{ raw
 }
 
 /**
+ * Gets a concierge session by public token
+ */
+export async function getConciergeSessionByToken(sessionToken: string) {
+  return await prisma.conciergeSession.findUnique({
+    where: { publicToken: sessionToken },
+    include: { shop: true },
+  });
+}
+
+/**
  * Creates a new concierge session and returns the public token
  */
 export async function createConciergeSession({
@@ -97,6 +107,53 @@ export async function createConciergeSession({
   });
 
   return publicToken;
+}
+
+/**
+ * Saves concierge result and marks session as COMPLETE
+ */
+export async function saveConciergeResult({
+  sessionToken,
+  productHandles,
+  productIds,
+  reasoning,
+}: {
+  sessionToken: string;
+  productHandles: string[];
+  productIds?: string[] | null;
+  reasoning?: string | null;
+}): Promise<void> {
+  // Find session by token
+  const session = await prisma.conciergeSession.findUnique({
+    where: { publicToken: sessionToken },
+    select: { id: true },
+  });
+
+  if (!session) {
+    throw new Error(`ConciergeSession not found for token: ${sessionToken}`);
+  }
+
+  // Upsert result and update session status
+  await prisma.$transaction([
+    prisma.conciergeResult.upsert({
+      where: { sessionId: session.id },
+      create: {
+        sessionId: session.id,
+        productHandles: productHandles,
+        productIds: productIds || null,
+        reasoning: reasoning || null,
+      },
+      update: {
+        productHandles: productHandles,
+        productIds: productIds || null,
+        reasoning: reasoning || null,
+      },
+    }),
+    prisma.conciergeSession.update({
+      where: { id: session.id },
+      data: { status: ConciergeSessionStatus.COMPLETE },
+    }),
+  ]);
 }
 
 /**
