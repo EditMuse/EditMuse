@@ -57,6 +57,104 @@
     }
   }
 
+  // Proxy URL helper
+  const PROXY_BASE = '/apps/editmuse';
+  function proxyUrl(path) {
+    var normalizedPath = path.startsWith('/') ? path : '/' + path;
+    return PROXY_BASE + normalizedPath;
+  }
+
+  // Fetch and cache shop settings from app proxy (once per page load)
+  var shopConfigCache = null;
+  var shopConfigPromise = null;
+  function fetchShopConfig() {
+    // Return cached config if available
+    if (shopConfigCache !== null) {
+      return Promise.resolve(shopConfigCache);
+    }
+
+    // Return existing promise if fetch is in progress
+    if (shopConfigPromise) {
+      return shopConfigPromise;
+    }
+
+    // Check sessionStorage first
+    try {
+      var cached = sessionStorage.getItem('editmuse_shop_config');
+      if (cached) {
+        shopConfigCache = JSON.parse(cached);
+        return Promise.resolve(shopConfigCache);
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+
+    // Fetch from API
+    shopConfigPromise = fetch(proxyUrl('/config') + window.location.search, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {
+        // Include stored ETag for conditional request
+        'If-None-Match': (function() {
+          try {
+            var cached = sessionStorage.getItem('editmuse_shop_config_etag');
+            return cached || '';
+          } catch (e) {
+            return '';
+          }
+        })(),
+      },
+    })
+      .then(function(response) {
+        // 304 Not Modified - use cached config (skip storing new config)
+        if (response.status === 304) {
+          shopConfigPromise = null;
+          try {
+            var cached = sessionStorage.getItem('editmuse_shop_config');
+            if (cached) {
+              shopConfigCache = JSON.parse(cached);
+              return shopConfigCache;
+            }
+          } catch (e) {
+            // Fall through to default
+          }
+        }
+        
+        if (!response.ok) {
+          shopConfigPromise = null;
+          throw new Error('Failed to fetch config');
+        }
+        return response.json().then(function(config) {
+          shopConfigCache = config;
+          shopConfigPromise = null;
+          // Cache config and ETag in sessionStorage
+          try {
+            sessionStorage.setItem('editmuse_shop_config', JSON.stringify(config));
+            var etag = response.headers.get('ETag');
+            if (etag) {
+              sessionStorage.setItem('editmuse_shop_config_etag', etag);
+            }
+          } catch (e) {
+            // Ignore storage errors
+          }
+          return config;
+        });
+      })
+      .catch(function(error) {
+        shopConfigPromise = null;
+        // Return default config on error
+        return {
+          buttonLabel: 'Ask EditMuse',
+          placementMode: 'inline',
+          defaultResultsCount: 8,
+          mode: 'guided',
+          enabled: true,
+        };
+      });
+
+    return shopConfigPromise;
+  }
+
   function getSessionId() {
     // Check URL first, then fallback to sessionStorage
     var params = new URLSearchParams(window.location.search);
@@ -573,7 +671,10 @@
       }
     }
     
-    loadResults();
+    // Fetch config first (cache it), then load results
+    fetchShopConfig().then(function() {
+      loadResults();
+    });
   }
 
   if (document.readyState === 'loading') {
@@ -688,5 +789,50 @@
         return originalFetch.apply(this, arguments);
       };
     }
+
+    // Track checkout started events
+    // Monitor for checkout button clicks and form submissions
+    document.addEventListener('click', function(e) {
+      var target = e.target;
+      if (!target) return;
+
+      // Check if clicked element is a checkout button/link
+      var checkoutButton = target.closest('a[href*="/checkout"], button[type="submit"][formaction*="/checkout"], [data-checkout], [name="add"][formaction*="/cart"], form[action*="/cart"] button[type="submit"]');
+      if (!checkoutButton) {
+        // Also check for common checkout button classes/text
+        var text = (target.textContent || '').toLowerCase();
+        if ((text.includes('checkout') || text.includes('buy now') || text.includes('purchase')) && 
+            (target.tagName === 'BUTTON' || target.tagName === 'A' || target.closest('button') || target.closest('a'))) {
+          checkoutButton = target.closest('button, a') || target;
+        }
+      }
+
+      if (checkoutButton) {
+        sendEvent('CHECKOUT_STARTED', sessionId, {
+          source: 'click',
+          element: checkoutButton.tagName || 'unknown'
+        });
+      }
+    }, true); // Use capture phase
+
+    // Track checkout form submissions
+    document.addEventListener('submit', function(e) {
+      var form = e.target;
+      if (!form || form.tagName !== 'FORM') return;
+      
+      var action = form.action || '';
+      if (action.indexOf('/checkout') !== -1 || action.indexOf('/cart') !== -1) {
+        // Check if this is a checkout/cart submission (not just add-to-cart)
+        var isCheckout = action.indexOf('/checkout') !== -1 || 
+                        (action.indexOf('/cart') !== -1 && !action.includes('/cart/add'));
+        
+        if (isCheckout) {
+          sendEvent('CHECKOUT_STARTED', sessionId, {
+            source: 'form_submit',
+            action: action
+          });
+        }
+      }
+    }, true); // Use capture phase
   })();
 })();

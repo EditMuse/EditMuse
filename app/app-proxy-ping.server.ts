@@ -20,6 +20,19 @@ export async function proxyPingLoader(
   request: Request,
   routePath: string
 ): Promise<Response> {
-  console.log(`[App Proxy] GET ${routePath}`);
-  return Response.json({ ok: true, route: "ping" });
+  const { withProxyLogging } = await import("~/utils/proxy-logging.server");
+  const { getShopFromAppProxy } = await import("~/app-proxy.server");
+  
+  const url = new URL(request.url);
+  const query = url.searchParams;
+  const shopDomain = getShopFromAppProxy(query) || query.get("shop") || undefined;
+
+  return withProxyLogging(
+    async () => {
+      return Response.json({ ok: true, route: "ping" });
+    },
+    request,
+    routePath,
+    shopDomain
+  );
 }

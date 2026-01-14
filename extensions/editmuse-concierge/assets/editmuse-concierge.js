@@ -30,6 +30,312 @@
   function isDesignMode() {
     return !!(window.Shopify && window.Shopify.designMode);
   }
+
+  // Fetch and cache shop settings from app proxy
+  var shopConfigCache = null;
+  var shopConfigPromise = null;
+  function fetchShopConfig() {
+    // Return cached config if available
+    if (shopConfigCache !== null) {
+      return Promise.resolve(shopConfigCache);
+    }
+
+    // Return existing promise if fetch is in progress
+    if (shopConfigPromise) {
+      return shopConfigPromise;
+    }
+
+    // Check sessionStorage first
+    try {
+      var cached = sessionStorage.getItem('editmuse_shop_config');
+      if (cached) {
+        shopConfigCache = JSON.parse(cached);
+        return Promise.resolve(shopConfigCache);
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+
+    // Fetch from API
+    shopConfigPromise = fetch(proxyUrl('/config') + window.location.search, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {
+        // Include stored ETag for conditional request
+        'If-None-Match': (function() {
+          try {
+            var cached = sessionStorage.getItem('editmuse_shop_config_etag');
+            return cached || '';
+          } catch (e) {
+            return '';
+          }
+        })(),
+      },
+    })
+      .then(function(response) {
+        // 304 Not Modified - use cached config (skip storing new config)
+        if (response.status === 304) {
+          shopConfigPromise = null;
+          try {
+            var cached = sessionStorage.getItem('editmuse_shop_config');
+            if (cached) {
+              shopConfigCache = JSON.parse(cached);
+              return shopConfigCache;
+            }
+          } catch (e) {
+            // Fall through to default
+          }
+        }
+        
+        if (!response.ok) {
+          shopConfigPromise = null;
+          throw new Error('Failed to fetch config');
+        }
+        return response.json().then(function(config) {
+          shopConfigCache = config;
+          shopConfigPromise = null;
+          // Cache config and ETag in sessionStorage
+          try {
+            sessionStorage.setItem('editmuse_shop_config', JSON.stringify(config));
+            var etag = response.headers.get('ETag');
+            if (etag) {
+              sessionStorage.setItem('editmuse_shop_config_etag', etag);
+            }
+          } catch (e) {
+            // Ignore storage errors
+          }
+          return config;
+        });
+      })
+      .catch(function(error) {
+        shopConfigPromise = null;
+        // Return default config on error
+        return {
+          buttonLabel: 'Ask EditMuse',
+          placementMode: 'inline',
+          defaultResultsCount: 8,
+          mode: 'guided',
+          enabled: true,
+        };
+      });
+
+    return shopConfigPromise;
+  }
+
+  // ============================================
+  // A/B TESTING SYSTEM
+  // ============================================
+
+  // Get or create visitor ID (persisted in localStorage)
+  function getVisitorId() {
+    try {
+      var vid = localStorage.getItem('editmuse_vid');
+      if (vid && vid.trim() !== '') {
+        return vid.trim();
+      }
+      // Generate new UUID
+      var newVid = (window.crypto && crypto.randomUUID) 
+        ? crypto.randomUUID() 
+        : 'v' + Date.now() + '-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+      localStorage.setItem('editmuse_vid', newVid);
+      return newVid;
+    } catch (e) {
+      // Fallback if localStorage unavailable
+      return 'v' + Date.now() + '-' + Math.random().toString(36).substring(2, 15);
+    }
+  }
+
+  // Stable hash function (simple string hash for consistent assignment)
+  function stableHash(str) {
+    var hash = 0;
+    if (str.length === 0) return hash;
+    for (var i = 0; i < str.length; i++) {
+      var char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash);
+  }
+
+  // Pick variant for an experiment using stable hashing
+  function pickVariant(visitorId, experimentKey, variants) {
+    if (!Array.isArray(variants) || variants.length === 0) {
+      return null;
+    }
+    var hashInput = visitorId + ':' + experimentKey;
+    var hash = stableHash(hashInput);
+    var index = hash % variants.length;
+    var variant = variants[index];
+    return variant && variant.name ? variant.name : null;
+  }
+
+  // Fetch and cache experiments (10 min cache in sessionStorage)
+  var experimentsCache = null;
+  var experimentsPromise = null;
+  function fetchExperiments() {
+    // Return cached if available and not expired (10 min = 600000 ms)
+    if (experimentsCache !== null) {
+      return Promise.resolve(experimentsCache);
+    }
+
+    // Return existing promise if fetch is in progress
+    if (experimentsPromise) {
+      return experimentsPromise;
+    }
+
+    // Check sessionStorage cache
+    try {
+      var cachedData = sessionStorage.getItem('editmuse_experiments_cache');
+      if (cachedData) {
+        var parsed = JSON.parse(cachedData);
+        var cacheTime = parsed.timestamp || 0;
+        var now = Date.now();
+        if (now - cacheTime < 600000) { // 10 minutes
+          experimentsCache = parsed.experiments || [];
+          return Promise.resolve(experimentsCache);
+        }
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+
+    // Fetch from API
+    experimentsPromise = fetch(proxyUrl('/experiments') + window.location.search, {
+      method: 'GET',
+      credentials: 'same-origin',
+    })
+      .then(function(response) {
+        if (!response.ok) {
+          throw new Error('Failed to fetch experiments');
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        var experiments = Array.isArray(data.experiments) ? data.experiments : [];
+        experimentsCache = experiments;
+        experimentsPromise = null;
+        // Cache in sessionStorage
+        try {
+          sessionStorage.setItem('editmuse_experiments_cache', JSON.stringify({
+            experiments: experiments,
+            timestamp: Date.now(),
+          }));
+        } catch (e) {
+          // Ignore storage errors
+        }
+        return experiments;
+      })
+      .catch(function(error) {
+        experimentsPromise = null;
+        console.error('[EditMuse] Error fetching experiments:', error);
+        experimentsCache = []; // Cache empty array on error
+        return [];
+      });
+
+    return experimentsPromise;
+  }
+
+  // Send experiment exposed event (with daily dedupe)
+  function sendExperimentExposed(visitorId, experimentKey, variantName, forced) {
+    try {
+      // Daily dedupe: check if we've already sent this exposure today
+      var today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+      var dedupeKey = 'editmuse_exp_' + visitorId + '_' + experimentKey + '_' + variantName + '_' + today;
+      var alreadySent = localStorage.getItem(dedupeKey);
+      if (alreadySent && !forced) {
+        debugLog('[EditMuse] Experiment exposure already logged today:', dedupeKey);
+        return;
+      }
+
+      // Send event
+      var url = '/apps/editmuse/event' + window.location.search;
+      var payload = {
+        eventType: 'EXPERIMENT_EXPOSED',
+        sid: null,
+        metadata: {
+          visitorId: visitorId,
+          experimentKey: experimentKey,
+          variantName: variantName,
+          forced: forced === true,
+        },
+      };
+
+      // Prefer beacon so navigation doesn't block
+      if (navigator.sendBeacon) {
+        var blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        navigator.sendBeacon(url, blob);
+      } else {
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          keepalive: true,
+          body: JSON.stringify(payload),
+        }).catch(function() {});
+      }
+
+      // Mark as sent for today
+      try {
+        localStorage.setItem(dedupeKey, '1');
+      } catch (e) {
+        // Ignore storage errors
+      }
+
+      debugLog('[EditMuse] Experiment exposure logged:', { experimentKey, variantName, forced });
+    } catch (e) {
+      console.error('[EditMuse] Error sending experiment exposure:', e);
+    }
+  }
+
+  // Compute experiment assignments and expose globally
+  var experimentsAssignments = {};
+  async function computeExperiments() {
+    try {
+      var visitorId = getVisitorId();
+      var experiments = await fetchExperiments();
+      var assignments = {};
+      var urlParams = new URLSearchParams(window.location.search);
+      var qaOverride = urlParams.get('editmuse_ab'); // Format: key:variant
+
+      // Parse QA override
+      var qaOverrides = {};
+      if (qaOverride) {
+        var parts = qaOverride.split(':');
+        if (parts.length === 2) {
+          qaOverrides[parts[0].trim()] = parts[1].trim();
+        }
+      }
+
+      // Compute assignments for each experiment
+      for (var i = 0; i < experiments.length; i++) {
+        var exp = experiments[i];
+        var key = exp.key;
+        var variants = Array.isArray(exp.variants) ? exp.variants : [];
+
+        // Check QA override first
+        if (qaOverrides[key]) {
+          var forcedVariant = qaOverrides[key];
+          assignments[key] = { variantName: forcedVariant };
+          sendExperimentExposed(visitorId, key, forcedVariant, true);
+          continue;
+        }
+
+        // Normal assignment
+        var variantName = pickVariant(visitorId, key, variants);
+        if (variantName) {
+          assignments[key] = { variantName: variantName };
+          sendExperimentExposed(visitorId, key, variantName, false);
+        }
+      }
+
+      experimentsAssignments = assignments;
+      window.__EDITMUSE_EXPERIMENTS = assignments;
+      debugLog('[EditMuse] Experiment assignments:', assignments);
+    } catch (e) {
+      console.error('[EditMuse] Error computing experiments:', e);
+      window.__EDITMUSE_EXPERIMENTS = {};
+    }
+  }
   
   // ============================================
   // PRESET SYSTEM
@@ -851,7 +1157,12 @@
   };
   
   // Initialize all blocks on page - instance-safe with Theme Editor support
-  function initAllBlocks() {
+  async function initAllBlocks() {
+    // Compute experiments first (if not already computed)
+    if (!window.__EDITMUSE_EXPERIMENTS) {
+      await computeExperiments();
+    }
+
     // Safe query for all concierge blocks (loosened selector to work regardless of block-id attribute)
     var blocks = document.querySelectorAll('[data-editmuse-concierge]');
     
@@ -1837,12 +2148,73 @@
     }
 
     getResultCount() {
+      // Check experiment override first (results_count_v1)
+      if (experimentsAssignments['results_count_v1'] && experimentsAssignments['results_count_v1'].variantName) {
+        var variant = experimentsAssignments['results_count_v1'].variantName;
+        // Find variant config in experiments
+        for (var i = 0; i < (experimentsCache || []).length; i++) {
+          if (experimentsCache[i].key === 'results_count_v1') {
+            var variants = Array.isArray(experimentsCache[i].variants) ? experimentsCache[i].variants : [];
+            for (var j = 0; j < variants.length; j++) {
+              if (variants[j].name === variant && variants[j].config && variants[j].config.defaultResultsCount) {
+                return parseInt(variants[j].config.defaultResultsCount, 10);
+              }
+            }
+          }
+        }
+      }
+      // Check attribute (from Liquid template)
       var count = this.getAttribute('result-count');
-      return count ? parseInt(count, 10) : undefined;
+      if (count) {
+        return parseInt(count, 10);
+      }
+      // Fall back to cached config
+      if (shopConfigCache && shopConfigCache.defaultResultsCount) {
+        return shopConfigCache.defaultResultsCount;
+      }
+      // Default fallback
+      return undefined;
     }
 
     getStartMode() {
-      return this.getAttribute('start-mode') || 'hybrid';
+      // Check experiment override first (mode_v1)
+      if (experimentsAssignments['mode_v1'] && experimentsAssignments['mode_v1'].variantName) {
+        var variant = experimentsAssignments['mode_v1'].variantName;
+        // Find variant config in experiments
+        for (var i = 0; i < (experimentsCache || []).length; i++) {
+          if (experimentsCache[i].key === 'mode_v1') {
+            var variants = Array.isArray(experimentsCache[i].variants) ? experimentsCache[i].variants : [];
+            for (var j = 0; j < variants.length; j++) {
+              if (variants[j].name === variant && variants[j].config && variants[j].config.mode) {
+                var expMode = variants[j].config.mode;
+                // Map mode (quick/guided) to start-mode (chat/hybrid/quiz)
+                if (expMode === 'quick') {
+                  return 'chat';
+                } else if (expMode === 'guided') {
+                  return 'hybrid';
+                }
+              }
+            }
+          }
+        }
+      }
+      // Check attribute (from Liquid template)
+      var attrValue = this.getAttribute('start-mode');
+      if (attrValue) {
+        return attrValue;
+      }
+      // Fall back to cached config (map mode to start-mode)
+      if (shopConfigCache && shopConfigCache.mode) {
+        // Map onboardingMode (quick/guided) to start-mode (chat/hybrid/quiz)
+        // quick -> chat, guided -> hybrid
+        if (shopConfigCache.mode === 'quick') {
+          return 'chat';
+        } else if (shopConfigCache.mode === 'guided') {
+          return 'hybrid';
+        }
+      }
+      // Default fallback
+      return 'hybrid';
     }
 
     getChatPlaceholder() {
@@ -1850,7 +2222,32 @@
     }
 
     getButtonLabel() {
-      return this.getAttribute('button-label') || 'Start Style Quiz';
+      // Check experiment override first (button_label_v2)
+      if (experimentsAssignments['button_label_v2'] && experimentsAssignments['button_label_v2'].variantName) {
+        var variant = experimentsAssignments['button_label_v2'].variantName;
+        // Find variant config in experiments
+        for (var i = 0; i < (experimentsCache || []).length; i++) {
+          if (experimentsCache[i].key === 'button_label_v2') {
+            var variants = Array.isArray(experimentsCache[i].variants) ? experimentsCache[i].variants : [];
+            for (var j = 0; j < variants.length; j++) {
+              if (variants[j].name === variant && variants[j].config && variants[j].config.buttonLabel) {
+                return variants[j].config.buttonLabel;
+              }
+            }
+          }
+        }
+      }
+      // Check attribute (from Liquid template)
+      var attrValue = this.getAttribute('button-label');
+      if (attrValue) {
+        return attrValue;
+      }
+      // Fall back to cached config
+      if (shopConfigCache && shopConfigCache.buttonLabel) {
+        return shopConfigCache.buttonLabel;
+      }
+      // Default fallback
+      return 'Start Style Quiz';
     }
 
     // Fetch questions from API
@@ -2957,7 +3354,10 @@
   if (typeof document !== 'undefined') {
     // Wrap initialization in DOMContentLoaded
     document.addEventListener("DOMContentLoaded", function() {
-      initAllBlocks();
+      // Fetch shop config and compute experiments first, then initialize blocks
+      Promise.all([fetchShopConfig(), computeExperiments()]).then(function() {
+        initAllBlocks();
+      });
     });
     
     // Theme Editor events

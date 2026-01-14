@@ -54,6 +54,20 @@ model Shop {
   trialEndsAt       DateTime?
   usageEvents       UsageEvent[]
   aiRankingCaches   AIRankingCache[]
+  orderAttributions OrderAttribution[]
+  attributionAttempts AttributionAttempt[]
+  experiments       Experiment[]
+  appErrors         AppError[]
+  appProxyLogs      AppProxyLog[]
+  
+  // Widget settings
+  buttonLabel       String?
+  placementMode     String? // "inline" | "sticky" | "both"
+  defaultResultsCount Int? // 8 | 12 | 16
+  widgetMode        String? // "quick" | "guided"
+  widgetTheme       String? // "light" | "dark"
+  installedBlockIdentifiers String? // JSON array of block identifiers (e.g., ["editmuse_concierge", "editmuse_results"])
+  storefrontTestUrl String? // URL to test for extension installation (e.g., https://shop.myshopify.com/)
 }
 
 model Experience {
@@ -100,6 +114,8 @@ model ConciergeSession {
   status          ConciergeSessionStatus @default(COLLECTING)
   resultCount     Int                    @default(8)
   answersJson     String                 @default("[]") // JSON array of user answers/messages
+  queryRaw        String?                // Original query text (first user message or extracted from answers)
+  queryNormalized String?                // Normalized query (lowercased, trimmed) for grouping
   clientRequestId String?
   chargedAt       DateTime?
   createdAt       DateTime               @default(now())
@@ -188,6 +204,8 @@ enum UsageEventType {
   RESULTS_VIEWED
   RECOMMENDATION_CLICKED
   ADD_TO_CART_CLICKED
+  CHECKOUT_STARTED
+  EXPERIMENT_EXPOSED
 }
 
 model UsageEvent {
@@ -219,4 +237,79 @@ model AIRankingCache {
   @@index([shopId, expiresAt])
   @@index([cacheKey, expiresAt])
   @@index([expiresAt]) // For cleanup of expired entries
+}
+
+model OrderAttribution {
+  id              String   @id @default(cuid())
+  shopId          String
+  shop            Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderId         String   // Shopify order ID
+  orderNumber     String?  // Order number/name for display
+  sessionId       String?  // ConciergeSession ID (if directly attributed)
+  sessionToken    String?  // ConciergeSession publicToken (for lookup)
+  attributionType String   // "direct" | "assisted" | "unattributed"
+  totalPrice      String   // Order total price as string (to avoid float precision issues)
+  currencyCode    String?
+  createdAt       DateTime @default(now())
+
+  @@index([shopId, createdAt])
+  @@index([orderId])
+  @@index([sessionId])
+  @@index([sessionToken])
+}
+
+model AttributionAttempt {
+  id            String   @id @default(cuid())
+  shopId        String
+  shop          Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  sessionId     String   // ConciergeSession ID
+  sessionToken  String?  // ConciergeSession publicToken (for lookup)
+  cartToken     String?  // Shopify cart token (no PII)
+  checkoutToken String?  // Shopify checkout token (no PII)
+  matchedAt     DateTime? // When this attempt was matched to an order
+  createdAt     DateTime @default(now())
+
+  @@index([shopId, sessionId])
+  @@index([shopId, cartToken])
+  @@index([shopId, checkoutToken])
+  @@index([sessionId])
+  @@index([createdAt])
+}
+
+model Experiment {
+  id        String   @id @default(cuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  key       String   // Experiment identifier (e.g., "button_label_v2")
+  isActive  Boolean  @default(false)
+  variants  Json     // JSON array of variant configurations: [{ name: "control", config: {} }, { name: "variant_a", config: {} }]
+  startedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, key])
+  @@index([shopId, isActive])
+}
+
+model AppError {
+  id          String   @id @default(cuid())
+  shopId      String?
+  shop        Shop?    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  requestId   String
+  route       String?
+  message     String
+  stack       String?
+  contextJson String?  // JSON metadata
+  createdAt   DateTime @default(now())
+}
+
+model AppProxyLog {
+  id          String   @id @default(cuid())
+  shopId      String?
+  shop        Shop?    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  requestId   String
+  route       String
+  status      Int
+  durationMs  Int
+  createdAt   DateTime @default(now())
 }

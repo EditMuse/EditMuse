@@ -5,6 +5,11 @@ import { createReadableStreamFromReadable } from "@react-router/node";
 import { type EntryContext } from "react-router";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { initSentry } from "./utils/sentry.server";
+import { getOrCreateRequestId, addRequestIdHeader } from "./utils/request-id.server";
+
+// Initialize Sentry on module load
+initSentry();
 
 export const streamTimeout = 5000;
 
@@ -14,6 +19,10 @@ export default async function handleRequest(
   responseHeaders: Headers,
   reactRouterContext: EntryContext
 ) {
+  // Generate and add request ID
+  const requestId = getOrCreateRequestId(request);
+  addRequestIdHeader(responseHeaders, requestId);
+
   addDocumentResponseHeaders(request, responseHeaders);
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? '')
