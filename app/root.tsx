@@ -1,11 +1,17 @@
 import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
 import { useEffect } from "react";
-import { initSentry } from "./utils/sentry.client";
 
-// Initialize Sentry on client side
-if (typeof window !== "undefined") {
-  initSentry();
-}
+export default function App() {
+  // Initialize Sentry on client side (lazy-loaded to avoid build errors)
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      import("./utils/sentry.client").then(({ initSentry }) => {
+        initSentry();
+      }).catch(() => {
+        // Sentry not available, skip initialization
+      });
+    }
+  }, []);
 
 export default function App() {
   return (
