@@ -6,6 +6,7 @@ import type { HeadersFunction } from "react-router";
 import prisma from "~/db.server";
 import { useState, useEffect } from "react";
 import { isResultCountAllowed, getCurrentPlan } from "~/models/billing.server";
+import { withQuery } from "~/utils/redirect.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -156,7 +157,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         where: { id: id! },
       });
       console.log("[EditExperience] Successfully deleted experience", { experienceId: id });
-      return redirect("/app/experiences");
+      return redirect(withQuery(request, "/app/experiences"));
     } catch (error) {
       console.error("[EditExperience] Error deleting experience:", error);
       return { error: error instanceof Error ? error.message : "Failed to delete experience" };
@@ -296,7 +297,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     });
 
     console.log("[EditExperience] Successfully updated experience", { experienceId: id, name, mode, resultCount });
-    return redirect("/app/experiences");
+    return redirect(withQuery(request, "/app/experiences"));
   } catch (error) {
     console.error("[EditExperience] Error updating experience:", error);
     return { error: error instanceof Error ? error.message : "Failed to update experience" };

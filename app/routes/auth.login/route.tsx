@@ -5,22 +5,38 @@ import { BreakoutRedirect } from "~/components/BreakoutRedirect";
 import { login } from "~/shopify.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const loginResult = await login(request);
   const url = new URL(request.url);
   const host = url.searchParams.get("host");
   const apiKey = process.env.SHOPIFY_API_KEY || "";
-  
-  // If login returns a redirect Response, extract Location and return JSON to prevent iframe navigation
-  if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
-    const location = loginResult.headers.get("Location");
-    if (location) {
-      // Return JSON instead of Response to break out of iframe client-side
-      return { redirectUrl: location, host, apiKey };
+
+  try {
+    const loginResult = await login(request);
+    
+    // If login returns a redirect Response, extract Location and return JSON to prevent iframe navigation
+    if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
+      const location = loginResult.headers.get("Location");
+      if (location) {
+        // Return JSON instead of Response to break out of iframe client-side
+        return { redirectUrl: location, host, apiKey };
+      }
     }
+    
+    // No redirect - return redirectUrl as null
+    return { redirectUrl: null, host, apiKey };
+  } catch (error) {
+    // login() may throw a redirect Response - catch it
+    if (error instanceof Response && error.status >= 300 && error.status < 400) {
+      const location = error.headers.get("Location");
+      if (location) {
+        // Return JSON instead of throwing Response to break out of iframe client-side
+        return { redirectUrl: location, host, apiKey };
+      }
+      // Re-throw other redirects
+      throw error;
+    }
+    // Re-throw non-redirect errors
+    throw error;
   }
-  
-  // No redirect - return redirectUrl as null
-  return { redirectUrl: null, host, apiKey };
 };
 
 export default function Auth() {

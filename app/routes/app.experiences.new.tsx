@@ -6,6 +6,7 @@ import type { HeadersFunction } from "react-router";
 import prisma from "~/db.server";
 import { useState } from "react";
 import { getEntitlements } from "~/models/billing.server";
+import { withQuery } from "~/utils/redirect.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -222,7 +223,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
 
     console.log("[CreateExperience] Successfully created experience", { id: experience.id, name: experience.name });
-    return redirect("/app/experiences");
+    return redirect(withQuery(request, "/app/experiences"));
   } catch (error) {
     console.error("[CreateExperience] Error creating experience:", error);
     const errorMessage = error instanceof Error ? error.message : "Failed to create experience";

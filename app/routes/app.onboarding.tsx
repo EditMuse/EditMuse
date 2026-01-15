@@ -3,6 +3,7 @@ import { useLoaderData, useActionData, Form, redirect, useNavigation } from "rea
 import { useState, useEffect } from "react";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
+import { withQuery } from "~/utils/redirect.server";
 
 type LoaderData = {
   shopDomain: string;
@@ -106,7 +107,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     },
   });
 
-  return redirect("/app/dashboard");
+  return redirect(withQuery(request, "/app/dashboard"));
 };
 
 export default function OnboardingPage() {

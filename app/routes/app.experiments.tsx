@@ -4,6 +4,7 @@ import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { UsageEventType } from "@prisma/client";
 import { useState, useEffect } from "react";
+import { withQuery } from "~/utils/redirect.server";
 
 type LoaderData = {
   experiments: Array<{
@@ -235,7 +236,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { id },
     });
 
-    return redirect("/app/experiments");
+    return redirect(withQuery(request, "/app/experiments"));
   }
 
   return Response.json({ error: "Invalid action" }, { status: 400 });

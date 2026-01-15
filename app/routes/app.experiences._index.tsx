@@ -6,6 +6,7 @@ import type { HeadersFunction } from "react-router";
 import prisma from "~/db.server";
 import { useState, useEffect } from "react";
 import { getEntitlements } from "~/models/billing.server";
+import { withQuery } from "~/utils/redirect.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
@@ -114,7 +115,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
       console.log("[ExperiencesIndex] Delete: Successfully deleted experience", { experienceId });
       // Redirect to revalidate the list
-      return redirect("/app/experiences");
+      return redirect(withQuery(request, "/app/experiences"));
     } else if (intent === "setDefault") {
       if (!experienceId) {
         console.error("[ExperiencesIndex] SetDefault: Experience ID required");
@@ -155,7 +156,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       
       console.log("[ExperiencesIndex] SetDefault: Successfully set default experience", { experienceId });
       // Redirect to revalidate the list
-      return redirect("/app/experiences");
+      return redirect(withQuery(request, "/app/experiences"));
     } else if (intent === "deleteDefaultConciergeDuplicates") {
       // Fetch all "Default Concierge" experiences for this shop, ordered by createdAt desc
       const defaultConciergeExperiences = await prisma.experience.findMany({
@@ -184,7 +185,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         });
         console.log("[ExperiencesIndex] DeleteDefaultConciergeDuplicates: Deleted duplicates", { deleted: toDelete.length, kept: toKeep.id });
         // Redirect to revalidate the list
-        return redirect("/app/experiences");
+        return redirect(withQuery(request, "/app/experiences"));
       }
       return { success: "No duplicates found" };
     } else {
