@@ -1,4 +1,6 @@
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
+import { Redirect } from "@shopify/app-bridge/actions";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData } from "react-router";
@@ -56,6 +58,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function Auth() {
   const loaderData = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
+  const app = useAppBridge() as any;
   const [shop, setShop] = useState("");
   const errors = (actionData || loaderData)?.errors || {};
   const redirectUrl = (actionData || loaderData)?.redirectUrl;
@@ -63,6 +66,14 @@ export default function Auth() {
   // Break out of iframe when redirecting to OAuth
   useEffect(() => {
     if (redirectUrl) {
+      const searchParams = new URLSearchParams(window.location.search);
+      const host = searchParams.get("host");
+
+      if (host && app) {
+        Redirect.create(app).dispatch(Redirect.Action.REMOTE, redirectUrl);
+        return;
+      }
+
       // Force redirect to break out of iframe
       // This is necessary because Shopify's OAuth pages block iframe embedding
       if (window.top && window.top !== window) {
@@ -73,11 +84,16 @@ export default function Auth() {
         window.location.href = redirectUrl;
       }
     }
-  }, [redirectUrl]);
+  }, [redirectUrl, app]);
 
   return (
     <AppProvider embedded={false}>
       <s-page>
+        {redirectUrl ? (
+          <s-section heading="Redirecting…">
+            <p>Redirecting to Shopify to complete installation.</p>
+          </s-section>
+        ) : (
         <Form method="post">
         <s-section heading="Log in">
           <s-text-field
@@ -92,6 +108,7 @@ export default function Auth() {
           <s-button type="submit">Log in</s-button>
         </s-section>
         </Form>
+        )}
       </s-page>
     </AppProvider>
   );
