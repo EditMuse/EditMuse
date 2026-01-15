@@ -25,15 +25,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const host = url.searchParams.get("host");
   const apiKey = process.env.SHOPIFY_API_KEY || "";
   
-  // If login returns a redirect to OAuth, extract the URL to break out of iframe
+  // If login returns a redirect Response, convert it to JSON to prevent iframe navigation
   if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
     const location = loginResult.headers.get("Location");
-    if (location && (location.includes("accounts.shopify.com") || location.includes("admin.shopify.com"))) {
-      // Return the redirect URL so we can break out of iframe client-side
+    if (location) {
+      // Return JSON instead of Response to break out of iframe client-side
       return { redirectUrl: location, host, apiKey, errors: {} };
     }
-    // For other redirects, return the Response directly
-    return loginResult;
   }
   
   const errors = loginErrorMessage(loginResult);
@@ -46,15 +44,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const host = url.searchParams.get("host");
   const apiKey = process.env.SHOPIFY_API_KEY || "";
   
-  // If login returns a redirect to OAuth, extract the URL to break out of iframe
+  // If login returns a redirect Response, convert it to JSON to prevent iframe navigation
   if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
     const location = loginResult.headers.get("Location");
-    if (location && (location.includes("accounts.shopify.com") || location.includes("admin.shopify.com"))) {
-      // Return the redirect URL so we can break out of iframe client-side
+    if (location) {
+      // Return JSON instead of Response to break out of iframe client-side
       return { redirectUrl: location, host, apiKey, errors: {} };
     }
-    // For other redirects, return the Response directly
-    return loginResult;
   }
   
   const errors = loginErrorMessage(loginResult);
