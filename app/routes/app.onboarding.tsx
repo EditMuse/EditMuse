@@ -68,6 +68,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const defaultResultsCount = formData.get("defaultResultsCount")?.toString();
   const widgetMode = formData.get("widgetMode")?.toString() || null;
   const widgetTheme = formData.get("widgetTheme")?.toString() || null;
+  const storefrontTestUrl = formData.get("storefrontTestUrl")?.toString() || null;
   const blockIdentifiers = formData.get("blockIdentifiers")?.toString() || "[]";
 
   // Validate placementMode
@@ -118,22 +119,32 @@ export default function OnboardingPage() {
 
   const isSubmitting = navigation.state === "submitting";
 
-  // Poll status endpoint periodically
-  useEffect(() => {
-    const checkStatus = async () => {
-      setIsCheckingStatus(true);
-      try {
-        const response = await fetch("/app/api/onboarding/status");
-        if (response.ok) {
-          const data = await response.json();
-          setStatus(data);
-        }
-      } catch (error) {
-        console.error("[Onboarding] Status check failed:", error);
-      } finally {
-        setIsCheckingStatus(false);
+  // Check status function
+  const checkStatus = async () => {
+    setIsCheckingStatus(true);
+    try {
+      const response = await fetch("/app/api/onboarding/status");
+      if (response.ok) {
+        const data = await response.json();
+        setStatus(data);
       }
-    };
+    } catch (error) {
+      console.error("[Onboarding] Status check failed:", error);
+    } finally {
+      setIsCheckingStatus(false);
+    }
+  };
+
+  // Poll status endpoint periodically (only when on Step 2 and not both OK)
+  useEffect(() => {
+    if (currentStep !== 2) {
+      return;
+    }
+
+    // Stop polling if both connectivity and extension are OK
+    if (status?.connectivity === "ok" && status?.extension === "ok") {
+      return;
+    }
 
     // Check immediately
     checkStatus();
@@ -142,7 +153,7 @@ export default function OnboardingPage() {
     const interval = setInterval(checkStatus, 3000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [currentStep, status?.connectivity, status?.extension]);
 
   const themeEditorUrl = `https://${shopDomain}/admin/themes/current/editor`;
 
@@ -342,6 +353,35 @@ export default function OnboardingPage() {
                   Verify that your storefront can communicate with the EditMuse service.
                 </p>
 
+                <div style={{ marginBottom: "1.5rem" }}>
+                  <label
+                    style={{
+                      display: "block",
+                      marginBottom: "0.5rem",
+                      fontWeight: "500",
+                      color: "#0B0B0F",
+                    }}
+                  >
+                    Storefront page URL to test
+                  </label>
+                  <input
+                    type="text"
+                    name="storefrontTestUrl"
+                    defaultValue={settings.storefrontTestUrl || ""}
+                    placeholder={`https://${shopDomain}/products/example-product`}
+                    style={{
+                      width: "100%",
+                      padding: "0.75rem",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "8px",
+                      fontSize: "1rem",
+                    }}
+                  />
+                  <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)", marginTop: "0.5rem" }}>
+                    Paste a live storefront URL where the EditMuse block should appear (e.g. a product page).
+                  </div>
+                </div>
+
                 <div
                   style={{
                     padding: "1.5rem",
@@ -360,7 +400,7 @@ export default function OnboardingPage() {
                   >
                     <div>
                       <div style={{ fontWeight: "500", color: "#0B0B0F", marginBottom: "0.25rem" }}>
-                        App Proxy Connectivity
+                        Connectivity
                       </div>
                       <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
                         Connection to /apps/editmuse/ping
@@ -370,9 +410,31 @@ export default function OnboardingPage() {
                       {isCheckingStatus ? (
                         <span style={{ color: "#6B7280" }}>Checking...</span>
                       ) : status?.connectivity === "ok" ? (
-                        <span style={{ color: "#10B981", fontWeight: "600" }}>✓ Connected</span>
+                        <span
+                          style={{
+                            padding: "0.25rem 0.75rem",
+                            borderRadius: "12px",
+                            backgroundColor: "#D1FAE5",
+                            color: "#065F46",
+                            fontWeight: "600",
+                            fontSize: "0.875rem",
+                          }}
+                        >
+                          OK
+                        </span>
                       ) : (
-                        <span style={{ color: "#EF4444", fontWeight: "600" }}>✗ Failed</span>
+                        <span
+                          style={{
+                            padding: "0.25rem 0.75rem",
+                            borderRadius: "12px",
+                            backgroundColor: "#FEE2E2",
+                            color: "#991B1B",
+                            fontWeight: "600",
+                            fontSize: "0.875rem",
+                          }}
+                        >
+                          FAIL
+                        </span>
                       )}
                     </div>
                   </div>
@@ -382,11 +444,12 @@ export default function OnboardingPage() {
                       display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center",
+                      marginBottom: status?.lastChecked || status?.extensionError ? "1rem" : "0",
                     }}
                   >
                     <div>
                       <div style={{ fontWeight: "500", color: "#0B0B0F", marginBottom: "0.25rem" }}>
-                        Extension Installation
+                        Extension installed
                       </div>
                       <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
                         Theme extension blocks installed
@@ -396,12 +459,76 @@ export default function OnboardingPage() {
                       {isCheckingStatus ? (
                         <span style={{ color: "#6B7280" }}>Checking...</span>
                       ) : status?.extension === "ok" ? (
-                        <span style={{ color: "#10B981", fontWeight: "600" }}>✓ Installed</span>
+                        <span
+                          style={{
+                            padding: "0.25rem 0.75rem",
+                            borderRadius: "12px",
+                            backgroundColor: "#D1FAE5",
+                            color: "#065F46",
+                            fontWeight: "600",
+                            fontSize: "0.875rem",
+                          }}
+                        >
+                          OK
+                        </span>
                       ) : (
-                        <span style={{ color: "#EF4444", fontWeight: "600" }}>✗ Not Installed</span>
+                        <span
+                          style={{
+                            padding: "0.25rem 0.75rem",
+                            borderRadius: "12px",
+                            backgroundColor: "#FEE2E2",
+                            color: "#991B1B",
+                            fontWeight: "600",
+                            fontSize: "0.875rem",
+                          }}
+                        >
+                          FAIL
+                        </span>
                       )}
                     </div>
                   </div>
+
+                  {status?.lastChecked && (
+                    <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)", marginTop: "1rem" }}>
+                      Last checked: {new Date(status.lastChecked).toLocaleString()}
+                    </div>
+                  )}
+
+                  {status?.extensionError && (
+                    <div
+                      style={{
+                        marginTop: "1rem",
+                        padding: "0.75rem",
+                        backgroundColor: "#FEF2F2",
+                        border: "1px solid #FECACA",
+                        borderRadius: "8px",
+                      }}
+                    >
+                      <div style={{ fontSize: "0.75rem", fontFamily: "monospace", color: "#991B1B" }}>
+                        {status.extensionError}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", gap: "1rem", marginBottom: "1.5rem" }}>
+                  <button
+                    type="button"
+                    onClick={checkStatus}
+                    disabled={isCheckingStatus}
+                    style={{
+                      padding: "0.625rem 1.25rem",
+                      background: isCheckingStatus ? "#9CA3AF" : "#FFFFFF",
+                      color: isCheckingStatus ? "#FFFFFF" : "#0B0B0F",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "8px",
+                      fontWeight: "500",
+                      cursor: isCheckingStatus ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                    }}
+                  >
+                    {isCheckingStatus ? "Checking..." : "Check again"}
+                  </button>
                 </div>
 
                 {status?.extension === "fail" && (
@@ -583,4 +710,3 @@ export default function OnboardingPage() {
     </s-page>
   );
 }
-

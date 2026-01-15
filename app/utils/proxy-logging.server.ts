@@ -62,7 +62,14 @@ export async function withProxyLogging<T>(
       console.error("[Proxy Logging] Failed to log proxy error:", e);
     });
 
-    throw error;
+    // Return error response with x-request-id header (don't leak error details)
+    const headers = new Headers();
+    headers.set("x-request-id", requestId);
+    return new Response("Internal Server Error", {
+      status: 500,
+      statusText: "Internal Server Error",
+      headers: headers,
+    });
   }
 }
 

@@ -7,6 +7,7 @@ import { rankProductsWithAI, fallbackRanking } from "~/models/ai-ranking.server"
 import { ConciergeSessionStatus } from "@prisma/client";
 import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/models/billing.server";
 import { createOverageUsageCharge } from "~/models/shopify-billing.server";
+import { withProxyLogging } from "~/utils/proxy-logging.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
@@ -246,19 +247,25 @@ export async function proxySessionStartLoader(
   request: Request,
   routePath: string
 ): Promise<Response> {
-  console.log(`[App Proxy] GET ${routePath}`);
-  console.log("[App Proxy] Request method:", request.method);
-  console.log("[App Proxy] Request URL:", request.url);
-  console.log("[App Proxy] Request pathname:", new URL(request.url).pathname);
-  
-  return Response.json({ 
-    ok: true, 
-    route: "session/start",
-    method: request.method,
-    pathname: new URL(request.url).pathname,
-    note: "This endpoint requires POST. Use POST to start a session or fetch questions.",
-    troubleshooting: "If POST requests return 404, check Shopify app proxy configuration in Partners dashboard."
-  });
+  const url = new URL(request.url);
+  const query = url.searchParams;
+  const shopDomain = getShopFromAppProxy(query) || query.get("shop") || undefined;
+
+  return withProxyLogging(
+    async () => {
+      return Response.json({ 
+        ok: true, 
+        route: "session/start",
+        method: request.method,
+        pathname: url.pathname,
+        note: "This endpoint requires POST. Use POST to start a session or fetch questions.",
+        troubleshooting: "If POST requests return 404, check Shopify app proxy configuration in Partners dashboard."
+      });
+    },
+    request,
+    routePath,
+    shopDomain
+  );
 }
 
 /**
@@ -270,16 +277,26 @@ export async function proxySessionStartOptions(
   request: Request,
   routePath: string
 ): Promise<Response> {
-  console.log(`[App Proxy] OPTIONS ${routePath} (CORS preflight)`);
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Max-Age": "86400",
+  const url = new URL(request.url);
+  const query = url.searchParams;
+  const shopDomain = getShopFromAppProxy(query) || query.get("shop") || undefined;
+
+  return withProxyLogging(
+    async () => {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
     },
-  });
+    request,
+    routePath,
+    shopDomain
+  );
 }
 
 /**

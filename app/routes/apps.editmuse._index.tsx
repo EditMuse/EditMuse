@@ -1,4 +1,6 @@
 import type { LoaderFunctionArgs } from "react-router";
+import { getShopFromAppProxy } from "~/app-proxy.server";
+import { withProxyLogging } from "~/utils/proxy-logging.server";
 
 /**
  * App Proxy Index Route
@@ -6,27 +8,29 @@ import type { LoaderFunctionArgs } from "react-router";
  * Returns 200 OK with JSON response for health checks
  */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  console.log("[App Proxy] GET /apps/editmuse");
-  
-  const method = request.method;
   const url = new URL(request.url);
   const query = url.searchParams;
-  
-  console.log("[App Proxy] Index route - Method:", method, "Query params:", {
-    shop: query.get("shop"),
-    signature: query.has("signature") ? "present" : "missing",
-  });
+  const shopDomain = getShopFromAppProxy(query) || query.get("shop") || undefined;
 
-  return Response.json({
-    ok: true,
-    route: "apps/editmuse",
-    method: method,
-    message: "EditMuse App Proxy is active",
-    availableEndpoints: [
-      "/apps/editmuse/session/start",
-      "/apps/editmuse/session",
-      "/apps/editmuse/ping",
-    ],
-  }, { status: 200 });
+  return withProxyLogging(
+    async () => {
+      const method = request.method;
+
+      return Response.json({
+        ok: true,
+        route: "apps/editmuse",
+        method: method,
+        message: "EditMuse App Proxy is active",
+        availableEndpoints: [
+          "/apps/editmuse/session/start",
+          "/apps/editmuse/session",
+          "/apps/editmuse/ping",
+        ],
+      }, { status: 200 });
+    },
+    request,
+    "/apps/editmuse",
+    shopDomain
+  );
 };
 

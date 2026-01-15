@@ -3,7 +3,7 @@
 client_id = "0d5be0973fcd6b60dd1edb5db97a9759"
 name = "EditMuse"
 # Production URL on Render - matches SHOPIFY_APP_URL environment variable
-application_url = "https://editmuse.onrender.com"
+application_url = "https://editmuse-z8wu.onrender.com"
 embedded = true
 
 [build]
@@ -35,8 +35,8 @@ use_legacy_install_flow = false
 # Base URL for app access
 # Callback URL for OAuth authentication
 redirect_urls = [
-  "https://editmuse.onrender.com",
-  "https://editmuse.onrender.com/auth/callback"
+  "https://editmuse-z8wu.onrender.com",
+  "https://editmuse-z8wu.onrender.com/auth/callback"
 ]
 
 [app_proxy]
@@ -46,6 +46,6 @@ redirect_urls = [
 # Shopify will automatically append the subpath when proxying requests.
 # For production: base URL of your Render deployment
 # For dev: will be auto-updated by CLI to dev tunnel URL
-url = "https://editmuse.onrender.com"
+url = "https://editmuse-z8wu.onrender.com"
 subpath = "editmuse"
 prefix = "apps"

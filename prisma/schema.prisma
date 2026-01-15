@@ -117,6 +117,7 @@ model ConciergeSession {
   queryRaw        String?                // Original query text (first user message or extracted from answers)
   queryNormalized String?                // Normalized query (lowercased, trimmed) for grouping
   clientRequestId String?
+  sessionToken    String?                // Stable token for attribution (set at creation, typically same as publicToken)
   chargedAt       DateTime?
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
@@ -126,6 +127,7 @@ model ConciergeSession {
   @@unique([shopId, clientRequestId])
   @@index([shopId])
   @@index([publicToken])
+  @@index([sessionToken])
   @@index([shopId, clientRequestId])
 }
 
@@ -252,6 +254,7 @@ model OrderAttribution {
   currencyCode    String?
   createdAt       DateTime @default(now())
 
+  @@unique([shopId, orderId])
   @@index([shopId, createdAt])
   @@index([orderId])
   @@index([sessionId])

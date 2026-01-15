@@ -1,6 +1,7 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
 import prisma from "~/db.server";
+import { withProxyLogging } from "~/utils/proxy-logging.server";
 
 /**
  * App Proxy endpoint to return active experiments as JSON
@@ -28,32 +29,39 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     shopDomain = query.get("shop");
   }
 
-  if (!shopDomain) {
-    return Response.json({ error: "Missing shop parameter" }, { status: 400 });
-  }
+  return withProxyLogging(
+    async () => {
+      if (!shopDomain) {
+        return Response.json({ error: "Missing shop parameter" }, { status: 400 });
+      }
 
-  // Fetch shop
-  const shop = await prisma.shop.findUnique({
-    where: { domain: shopDomain },
-  });
+      // Fetch shop
+      const shop = await prisma.shop.findUnique({
+        where: { domain: shopDomain },
+      });
 
-  if (!shop) {
-    return Response.json({ error: "Shop not found" }, { status: 404 });
-  }
+      if (!shop) {
+        return Response.json({ error: "Shop not found" }, { status: 404 });
+      }
 
-  // Fetch active experiments
-  const experiments = await prisma.experiment.findMany({
-    where: {
-      shopId: shop.id,
-      isActive: true,
+      // Fetch active experiments
+      const experiments = await prisma.experiment.findMany({
+        where: {
+          shopId: shop.id,
+          isActive: true,
+        },
+        select: {
+          key: true,
+          variants: true,
+        },
+      });
+
+      // Return experiments as JSON
+      return Response.json({ experiments });
     },
-    select: {
-      key: true,
-      variants: true,
-    },
-  });
-
-  // Return experiments as JSON
-  return Response.json({ experiments });
+    request,
+    "/apps/editmuse/experiments",
+    shopDomain || undefined
+  );
 };
 

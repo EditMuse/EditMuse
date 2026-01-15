@@ -2,11 +2,21 @@ import type { LoaderFunctionArgs } from "react-router";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
+type StatusResponse = {
+  connectivity: "ok" | "fail";
+  extension: "ok" | "fail";
+  extensionError?: string;
+  lastChecked?: string;
+};
+
+export const loader = async ({ request }: LoaderFunctionArgs): Promise<Response> => {
   const { session } = await authenticate.admin(request);
 
   const shop = await prisma.shop.findUnique({
     where: { domain: session.shop },
+    select: {
+      storefrontTestUrl: true,
+    },
   });
 
   if (!shop) {
@@ -33,8 +43,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   // Check extension installation: fetch storefront HTML and check for markers
   let extensionStatus: "ok" | "fail" = "fail";
-  let extensionError: string | null = null;
-  let lastChecked: string | null = null;
+  let extensionError: string | undefined = undefined;
+  let lastChecked: string | undefined = undefined;
 
   if (shop.storefrontTestUrl) {
     try {
@@ -75,26 +85,27 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
               extensionError = "Extension markers not found in HTML";
             }
           }
-        } catch (fetchError: any) {
+        } catch (fetchError: unknown) {
           clearTimeout(timeoutId);
-          if (fetchError.name === "AbortError") {
+          if (fetchError instanceof Error && fetchError.name === "AbortError") {
             extensionError = "Request timeout (5s)";
           } else {
-            extensionError = fetchError.message || "Failed to fetch storefront";
+            extensionError = fetchError instanceof Error ? fetchError.message : "Failed to fetch storefront";
           }
         }
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error("[Onboarding] Extension check failed:", error);
-      extensionError = error.message || "Unknown error";
+      extensionError = error instanceof Error ? error.message : "Unknown error";
     }
   }
 
-  return Response.json({
+  const response: StatusResponse = {
     connectivity: connectivityStatus,
     extension: extensionStatus,
-    extensionError: extensionError || undefined,
-    lastChecked: lastChecked || undefined,
-  });
-};
+    ...(extensionError ? { extensionError } : {}),
+    ...(lastChecked ? { lastChecked } : {}),
+  };
 
+  return Response.json(response);
+};

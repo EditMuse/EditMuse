@@ -18,6 +18,10 @@ function safeJson(s: string | null): any {
 type DashboardData = {
   from: string;
   to: string;
+  attributionBanner?: {
+    type: "warning" | "info";
+    message: string;
+  };
   metrics: {
     sessions: number;
     resultsGenerated: number;
@@ -444,9 +448,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     .sort((a, b) => b.recommendedCount - a.recommendedCount)
     .slice(0, 50);
 
+  // Attribution banner logic
+  const attributionEnabled = process.env.SHOPIFY_ORDERS_WEBHOOK_ENABLED === "true";
+  const attributionBanner = attributionEnabled
+    ? orderAttributions.length === 0
+      ? {
+          type: "info" as const,
+          message:
+            "Attribution enabled, but no attributed orders yet. Ensure checkout started events include tokens and the orders/create webhook is firing.",
+        }
+      : undefined
+    : {
+        type: "warning" as const,
+        message:
+          "Order attribution is disabled. Enable SHOPIFY_ORDERS_WEBHOOK_ENABLED to start attributing orders (may require Shopify approval).",
+      };
+
   const data: DashboardData = {
     from: fromDate.toISOString().slice(0, 10),
     to: toDate.toISOString().slice(0, 10),
+    ...(attributionBanner ? { attributionBanner } : {}),
     metrics: {
       sessions: sessionsCount,
       resultsGenerated,
@@ -501,6 +522,34 @@ export default function DashboardPage() {
               Export CSV
             </a>
           </div>
+
+          {/* Attribution Banner */}
+          {data.attributionBanner && (
+            <div
+              style={{
+                padding: "1rem 1.5rem",
+                background:
+                  data.attributionBanner.type === "warning"
+                    ? "linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(251, 191, 36, 0.1))"
+                    : "linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(96, 165, 250, 0.1))",
+                border:
+                  data.attributionBanner.type === "warning"
+                    ? "2px solid rgba(245, 158, 11, 0.3)"
+                    : "2px solid rgba(59, 130, 246, 0.3)",
+                borderRadius: "12px",
+                marginBottom: "1.5rem",
+                color: data.attributionBanner.type === "warning" ? "#D97706" : "#2563EB",
+                boxShadow:
+                  data.attributionBanner.type === "warning"
+                    ? "0 4px 12px rgba(245, 158, 11, 0.2)"
+                    : "0 4px 12px rgba(59, 130, 246, 0.2)",
+              }}
+            >
+              <div style={{ fontWeight: "600", fontSize: "0.875rem" }}>
+                {data.attributionBanner.message}
+              </div>
+            </div>
+          )}
 
           {/* KPI Cards */}
           <div

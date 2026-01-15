@@ -30,7 +30,7 @@
   function isDesignMode() {
     return !!(window.Shopify && window.Shopify.designMode);
   }
-
+  
   // Fetch and cache shop settings from app proxy
   var shopConfigCache = null;
   var shopConfigPromise = null;
@@ -3356,7 +3356,7 @@
     document.addEventListener("DOMContentLoaded", function() {
       // Fetch shop config and compute experiments first, then initialize blocks
       Promise.all([fetchShopConfig(), computeExperiments()]).then(function() {
-        initAllBlocks();
+      initAllBlocks();
       });
     });
     
