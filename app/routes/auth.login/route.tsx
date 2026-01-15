@@ -65,16 +65,18 @@ export default function Auth() {
   const loaderData = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const [shop, setShop] = useState("");
-  const [showFallback, setShowFallback] = useState(false);
   const errors = (actionData || loaderData)?.errors || {};
   const redirectUrl = (actionData || loaderData)?.redirectUrl;
-  const host = (actionData || loaderData)?.host as string | null | undefined;
-  const apiKey = (actionData || loaderData)?.apiKey as string | undefined;
+  const dataHost = (actionData || loaderData)?.host as string | null | undefined;
+  const dataApiKey = (actionData || loaderData)?.apiKey as string | undefined;
 
   // Break out of iframe when redirecting to OAuth
   useEffect(() => {
     if (redirectUrl) {
-      setShowFallback(false);
+      // Determine host from loader/action data first, fallback to URLSearchParams
+      const host = dataHost || new URLSearchParams(window.location.search).get("host");
+      // Determine apiKey from loader/action data first
+      const apiKey = dataApiKey;
 
       if (host && apiKey) {
         try {
@@ -82,14 +84,18 @@ export default function Auth() {
           Redirect.create(app).dispatch(Redirect.Action.REMOTE, redirectUrl);
           return;
         } catch (error) {
-          setShowFallback(true);
-          return;
+          // Fall through to top-level navigation
         }
       }
 
-      setShowFallback(true);
+      // Use top-level navigation as fallback
+      if (window.top && window.top !== window) {
+        window.top.location.assign(redirectUrl);
+      } else {
+        window.location.assign(redirectUrl);
+      }
     }
-  }, [redirectUrl, host, apiKey]);
+  }, [redirectUrl, dataHost, dataApiKey]);
 
   return (
     <AppProvider embedded={false}>
@@ -97,20 +103,9 @@ export default function Auth() {
         {redirectUrl ? (
           <s-section heading="Redirecting…">
             <p>Redirecting to Shopify to complete installation.</p>
-            {showFallback && (
-              <s-button
-                type="button"
-                onClick={() => {
-                  if (window.top && window.top !== window) {
-                    window.top.location.href = redirectUrl;
-                  } else {
-                    window.location.href = redirectUrl;
-                  }
-                }}
-              >
-                Continue
-              </s-button>
-            )}
+            <a href={redirectUrl} target="_top" rel="noreferrer">
+              Continue
+            </a>
           </s-section>
         ) : (
         <Form method="post">
