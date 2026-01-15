@@ -56,6 +56,8 @@ function extractTokens(order: any): { checkoutToken?: string; cartToken?: string
  * Orders tracking will only work if this webhook is enabled.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
+  console.log("[orders/create] HIT", new Date().toISOString());
+
   if (request.method !== "POST") {
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
@@ -66,6 +68,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   try {
     // Authenticate webhook
     const { shop, topic } = await authenticate.webhook(request);
+    console.log("[orders/create] VERIFIED", new Date().toISOString());
 
     const body = await request.json();
 
