@@ -1,23 +1,8 @@
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
-import createApp from "@shopify/app-bridge";
-import { Redirect } from "@shopify/app-bridge/actions";
-import { useState, useEffect } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, useActionData, useLoaderData } from "react-router";
-import type { LoginError } from "@shopify/shopify-app-react-router/server";
-import { LoginErrorType } from "@shopify/shopify-app-react-router/server";
-
+import type { LoaderFunctionArgs } from "react-router";
+import { useLoaderData } from "react-router";
+import { BreakoutRedirect } from "~/components/BreakoutRedirect";
 import { login } from "~/shopify.server";
-
-function loginErrorMessage(loginErrors: LoginError): { shop?: string } {
-  if (loginErrors?.shop === LoginErrorType.MissingShop) {
-    return { shop: "Please enter your shop domain to log in" };
-  } else if (loginErrors?.shop === LoginErrorType.InvalidShop) {
-    return { shop: "Please enter a valid shop domain to log in" };
-  }
-
-  return {};
-}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const loginResult = await login(request);
@@ -25,99 +10,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const host = url.searchParams.get("host");
   const apiKey = process.env.SHOPIFY_API_KEY || "";
   
-  // If login returns a redirect Response, convert it to JSON to prevent iframe navigation
+  // If login returns a redirect Response, extract Location and return JSON to prevent iframe navigation
   if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
     const location = loginResult.headers.get("Location");
     if (location) {
       // Return JSON instead of Response to break out of iframe client-side
-      return { redirectUrl: location, host, apiKey, errors: {} };
+      return { redirectUrl: location, host, apiKey };
     }
   }
   
-  const errors = loginErrorMessage(loginResult);
-  return { errors, host, apiKey };
-};
-
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const loginResult = await login(request);
-  const url = new URL(request.url);
-  const host = url.searchParams.get("host");
-  const apiKey = process.env.SHOPIFY_API_KEY || "";
-  
-  // If login returns a redirect Response, convert it to JSON to prevent iframe navigation
-  if (loginResult instanceof Response && loginResult.status >= 300 && loginResult.status < 400) {
-    const location = loginResult.headers.get("Location");
-    if (location) {
-      // Return JSON instead of Response to break out of iframe client-side
-      return { redirectUrl: location, host, apiKey, errors: {} };
-    }
-  }
-  
-  const errors = loginErrorMessage(loginResult);
-  return { errors, host, apiKey };
+  // No redirect - return redirectUrl as null
+  return { redirectUrl: null, host, apiKey };
 };
 
 export default function Auth() {
-  const loaderData = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
-  const [shop, setShop] = useState("");
-  const errors = (actionData || loaderData)?.errors || {};
-  const redirectUrl = (actionData || loaderData)?.redirectUrl;
-  const dataHost = (actionData || loaderData)?.host as string | null | undefined;
-  const dataApiKey = (actionData || loaderData)?.apiKey as string | undefined;
-
-  // Break out of iframe when redirecting to OAuth
-  useEffect(() => {
-    if (redirectUrl) {
-      // Determine host from loader/action data first, fallback to URLSearchParams
-      const host = dataHost || new URLSearchParams(window.location.search).get("host");
-      // Determine apiKey from loader/action data first
-      const apiKey = dataApiKey;
-
-      if (host && apiKey) {
-        try {
-          const app = createApp({ apiKey, host, forceRedirect: true });
-          Redirect.create(app).dispatch(Redirect.Action.REMOTE, redirectUrl);
-          return;
-        } catch (error) {
-          // Fall through to top-level navigation
-        }
-      }
-
-      // Use top-level navigation as fallback
-      if (window.top && window.top !== window) {
-        window.top.location.assign(redirectUrl);
-      } else {
-        window.location.assign(redirectUrl);
-      }
-    }
-  }, [redirectUrl, dataHost, dataApiKey]);
+  const { redirectUrl, host, apiKey } = useLoaderData<typeof loader>();
 
   return (
     <AppProvider embedded={false}>
       <s-page>
         {redirectUrl ? (
-          <s-section heading="Redirecting…">
-            <p>Redirecting to Shopify to complete installation.</p>
-            <a href={redirectUrl} target="_top" rel="noreferrer">
-              Continue
-            </a>
-          </s-section>
+          <BreakoutRedirect redirectUrl={redirectUrl} host={host} apiKey={apiKey} />
         ) : (
-        <Form method="post">
-        <s-section heading="Log in">
-          <s-text-field
-            name="shop"
-            label="Shop domain"
-            details="example.myshopify.com"
-            value={shop}
-            onChange={(e) => setShop(e.currentTarget.value)}
-            autocomplete="on"
-            error={"shop" in errors && typeof errors.shop === "string" ? errors.shop : undefined}
-          ></s-text-field>
-          <s-button type="submit">Log in</s-button>
-        </s-section>
-        </Form>
+          <s-section heading="Log in">
+            <p>Please access this app from the Shopify admin.</p>
+          </s-section>
         )}
       </s-page>
     </AppProvider>
