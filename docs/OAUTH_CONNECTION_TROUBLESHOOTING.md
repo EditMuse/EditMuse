@@ -48,7 +48,7 @@ https://editmuse-z8wu.onrender.com/auth/callback
 - ✅ `SHOPIFY_APP_URL` = `https://editmuse-z8wu.onrender.com`
 - ✅ `SHOPIFY_API_KEY` = Your API key (should match `client_id` in shopify.app.toml)
 - ✅ `SHOPIFY_API_SECRET` = Your API secret
-- ✅ `SCOPES` = `read_products,write_products,write_app_proxy`
+- ✅ `SCOPES` = `read_products,write_products,write_app_proxy,read_orders`
 - ✅ `DATABASE_URL` = Your PostgreSQL connection string
 
 **How to check:**

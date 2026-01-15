@@ -30,7 +30,8 @@ api_version = "2026-01"
 # - read_products: Required to fetch products from Shopify Admin API (already used in app)
 # - write_products: Already used for product operations
 # - write_app_proxy: Required for app proxy to function correctly
-scopes = "read_products,write_products,write_app_proxy"
+# - read_orders: Required for orders/create webhook
+scopes = "read_products,write_products,write_app_proxy,read_orders"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
