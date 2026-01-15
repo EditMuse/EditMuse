@@ -3299,6 +3299,159 @@
 
   debugLog('EditMuse Concierge Web Component registered');
   
+  // Add-to-Cart tracking
+  function trackAddToCart(variantId, quantity, currentUrl) {
+    try {
+      var eventUrl = '/apps/editmuse/event' + window.location.search;
+      var payload = {
+        eventType: 'ADD_TO_CART_CLICKED',
+        sid: null,
+        metadata: {
+          variantId: variantId || null,
+          quantity: quantity || 1,
+          url: currentUrl || window.location.href,
+        },
+      };
+
+      // Prefer beacon so navigation doesn't block
+      if (navigator.sendBeacon) {
+        var blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        navigator.sendBeacon(eventUrl, blob);
+      } else {
+        fetch(eventUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          keepalive: true,
+          body: JSON.stringify(payload),
+        }).catch(function() {});
+      }
+
+      if (window.__EDITMUSE_DEBUG) {
+        console.log('[EditMuse] ATC tracked', { variantId: variantId, qty: quantity || 1 });
+      }
+    } catch (e) {
+      console.error('[EditMuse] Error tracking ATC:', e);
+    }
+  }
+
+  // Track ATC from form submits
+  function setupATCFormTracking() {
+    // Intercept form submits
+    document.addEventListener('submit', function(e) {
+      var form = e.target;
+      if (!form || form.tagName !== 'FORM') return;
+      
+      var action = form.getAttribute('action') || '';
+      if (!action || !action.includes('/cart/add')) return;
+
+      // Extract variant ID and quantity
+      var variantInput = form.querySelector('input[name="id"]');
+      var quantityInput = form.querySelector('input[name="quantity"]');
+      var variantId = variantInput ? variantInput.value : null;
+      var quantity = quantityInput ? parseInt(quantityInput.value, 10) : 1;
+
+      trackAddToCart(variantId, quantity, window.location.href);
+    }, true); // Use capture phase to catch before form submits
+  }
+
+  // Track ATC from AJAX (fetch/XHR)
+  function setupATCAjaxTracking() {
+    // Intercept fetch
+    var originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+      var urlStr = typeof url === 'string' ? url : (url && url.url ? url.url : '');
+      if (urlStr && (urlStr.includes('/cart/add') || urlStr.includes('/cart/add.js'))) {
+        // Extract variant ID and quantity from options
+        var variantId = null;
+        var quantity = 1;
+        
+        if (options && options.body) {
+          try {
+            // Try parsing as FormData
+            if (options.body instanceof FormData) {
+              variantId = options.body.get('id') || null;
+              var qtyStr = options.body.get('quantity');
+              quantity = qtyStr ? parseInt(qtyStr, 10) : 1;
+            } else if (typeof options.body === 'string') {
+              // Try parsing as URL-encoded string
+              var params = new URLSearchParams(options.body);
+              variantId = params.get('id') || null;
+              var qtyStr = params.get('quantity');
+              quantity = qtyStr ? parseInt(qtyStr, 10) : 1;
+            } else if (typeof options.body === 'object') {
+              // Try parsing as JSON
+              variantId = options.body.id || null;
+              quantity = options.body.quantity || 1;
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+
+        trackAddToCart(variantId, quantity, window.location.href);
+      }
+      
+      return originalFetch.apply(this, arguments);
+    };
+
+    // Intercept XMLHttpRequest
+    var originalXHROpen = XMLHttpRequest.prototype.open;
+    var originalXHRSend = XMLHttpRequest.prototype.send;
+    
+    XMLHttpRequest.prototype.open = function(method, url) {
+      this._editmuse_url = url;
+      this._editmuse_method = method;
+      return originalXHROpen.apply(this, arguments);
+    };
+    
+    XMLHttpRequest.prototype.send = function(data) {
+      var url = this._editmuse_url;
+      var method = this._editmuse_method;
+      
+      if (method === 'POST' && url && (url.includes('/cart/add') || url.includes('/cart/add.js'))) {
+        // Extract variant ID and quantity
+        var variantId = null;
+        var quantity = 1;
+        
+        if (data) {
+          try {
+            if (data instanceof FormData) {
+              variantId = data.get('id') || null;
+              var qtyStr = data.get('quantity');
+              quantity = qtyStr ? parseInt(qtyStr, 10) : 1;
+            } else if (typeof data === 'string') {
+              var params = new URLSearchParams(data);
+              variantId = params.get('id') || null;
+              var qtyStr = params.get('quantity');
+              quantity = qtyStr ? parseInt(qtyStr, 10) : 1;
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+
+        trackAddToCart(variantId, quantity, window.location.href);
+      }
+      
+      return originalXHRSend.apply(this, arguments);
+    };
+  }
+
+  // Initialize ATC tracking when DOM is ready
+  if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function() {
+        setupATCFormTracking();
+        setupATCAjaxTracking();
+      });
+    } else {
+      // DOM already loaded
+      setupATCFormTracking();
+      setupATCAjaxTracking();
+    }
+  }
+  
   // Theme Editor event handlers
   function handleSectionLoad() {
     debugLog('[EditMuse] Theme Editor: section load');
