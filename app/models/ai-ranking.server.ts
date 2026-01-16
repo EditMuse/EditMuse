@@ -40,6 +40,72 @@ const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = 12000; // 12 seconds
 const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total
 const CACHE_DURATION_HOURS = 36; // Cache for 36 hours (between 24-48 hours)
+const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
+
+/**
+ * Strips HTML tags and cleans product description
+ * Removes HTML entities, preserves text content
+ */
+function cleanDescription(description: string | null | undefined): string {
+  if (!description) return "";
+  
+  // Remove HTML tags while preserving text content
+  let cleaned = description
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // Remove script tags
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "") // Remove style tags
+    .replace(/<[^>]+>/g, " ") // Remove all HTML tags
+    .replace(/&nbsp;/g, " ") // Replace non-breaking spaces
+    .replace(/&amp;/g, "&") // Decode HTML entities
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/\s+/g, " ") // Normalize whitespace
+    .trim();
+  
+  return cleaned;
+}
+
+/**
+ * Enhances and normalizes user intent for better AI understanding
+ * Expands abbreviations, normalizes language, adds context
+ */
+function enhanceUserIntent(userIntent: string): string {
+  if (!userIntent || userIntent.trim().length === 0) {
+    return "No specific intent provided";
+  }
+  
+  let enhanced = userIntent.trim();
+  
+  // Common abbreviation expansions
+  const abbreviations: Record<string, string> = {
+    "w/": "with",
+    "w/o": "without",
+    "vs": "versus",
+    "e.g.": "for example",
+    "etc.": "and so on",
+    "approx": "approximately",
+    "min": "minimum",
+    "max": "maximum",
+  };
+  
+  for (const [abbrev, expansion] of Object.entries(abbreviations)) {
+    const regex = new RegExp(`\\b${abbrev.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+    enhanced = enhanced.replace(regex, expansion);
+  }
+  
+  // Normalize common shopping intent patterns
+  enhanced = enhanced
+    .replace(/\bi'm looking for\b/gi, "I need")
+    .replace(/\bi want\b/gi, "I need")
+    .replace(/\bi need\b/gi, "I need")
+    .replace(/\bsomething\b/gi, "a product")
+    .replace(/\bstuff\b/gi, "items")
+    .replace(/\bthings\b/gi, "products");
+  
+  return enhanced;
+}
 
 /**
  * Checks if AI ranking is enabled
@@ -120,9 +186,10 @@ function deterministicRanking(
     return score;
   }
 
+  // Enhanced deterministic ranking with better scoring
   // Sort candidates
   const sorted = [...candidates].sort((a, b) => {
-    // 1) available desc
+    // 1) available desc (in-stock first)
     if (a.available !== b.available) {
       return a.available ? -1 : 1;
     }
@@ -134,8 +201,21 @@ function deterministicRanking(
       if (sa !== sb) return sb - sa;
     }
     
-    // 3) price closeness to budget (if we had budget info, but we don't have it here)
-    // For now, just use handle as tiebreaker
+    // 3) Prefer products with more tags (indicates more metadata/attributes)
+    const aTagCount = (a.tags || []).length;
+    const bTagCount = (b.tags || []).length;
+    if (aTagCount !== bTagCount) {
+      return bTagCount - aTagCount;
+    }
+    
+    // 4) Prefer products with descriptions (more information available)
+    const aHasDesc = a.description && a.description.trim().length > 0;
+    const bHasDesc = b.description && b.description.trim().length > 0;
+    if (aHasDesc !== bHasDesc) {
+      return bHasDesc ? 1 : -1;
+    }
+    
+    // 5) Use handle as final tiebreaker for consistency
     return a.handle.localeCompare(b.handle);
   });
 
@@ -143,7 +223,7 @@ function deterministicRanking(
   
   return {
     rankedHandles,
-    reasoning: "AI ranking unavailable; used deterministic ranking.",
+    reasoning: "AI ranking unavailable; selected products based on availability, preferences, and product information quality.",
   };
 }
 
@@ -340,12 +420,23 @@ export async function rankProductsWithAI(
   const model = getOpenAIModel();
   console.log("[AI Ranking] Starting AI ranking with model:", model, "candidates:", candidates.length);
 
+  // Enhance user intent for better AI understanding
+  const enhancedIntent = enhanceUserIntent(userIntent);
+  console.log("[AI Ranking] Enhanced user intent length:", enhancedIntent.length);
+
   // Build product list for prompt (limit to 200)
+  // Use full descriptions (cleaned) instead of truncating to 200 chars
   const productList = candidates.slice(0, 200).map((p, idx) => {
     const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.join(", ") : "none";
     const colors = (p.colors && p.colors.length > 0) ? p.colors.join(", ") : "none";
     const materials = (p.materials && p.materials.length > 0) ? p.materials.join(", ") : "none";
     const optionValues = p.optionValues ? JSON.stringify(p.optionValues) : "{}";
+    
+    // Clean and use full description (up to MAX_DESCRIPTION_LENGTH)
+    const cleanedDescription = cleanDescription(p.description);
+    const descriptionText = cleanedDescription.length > MAX_DESCRIPTION_LENGTH
+      ? cleanedDescription.substring(0, MAX_DESCRIPTION_LENGTH) + "..."
+      : cleanedDescription || "No description available";
     
     return `${idx + 1}. Handle: ${p.handle}
    Title: ${p.title}
@@ -353,7 +444,7 @@ export async function rankProductsWithAI(
    Type: ${p.productType || "unknown"}
    Vendor: ${p.vendor || "unknown"}
    Price: ${p.price || "unknown"}
-   Description: ${(p.description || "").substring(0, 200)}${p.description && p.description.length > 200 ? "..." : ""}
+   Description: ${descriptionText}
    Available: ${p.available ? "yes" : "no"}
    Sizes: ${sizes}
    Colors: ${colors}
@@ -403,36 +494,82 @@ Rules:
 `
     : "";
 
-  const systemPrompt = `You are a product recommendation assistant for an e-commerce store. Your task is to rank products based on how well they match the shopper's intent.
+  const systemPrompt = `You are an expert product recommendation assistant for an e-commerce store. Your task is to deeply understand the shopper's intent and match it with the most relevant products from the catalog.
 
 CRITICAL RULES:
 - Return ONLY valid JSON matching the schema
 - You MUST use the EXACT handle values from the candidate list (case-sensitive, no modifications)
 - Copy handles EXACTLY as shown in the "Handle: ..." field
-- Rank products by relevance to user intent (most relevant first)
-- Consider: product type, tags, description, price, availability${constraintsText || prefsText !== "Variant option preferences: none" ? ", variant options (sizes/colors/materials/optionValues)" : ""}
-- Return exactly ${resultCount} products (or fewer if fewer candidates)
+- Do NOT modify, truncate, or change the handle values in any way
+
+MATCHING STRATEGY (in priority order):
+1. **Semantic Understanding**: Read the FULL product description carefully. Understand not just keywords but the product's purpose, use cases, features, benefits, and context. Match products that solve the user's problem or meet their need, even if exact keywords don't match.
+
+2. **Intent Alignment**: Consider the user's intent holistically:
+   - What problem are they trying to solve?
+   - What occasion or use case do they have in mind?
+   - What are their implicit needs (quality, style, functionality)?
+   - Are they looking for something specific or exploring options?
+
+3. **Product Attributes**: Prioritize matches based on:
+   - Title relevance (exact keyword matches are good, but semantic meaning is better)
+   - Tags that indicate category, style, or features
+   - Product type alignment with intent
+   - Full description analysis (read the entire description - it contains key details about features, materials, use cases, and benefits)
+   - Vendor/brand if mentioned in intent
+   - Price range alignment with budget preferences
+   - Availability (prefer in-stock items when stock-only filtering is enabled)
+
+4. **Variant Matching**: ${constraintsText || prefsText !== "Variant option preferences: none" ? "When variant preferences are specified (size/color/material/optionValues), prioritize products that offer those exact options. However, do not exclude products that match the intent well but lack exact variant matches - use variant matching as a tie-breaker rather than a hard filter." : "Consider variant options (sizes, colors, materials) as secondary factors - they can boost relevance but shouldn't exclude otherwise perfect matches."}
+
+5. **Keyword Relevance**: ${include.length > 0 || avoid.length > 0 ? `Include terms suggest desired features/categories. Avoid terms indicate undesired features. Use these as guidance, but prioritize semantic understanding over exact keyword matching.` : "Keyword matching (include/avoid) is secondary to semantic understanding."}
+
+6. **Quality vs Quantity**: It's better to return fewer high-quality matches than to include products that don't truly fit the intent. If fewer than ${resultCount} products genuinely match the intent, return only the ones that do.
+
+RANKING GUIDELINES:
+- Most relevant products first (deep semantic match + attribute alignment)
+- Consider description content thoroughly - it often contains critical details not in title/tags
+- Prefer products that clearly solve the stated problem or meet the stated need
+- When in doubt, prioritize products where the description explicitly addresses the user's intent
+- Use variant preferences as a tie-breaker when multiple products have similar relevance
+
+OUTPUT REQUIREMENTS:
+- Return exactly ${resultCount} products (or fewer if genuinely fewer matches exist)
 - Do NOT include products that don't match the intent
 - Do NOT include PII or personal information in reasoning
-- Do NOT modify, truncate, or change the handle values in any way
+- Provide clear, concise reasoning explaining why these products were selected
 
 Output schema (MUST be valid JSON):
 {
   "ranked_handles": ["exact-handle-1", "exact-handle-2", ...],
-  "reasoning": "Brief explanation of why these products were selected"
+  "reasoning": "Brief explanation of why these products were selected, focusing on how they match the user's intent"
 }`;
 
   const userPrompt = `Shopper Intent:
-${userIntent || "No specific intent provided"}${constraintsText}
+${enhancedIntent}${constraintsText}
 
 ${prefsText}${rulesText}${keywordText}
+
+ANALYSIS INSTRUCTIONS:
+1. Carefully read the shopper's intent above. What are they really looking for? What problem are they solving?
+2. For each candidate product below, read the FULL description. The description contains detailed information about:
+   - Product features and benefits
+   - Materials and construction
+   - Use cases and occasions
+   - Care instructions and details
+   - Style, fit, and design notes
+3. Match products where the description indicates they meet the user's needs, even if the title/tags don't have exact keyword matches.
+4. Consider implicit needs: If someone asks for "something comfortable," look for products where the description mentions comfort, softness, or ergonomic design.
 
 Candidate Products (${candidates.length} total):
 ${productList}
 
-IMPORTANT: Copy the handle values EXACTLY as shown above (e.g., if you see "Handle: my-product-handle", use "my-product-handle" exactly).
+IMPORTANT: 
+- Copy handle values EXACTLY as shown above (e.g., "Handle: my-product-handle" → use "my-product-handle" exactly)
+- Read each product's full description - it contains critical matching information
+- Prioritize deep semantic matches over surface-level keyword matches
 
-Rank the top ${resultCount} products that best match the shopper's intent. Return ONLY the JSON object with ranked_handles array (using exact handles) and reasoning string.`;
+Rank the top ${resultCount} products that best match the shopper's intent based on thorough analysis of their descriptions and attributes. Return ONLY the JSON object with ranked_handles array (using exact handles) and reasoning string.`;
 
   // Attempt AI ranking with retries
   let lastError: any = null;
@@ -459,8 +596,8 @@ Rank the top ${resultCount} products that best match the shopper's intent. Retur
             { role: "user", content: userPrompt },
           ],
           response_format: { type: "json_object" },
-          temperature: 0.3, // Lower temperature for more consistent ranking
-          max_tokens: 1000,
+          temperature: 0.2, // Lower temperature (0.2 vs 0.3) for more consistent and focused ranking
+          max_tokens: 1500, // Increased to allow more detailed reasoning
         }),
       });
 

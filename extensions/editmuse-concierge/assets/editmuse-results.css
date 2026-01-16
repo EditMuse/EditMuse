@@ -52,11 +52,36 @@
   }
 }
 
-.editmuse-results-loading p {
+.editmuse-loading-messages {
+  position: relative;
+  min-height: 1.5em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.editmuse-loading-text {
   margin: 0;
   font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
   color: var(--em-muted, rgba(11,11,15,0.62));
   font-weight: 400;
+  opacity: 1;
+  transition: opacity 0.6s ease-in-out, transform 0.4s ease-in-out;
+  transform: translateY(0);
+  text-align: center;
+}
+
+/* Fade out animation when changing messages */
+.editmuse-loading-text.fade-out {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+/* Fade in animation for new messages */
+.editmuse-loading-text.fade-in {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 /* Results Grid */

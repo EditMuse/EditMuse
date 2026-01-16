@@ -165,6 +165,50 @@
     return sid;
   }
 
+  // Loading messages that rotate while fetching results
+  var loadingMessages = [
+    'Analyzing your preferences...',
+    'Searching through our catalog...',
+    'Matching products to your style...',
+    'Fine-tuning recommendations...'
+  ];
+
+  var loadingMessageInterval = null;
+
+  function startLoadingAnimation() {
+    var container = document.querySelector('[data-editmuse-results]');
+    if (!container) return;
+    
+    var loadingText = container.querySelector('[data-editmuse-loading-text]');
+    if (!loadingText) return;
+
+    var currentIndex = 0;
+
+    // Update message immediately
+    loadingText.textContent = loadingMessages[0];
+    loadingText.className = 'editmuse-loading-text fade-in';
+
+    // Cycle through messages every 4 seconds with fade animation
+    loadingMessageInterval = setInterval(function() {
+      // Fade out
+      loadingText.className = 'editmuse-loading-text fade-out';
+      
+      // After fade out completes, change text and fade in
+      setTimeout(function() {
+        currentIndex = (currentIndex + 1) % loadingMessages.length;
+        loadingText.textContent = loadingMessages[currentIndex];
+        loadingText.className = 'editmuse-loading-text fade-in';
+      }, 400); // Half of transition duration (0.6s / 1.5 = ~400ms)
+    }, 4000);
+  }
+
+  function stopLoadingAnimation() {
+    if (loadingMessageInterval) {
+      clearInterval(loadingMessageInterval);
+      loadingMessageInterval = null;
+    }
+  }
+
   function showLoading() {
     var container = document.querySelector('[data-editmuse-results]');
     if (!container) return;
@@ -172,13 +216,17 @@
     var content = container.querySelector('[data-editmuse-content]');
     var error = container.querySelector('[data-editmuse-error]');
     var empty = container.querySelector('[data-editmuse-empty]');
-    if (loading) loading.style.display = 'block';
+    if (loading) loading.style.display = 'flex';
     if (content) content.style.display = 'none';
     if (error) error.style.display = 'none';
     if (empty) empty.style.display = 'none';
+    
+    // Start animated loading messages
+    startLoadingAnimation();
   }
 
   function showError(msg) {
+    stopLoadingAnimation(); // Stop animation on error
     var container = document.querySelector('[data-editmuse-results]');
     if (!container) return;
     var loading = container.querySelector('[data-editmuse-loading]');
@@ -188,7 +236,7 @@
     if (loading) loading.style.display = 'none';
     if (content) content.style.display = 'none';
     if (error) {
-      error.style.display = 'block';
+      error.style.display = 'flex';
       var p = error.querySelector('p');
       if (p && msg) p.textContent = msg;
     }
@@ -196,6 +244,7 @@
   }
 
   function showContent() {
+    stopLoadingAnimation(); // Stop animation when content loads
     var container = document.querySelector('[data-editmuse-results]');
     if (!container) return;
     var loading = container.querySelector('[data-editmuse-loading]');
@@ -209,6 +258,7 @@
   }
 
   function showEmpty(msg) {
+    stopLoadingAnimation(); // Stop animation on empty
     var container = document.querySelector('[data-editmuse-results]');
     if (!container) return;
     var loading = container.querySelector('[data-editmuse-loading]');
@@ -219,7 +269,7 @@
     if (content) content.style.display = 'none';
     if (error) error.style.display = 'none';
     if (empty) {
-      empty.style.display = 'block';
+      empty.style.display = 'flex';
       var p = empty.querySelector('p');
       if (p && msg) p.textContent = msg;
     }

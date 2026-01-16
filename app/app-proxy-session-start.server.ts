@@ -8,6 +8,7 @@ import { ConciergeSessionStatus } from "@prisma/client";
 import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/models/billing.server";
 import { createOverageUsageCharge } from "~/models/shopify-billing.server";
 import { withProxyLogging } from "~/utils/proxy-logging.server";
+import { ensureResultDiversity, generateEmptyResultSuggestions } from "~/models/result-quality.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
@@ -915,14 +916,29 @@ export async function proxySessionStartAction(
       );
 
       // Build userIntent from answers (before building candidates, so we can use keywords for filtering)
+      // Enhanced: Better context preservation and intent building
       let userIntent = "";
       if (Array.isArray(answers)) {
-        userIntent = answers.join("; ").trim();
+        // Filter out empty/null answers and preserve meaningful context
+        const meaningfulAnswers = answers
+          .filter(a => a !== null && a !== undefined && String(a).trim().length > 0)
+          .map(a => String(a).trim());
+        
+        // Join with better separators to preserve context
+        // Use ". " for natural flow instead of "; " which can feel mechanical
+        userIntent = meaningfulAnswers.join(". ").trim();
+        
+        // If we have multiple answers, add context connectors for better AI understanding
+        if (meaningfulAnswers.length > 1) {
+          // The userIntent now flows naturally: "Answer 1. Answer 2. Answer 3"
+          // This helps AI understand the full context better
+        }
       } else if (typeof answers === "string") {
         userIntent = answers.trim();
       }
 
       console.log("[App Proxy] User intent length:", userIntent.length);
+      console.log("[App Proxy] User intent preview:", userIntent.substring(0, 200));
 
       // Extract includeTerms and avoidTerms from userIntent (before building candidates)
       function extractKeywords(text: string): { includeTerms: string[]; avoidTerms: string[] } {
@@ -1274,13 +1290,36 @@ export async function proxySessionStartAction(
         }
       }
 
+      // Ensure result diversity (vendor, type, price variety)
+      // This improves user experience by avoiding too many similar products
+      const diverseHandles = ensureResultDiversity(
+        finalHandlesGuaranteed.slice(0, targetCount),
+        allCandidates,
+        resultCountUsed
+      );
+      console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandlesGuaranteed.slice(0, targetCount).length, ")");
+
       // Final reasoning string (include relaxation notes)
       const notes = [...relaxNotes];
       const reasoning = [...notes, ...reasoningParts].filter(Boolean).join(" ");
-      productHandles = finalHandles.slice(0, targetCount);
+      productHandles = diverseHandles.slice(0, targetCount);
 
       console.log("[App Proxy] Final product handles:", productHandles.length, "out of", targetCount, "requested");
       
+      // Generate helpful suggestions if no results
+      let finalReasoning = reasoning;
+      if (productHandles.length === 0) {
+        const suggestions = generateEmptyResultSuggestions(
+          userIntent,
+          filteredProducts.length,
+          baseProducts.length
+        );
+        finalReasoning = suggestions.length > 0 
+          ? `No products match your criteria. ${suggestions[0]}`
+          : "No products available. Please try adjusting your search criteria or filters.";
+        console.log("[App Proxy] No products found - generated suggestions:", suggestions);
+      }
+
       // Save results and mark session as COMPLETE
       await saveConciergeResult({
         sessionToken,
@@ -1288,7 +1327,7 @@ export async function proxySessionStartAction(
         productIds: null,
         reasoning: productHandles.length > 0 
           ? reasoning
-          : "No products available. Please ensure the app is installed and products exist.",
+          : finalReasoning,
       });
 
       console.log("[App Proxy] Results saved, session marked COMPLETE");
