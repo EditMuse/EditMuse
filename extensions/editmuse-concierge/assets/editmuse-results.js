@@ -177,10 +177,23 @@
 
   function startLoadingAnimation() {
     var container = document.querySelector('[data-editmuse-results]');
-    if (!container) return;
+    if (!container) {
+      // Retry after a short delay if container not ready
+      setTimeout(startLoadingAnimation, 100);
+      return;
+    }
     
     var loadingText = container.querySelector('[data-editmuse-loading-text]');
-    if (!loadingText) return;
+    if (!loadingText) {
+      // Retry after a short delay if text element not ready
+      setTimeout(startLoadingAnimation, 100);
+      return;
+    }
+
+    // Stop any existing interval
+    if (loadingMessageInterval) {
+      clearInterval(loadingMessageInterval);
+    }
 
     var currentIndex = 0;
 
@@ -195,11 +208,23 @@
       
       // After fade out completes, change text and fade in
       setTimeout(function() {
+        if (!loadingText) return; // Safety check
         currentIndex = (currentIndex + 1) % loadingMessages.length;
         loadingText.textContent = loadingMessages[currentIndex];
         loadingText.className = 'editmuse-loading-text fade-in';
       }, 400); // Half of transition duration (0.6s / 1.5 = ~400ms)
     }, 4000);
+  }
+
+  // Start animation immediately on page load (in case loading is already visible)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() {
+      // Small delay to ensure DOM is fully ready
+      setTimeout(startLoadingAnimation, 50);
+    });
+  } else {
+    // DOM already loaded, start immediately
+    setTimeout(startLoadingAnimation, 50);
   }
 
   function stopLoadingAnimation() {

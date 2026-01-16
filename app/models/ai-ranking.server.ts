@@ -39,7 +39,7 @@ const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = 12000; // 12 seconds
 const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total
-const CACHE_DURATION_HOURS = 36; // Cache for 36 hours (between 24-48 hours)
+const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
 
 /**
@@ -262,53 +262,20 @@ function generateCacheKey(
 
 /**
  * Checks cache for existing ranking result
+ * Cache disabled - always returns null to force fresh AI ranking
  */
 async function getCachedRanking(
   cacheKey: string,
   shopId?: string
 ): Promise<{ rankedHandles: string[]; reasoning: string } | null> {
-  if (!shopId) {
-    return null; // Can't cache without shopId
-  }
-  
-  try {
-    const now = new Date();
-    const cached = await prisma.aIRankingCache.findFirst({
-      where: {
-        cacheKey,
-        shopId,
-        expiresAt: { gt: now },
-      },
-      orderBy: { createdAt: "desc" },
-    });
-    
-    if (cached) {
-      console.log("[AI Ranking] Cache HIT - using cached result");
-      // Parse JSON string (SQLite stores as string, PostgreSQL as Json)
-      let rankedHandles: string[] = [];
-      try {
-        rankedHandles = typeof cached.rankedHandles === "string"
-          ? JSON.parse(cached.rankedHandles)
-          : (cached.rankedHandles as string[]);
-      } catch {
-        console.error("[AI Ranking] Error parsing cached rankedHandles");
-      }
-      return {
-        rankedHandles,
-        reasoning: cached.reasoning || "Cached AI-ranked products",
-      };
-    }
-    
-    console.log("[AI Ranking] Cache MISS - will call OpenAI");
-    return null;
-  } catch (error) {
-    console.error("[AI Ranking] Error checking cache:", error);
-    return null; // On error, proceed without cache
-  }
+  // Cache disabled - always return null to force fresh AI ranking
+  console.log("[AI Ranking] Cache disabled - will call OpenAI");
+  return null;
 }
 
 /**
  * Stores ranking result in cache
+ * Cache disabled - no-op function
  */
 async function setCachedRanking(
   cacheKey: string,
@@ -319,43 +286,9 @@ async function setCachedRanking(
   reasoning: string,
   resultCount: number
 ): Promise<void> {
-  try {
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + CACHE_DURATION_HOURS * 60 * 60 * 1000);
-    
-    // Create product hash for storage
-    const productHandles = candidates.map(c => c.handle).sort();
-    const productHash = crypto.createHash("sha256")
-      .update(productHandles.join(","))
-      .digest("hex");
-    
-    // Upsert cache entry (update if exists, create if not)
-    // SQLite stores JSON as string, PostgreSQL as Json type
-    const rankedHandlesJson = JSON.stringify(rankedHandles);
-    await prisma.aIRankingCache.upsert({
-      where: { cacheKey },
-      update: {
-        rankedHandles: rankedHandlesJson,
-        reasoning,
-        expiresAt,
-      },
-      create: {
-        cacheKey,
-        shopId,
-        userIntent: userIntent.substring(0, 1000), // Limit length for storage
-        productHash,
-        rankedHandles: rankedHandlesJson,
-        reasoning: reasoning.substring(0, 2000), // Limit length
-        resultCount,
-        expiresAt,
-      },
-    });
-    
-    console.log("[AI Ranking] Cached result for", CACHE_DURATION_HOURS, "hours");
-  } catch (error) {
-    console.error("[AI Ranking] Error caching result:", error);
-    // Don't throw - caching is best-effort
-  }
+  // Cache disabled - do nothing
+  // This function is kept for API compatibility but doesn't cache anything
+  return;
 }
 
 /**
