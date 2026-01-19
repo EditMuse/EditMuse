@@ -922,7 +922,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           },
         },
       },
-      required: ["trustFallback", "selected"],
+      required: ["trustFallback", "selected", "rejected_candidates"],
       additionalProperties: false,
     };
   }
