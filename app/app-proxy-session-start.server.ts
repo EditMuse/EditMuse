@@ -20,6 +20,18 @@ import {
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
+/**
+ * Compute credits for delivered result count
+ * Tiered billing: 1-8 = 1 credit, 9-12 = 1.5 credits, 13-16 = 2 credits
+ * For values > 16, clamp to 2 credits (extend explicitly if needed)
+ */
+function creditsForDeliveredCount(n: number): number {
+  if (n <= 0) return 0;
+  if (n <= 8) return 1;
+  if (n <= 12) return 1.5;
+  return 2; // 13-16 (clamp for now, extend if >16 supported)
+}
+
 const PRODUCT_POOL_LIMIT = 500;       // how many products we pull from Shopify
 // CANDIDATE_WINDOW_SIZE is now dynamic based on entitlements (calculated per request)
 const MAX_AI_PASSES = 3;              // first pass + up to 2 top-up passes
@@ -674,10 +686,12 @@ export async function proxySessionStartAction(
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { experienceId, resultCount, answers, clientRequestId } = body;
+  const { experienceId, answers, clientRequestId } = body;
+  // NOTE: resultCount is ignored - Experience.resultCount is the ONLY source of truth
+  const bodyResultCount = (body as any).resultCount; // Only for logging
   console.log("[App Proxy] Request body:", {
     experienceId,
-    resultCount,
+    bodyResultCount, // Log only, not used
     hasAnswers: !!answers,
     clientRequestId,
   });
@@ -908,7 +922,7 @@ export async function proxySessionStartAction(
 
   // Experience.resultCount is the ONLY source of truth for number of results
   const finalResultCount = Number(experience.resultCount ?? 8);
-  console.log("[ResultCount] source=experience value=", finalResultCount, "experienceId=", experienceIdUsed, "bodyResultCount=", resultCount);
+  console.log("[ResultCount] chosen=", finalResultCount, "ignoredBody=", bodyResultCount, "experienceId=", experienceIdUsed);
 
   // Validate and determine mode (must be quiz/chat/hybrid, fallback to hybrid)
   const validModes = ["quiz", "chat", "hybrid"];
@@ -1041,9 +1055,14 @@ export async function proxySessionStartAction(
 
   // Calculate dynamic AI window based on finalResultCount and entitlements
   // bundleWindow: 8->60, 12->90, 16->120
+  // Reduce AI window when no hardTerms (max 60 candidates)
   const bundleWindow = finalResultCount === 8 ? 60 : finalResultCount === 12 ? 90 : 120;
-  const aiWindow = Math.min(entitlements.candidateCap, bundleWindow);
-  console.log("[App Proxy] AI window:", aiWindow, "(bundleWindow:", bundleWindow, ", candidateCap:", entitlements.candidateCap, ")");
+  const baseAiWindow = Math.min(entitlements.candidateCap, bundleWindow);
+  
+  // Parse intent early to check for hardTerms (before actual parsing, we'll adjust after parsing)
+  // For now, calculate base window, then adjust after intent parsing
+  let aiWindow = baseAiWindow;
+  console.log("[App Proxy] Base AI window:", aiWindow, "(bundleWindow:", bundleWindow, ", candidateCap:", entitlements.candidateCap, ")");
 
   // Store answers as JSON
   const answersJson = Array.isArray(answers) 
@@ -1592,6 +1611,255 @@ export async function proxySessionStartAction(
         return { handles, trustFallback, budgetExceeded, totalPrice, chosenPrimaries };
       }
       
+      /**
+       * 3-pass bundle top-up ladder
+       * PASS 1: Strict (only correct item pools, enforce per-item + total budget, prefer inStock, cheapest-first)
+       * PASS 2: Relaxed allocation (ignore per-item caps, enforce only totalBudget, cheapest-first)
+       * PASS 3: Relaxed substitutes (allow substitutes for small pools, enforce totalBudget if possible, else exceed with trustFallback)
+       */
+      function bundleTopUp3Pass(
+        existingHandles: string[],
+        bundleItemPools: Map<number, EnrichedCandidate[]>,
+        allocatedBudgets: Map<number, number>,
+        totalBudget: number | null,
+        requestedCount: number,
+        bundleItemsWithBudget: Array<{ hardTerms: string[]; quantity: number }>,
+        inStockOnly: boolean,
+        experience: any
+      ): {
+        handles: string[];
+        trustFallback: boolean;
+        budgetExceeded: boolean;
+        totalPrice: number;
+        pass1Added: number;
+        pass2Added: number;
+        pass3Added: number;
+      } {
+        const used = new Set<string>(existingHandles);
+        const handles = [...existingHandles];
+        let trustFallback = false;
+        let budgetExceeded = false;
+        let totalPrice = existingHandles.reduce((sum, handle) => {
+          // Calculate existing total price from item pools
+          for (const pool of bundleItemPools.values()) {
+            const c = pool.find(p => p.handle === handle);
+            if (c) {
+              const price = c.price ? parseFloat(String(c.price)) : NaN;
+              return sum + (Number.isFinite(price) ? price : 0);
+            }
+          }
+          return sum;
+        }, 0);
+        
+        let pass1Added = 0;
+        let pass2Added = 0;
+        let pass3Added = 0;
+        
+        const getPrice = (c: EnrichedCandidate): number => {
+          const price = c.price ? parseFloat(String(c.price)) : NaN;
+          return Number.isFinite(price) ? price : Infinity;
+        };
+        
+        const isAvailable = (c: EnrichedCandidate): boolean => {
+          if (!inStockOnly) return true;
+          return c.available === true;
+        };
+        
+        // PASS 1: Strict
+        while (handles.length < requestedCount) {
+          let added = false;
+          const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+          
+          // Round-robin across items
+          for (const itemIdx of itemIndices) {
+            if (handles.length >= requestedCount) break;
+            const pool = bundleItemPools.get(itemIdx) || [];
+            const allocatedBudget = allocatedBudgets.get(itemIdx);
+            
+            // Filter candidates: available if needed, within allocated budget, within total budget
+            const candidates = pool
+              .filter(c => !used.has(c.handle))
+              .filter(c => isAvailable(c))
+              .filter(c => {
+                const price = getPrice(c);
+                if (allocatedBudget !== undefined && allocatedBudget !== null) {
+                  if (price > allocatedBudget) return false;
+                }
+                if (totalBudget !== null) {
+                  if (totalPrice + price > totalBudget) return false;
+                }
+                return true;
+              })
+              .sort((a, b) => getPrice(a) - getPrice(b)); // cheapest first
+            
+            if (candidates.length > 0) {
+              const selected = candidates[0];
+              handles.push(selected.handle);
+              used.add(selected.handle);
+              totalPrice += getPrice(selected);
+              pass1Added++;
+              added = true;
+              break; // One per round-robin cycle
+            }
+          }
+          
+          if (!added) break;
+        }
+        
+        // PASS 2: Relaxed allocation (ignore per-item caps, enforce only totalBudget)
+        while (handles.length < requestedCount) {
+          let added = false;
+          const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+          
+          for (const itemIdx of itemIndices) {
+            if (handles.length >= requestedCount) break;
+            const pool = bundleItemPools.get(itemIdx) || [];
+            
+            // Filter: available if needed, within total budget only (ignore allocated budget)
+            const candidates = pool
+              .filter(c => !used.has(c.handle))
+              .filter(c => isAvailable(c))
+              .filter(c => {
+                const price = getPrice(c);
+                if (totalBudget !== null) {
+                  if (totalPrice + price > totalBudget) return false;
+                }
+                return true;
+              })
+              .sort((a, b) => getPrice(a) - getPrice(b));
+            
+            if (candidates.length > 0) {
+              const selected = candidates[0];
+              handles.push(selected.handle);
+              used.add(selected.handle);
+              totalPrice += getPrice(selected);
+              pass2Added++;
+              added = true;
+              break;
+            }
+          }
+          
+          if (!added) break;
+        }
+        
+        // PASS 3: Relaxed substitutes (allow substitutes, exceed budget if needed)
+        // Build substitute pools
+        const substituteMap = new Map<number, string[]>(); // itemIdx -> substitute terms
+        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+          const item = bundleItemsWithBudget[itemIdx];
+          const mainTerm = item.hardTerms[0]?.toLowerCase() || "";
+          const substitutes: string[] = [];
+          
+          // Define substitutes
+          if (mainTerm.includes("blazer") || mainTerm.includes("outerwear")) {
+            substitutes.push("jacket", "coat", "waistcoat");
+          }
+          if (mainTerm.includes("trouser")) {
+            substitutes.push("pant", "chino");
+          }
+          if (mainTerm.includes("shirt")) {
+            substitutes.push("dress shirt", "button-up", "formal shirt");
+          }
+          if (mainTerm.includes("suit")) {
+            // Only allow tuxedo if wedding/formal intent (check userIntent later, for now skip)
+            // substitutes.push("tuxedo");
+          }
+          
+          if (substitutes.length > 0) {
+            substituteMap.set(itemIdx, substitutes);
+          }
+        }
+        
+        // Check if any item pool is too small (< 5 candidates)
+        const needsSubstitutes = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => {
+          const pool = bundleItemPools.get(i) || [];
+          const availableInPool = pool.filter(c => !used.has(c.handle)).length;
+          return availableInPool < 5;
+        });
+        
+        while (handles.length < requestedCount) {
+          let added = false;
+          const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+          
+          for (const itemIdx of itemIndices) {
+            if (handles.length >= requestedCount) break;
+            const pool = bundleItemPools.get(itemIdx) || [];
+            const substitutes = substituteMap.get(itemIdx) || [];
+            const needsSubstitute = needsSubstitutes[itemIdx];
+            
+            // Build candidate list: primary pool first, then substitutes if needed
+            let candidates: EnrichedCandidate[] = [];
+            
+            // Primary pool
+            const primaryCandidates = pool
+              .filter(c => !used.has(c.handle))
+              .filter(c => !inStockOnly || c.available === true)
+              .sort((a, b) => getPrice(a) - getPrice(b));
+            
+            candidates.push(...primaryCandidates);
+            
+            // If pool too small, add substitutes
+            if (needsSubstitute && substitutes.length > 0) {
+              // Find substitute candidates from other pools
+              for (const subTerm of substitutes) {
+                for (let otherIdx = 0; otherIdx < bundleItemsWithBudget.length; otherIdx++) {
+                  if (otherIdx === itemIdx) continue;
+                  const otherPool = bundleItemPools.get(otherIdx) || [];
+                  const subCandidates = otherPool
+                    .filter(c => !used.has(c.handle))
+                    .filter(c => !inStockOnly || c.available === true)
+                    .filter(c => {
+                      const haystack = [
+                        c.title || "",
+                        c.productType || "",
+                        (c.tags || []).join(" "),
+                        c.vendor || "",
+                        c.searchText || "",
+                      ].join(" ").toLowerCase();
+                      return haystack.includes(subTerm);
+                    })
+                    .sort((a, b) => getPrice(a) - getPrice(b));
+                  candidates.push(...subCandidates);
+                }
+              }
+            }
+            
+            // Remove duplicates
+            candidates = candidates.filter((c, idx, arr) => arr.findIndex(x => x.handle === c.handle) === idx);
+            
+            // Try to respect totalBudget first
+            const withinBudget = candidates.filter(c => {
+              const price = getPrice(c);
+              if (totalBudget !== null) {
+                return totalPrice + price <= totalBudget;
+              }
+              return true;
+            });
+            
+            const selected = withinBudget.length > 0 ? withinBudget[0] : candidates[0];
+            
+            if (selected) {
+              const price = getPrice(selected);
+              if (totalBudget !== null && totalPrice + price > totalBudget) {
+                budgetExceeded = true;
+                trustFallback = true;
+              }
+              
+              handles.push(selected.handle);
+              used.add(selected.handle);
+              totalPrice += price;
+              pass3Added++;
+              added = true;
+              break;
+            }
+          }
+          
+          if (!added) break;
+        }
+        
+        return { handles, trustFallback, budgetExceeded, totalPrice, pass1Added, pass2Added, pass3Added };
+      }
+      
       function allocateBudgetPerItem(
         items: Array<{ hardTerms: string[]; quantity: number }>,
         totalBudget: number
@@ -1839,6 +2107,12 @@ export async function proxySessionStartAction(
       
       const strictGateCount = strictGate.length;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
+      
+      // Reduce AI window when no hardTerms (max 60 candidates)
+      if (hardTerms.length === 0 && aiWindow > 60) {
+        aiWindow = 60;
+        console.log("[App Proxy] AI window reduced to 60 (no hardTerms)");
+      }
       
       // Pre-rank gated candidates with BM25 + boosts
       console.log("[App Proxy] [Layer 2] Pre-ranking candidates with BM25");
@@ -2204,6 +2478,12 @@ export async function proxySessionStartAction(
               reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
             }
             
+            // Add delivered vs requested count to reasoning (will be finalized after top-up)
+            const deliveredAfterAI = finalHandles.length;
+            if (deliveredAfterAI < finalResultCount) {
+              reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+            }
+            
             reasoningParts.push(reasoningText);
             console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles, final after budget-aware selection:", finalHandles.length);
           } else {
@@ -2385,7 +2665,21 @@ export async function proxySessionStartAction(
         }
       } else {
         // if AI fails completely, we will fallback at the end
-        reasoningParts.push("Products selected using default ranking.");
+        // But if no-hard-terms and gatedPool>0, use deterministic now
+        if (hardTerms.length === 0 && gatedCandidates.length > 0) {
+          console.log("[App Proxy] No-hard-terms: AI returned empty, using deterministic ranking from gated pool");
+          finalHandles = fallbackRanking(window1, targetCount);
+          reasoningParts.push("Products selected using relevance ranking.");
+        } else {
+          reasoningParts.push("Products selected using default ranking.");
+        }
+      }
+      
+      // No-hard-terms validation: if selected empty AND gatedPool>0 AFTER AI call, fall back to deterministic
+      if (hardTerms.length === 0 && finalHandles.length === 0 && gatedCandidates.length > 0) {
+        console.log("[App Proxy] No-hard-terms: AI returned empty but gatedPool>0, falling back to deterministic ranking");
+        finalHandles = fallbackRanking(gatedCandidates.slice(0, aiWindow), targetCount);
+        reasoningParts.push("Products selected using relevance ranking.");
       }
 
       // TOP-UP PASSES (skip for bundle mode - handled separately)
@@ -2786,7 +3080,7 @@ export async function proxySessionStartAction(
           finalHandlesGuaranteed = inPoolHandles;
         }
         
-        // If we need top-up, use budget-aware helper
+        // If we need top-up, use 3-pass ladder
         if (finalHandlesGuaranteed.length < finalResultCount) {
           // Build allocated budgets map
           const allocatedBudgets = new Map<number, number>();
@@ -2796,32 +3090,59 @@ export async function proxySessionStartAction(
             }
           });
           
-          // Use budget-aware selection helper for top-up
-          const topUpResult = selectBundleWithinBudget(
+          // Use 3-pass bundle top-up ladder
+          const topUpResult = bundleTopUp3Pass(
+            finalHandlesGuaranteed,
             bundleItemPools,
             allocatedBudgets,
             bundleIntent.totalBudget,
             finalResultCount,
-            bundleItemsWithBudget.length
+            bundleItemsWithBudget,
+            experience.inStockOnly || false,
+            experience
           );
           
-          // Merge with existing handles (avoid duplicates)
-          const existingSet = new Set(finalHandlesGuaranteed);
-          for (const handle of topUpResult.handles) {
-            if (!existingSet.has(handle)) {
-              finalHandlesGuaranteed.push(handle);
-              existingSet.add(handle);
-              if (finalHandlesGuaranteed.length >= finalResultCount) break;
-            }
-          }
+          // Replace with top-up result (already includes existing handles)
+          finalHandlesGuaranteed = topUpResult.handles;
           
           if (topUpResult.trustFallback) {
             trustFallback = true;
           }
           
+          // Log top-up results
+          const finalCountsByItem = new Map<number, number>();
+          for (const handle of finalHandlesGuaranteed) {
+            for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+              const pool = bundleItemPools.get(itemIdx) || [];
+              if (pool.some(c => c.handle === handle)) {
+                finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+                break;
+              }
+            }
+          }
+          
+          const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
+            const count = finalCountsByItem.get(idx) || 0;
+            const itemName = item.hardTerms[0];
+            return `${itemName}=${count}`;
+          }).join(" ");
+          
+          console.log("[Bundle TopUp] requested=", finalResultCount, "delivered=", finalHandlesGuaranteed.length, 
+            "pass1_added=", topUpResult.pass1Added, "pass2_added=", topUpResult.pass2Added, 
+            "pass3_added=", topUpResult.pass3Added, "trustFallback=", topUpResult.trustFallback,
+            "budgetExceeded=", topUpResult.budgetExceeded);
+          console.log("[Bundle TopUp] finalCounts", finalCountsText);
           console.log("[Bundle Budget] top-up finalTotalPrice=", topUpResult.totalPrice.toFixed(2), 
             "finalCount=", finalHandlesGuaranteed.length, "trustFallback=", topUpResult.trustFallback,
             "budgetExceeded=", topUpResult.budgetExceeded);
+          
+          // If still can't reach requestedCount after 3 passes, update reasoning
+          if (finalHandlesGuaranteed.length < finalResultCount) {
+            const missingReason = `Only ${finalHandlesGuaranteed.length} matches available for the requested bundle categories within budget/stock constraints.`;
+            if (reasoningParts.length > 0 && !reasoningParts[reasoningParts.length - 1].includes(missingReason)) {
+              reasoningParts.push(missingReason);
+            }
+          }
         }
         
         // Count final handles per item for logging (AFTER top-up)
@@ -2984,9 +3305,42 @@ export async function proxySessionStartAction(
 
       // Final reasoning string (include relaxation notes)
       const notes = [...relaxNotes];
-      const reasoning = [...notes, ...reasoningParts].filter(Boolean).join(" ");
+      let reasoning = [...notes, ...reasoningParts].filter(Boolean).join(" ");
       const finalHandlesArray = Array.isArray(finalHandlesGuaranteed) ? finalHandlesGuaranteed : [];
       productHandles = (Array.isArray(diverseHandles) ? diverseHandles : finalHandlesArray).slice(0, targetCount);
+      
+      // Add delivered vs requested count to reasoning
+      const deliveredCountAtReasoning = productHandles.length;
+      const requestedCountAtReasoning = targetCount;
+      const isBundleModeForReasoning = bundleIntent?.isBundle === true;
+      
+      if (deliveredCountAtReasoning < requestedCountAtReasoning) {
+        // Explain why fewer results
+        let whyFewer = "";
+        if (isBundleModeForReasoning) {
+          // Bundle-specific reasons
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+            whyFewer = "Limited matches available within budget and stock constraints.";
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+            whyFewer = "Limited in-stock matches available for the requested bundle categories.";
+          } else {
+            whyFewer = "Limited matches available for the requested bundle categories.";
+          }
+        } else {
+          // Single-item reasons
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+            whyFewer = "Limited matches available within budget constraints.";
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+            whyFewer = "Limited in-stock matches available.";
+          } else {
+            whyFewer = "Limited matches available for your criteria.";
+          }
+        }
+        reasoning += ` Showing ${deliveredCountAtReasoning} results (requested ${requestedCountAtReasoning}). ${whyFewer}`;
+      } else if (deliveredCountAtReasoning === requestedCountAtReasoning && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
+        // Budget was exceeded in pass 3
+        reasoning += ` Showing ${deliveredCountAtReasoning} results (requested ${requestedCountAtReasoning}). Budget was relaxed to show more options.`;
+      }
 
       console.log("[App Proxy] Final product handles:", productHandles.length, "out of", targetCount, "requested");
       
@@ -3004,39 +3358,56 @@ export async function proxySessionStartAction(
         console.log("[App Proxy] No products found - generated suggestions:", suggestions);
       }
       
+      // Guard: finalHandles must be defined and an array before saving
+      if (finalHandles === undefined || !Array.isArray(finalHandles)) {
+        const errorMsg = `[App Proxy] FATAL: finalHandles is undefined or not an array. Cannot save or mark COMPLETE. finalHandles=${finalHandles}`;
+        console.error(errorMsg);
+        throw new Error(errorMsg);
+      }
+      
       // Ensure productHandles is always an array before saving
       const finalHandlesToSave = Array.isArray(productHandles) ? productHandles : [];
-      console.log("[Bundle Save] handlesCount=", finalHandlesToSave.length, "handlesPreview=", finalHandlesToSave.slice(0, 5));
       
-      // Save results and mark session as COMPLETE
+      // Double-check: if finalHandlesToSave is empty but finalHandles has items, use finalHandles
+      const handlesToSave = finalHandlesToSave.length > 0 ? finalHandlesToSave : (Array.isArray(finalHandles) ? finalHandles.slice(0, targetCount) : []);
+      const deliveredCount = handlesToSave.length;
+      const requestedCount = finalResultCount;
+      const billedCount = handlesToSave.length;
+      
+      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "handlesPreview=", handlesToSave.slice(0, 5));
+      
+      // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
       await saveConciergeResult({
         sessionToken,
-        productHandles: finalHandlesToSave,
+        productHandles: handlesToSave,
         productIds: null,
-        reasoning: finalHandlesToSave.length > 0 
+        reasoning: handlesToSave.length > 0 
           ? reasoning
           : finalReasoning,
       });
 
-      console.log("[App Proxy] Results saved, session marked COMPLETE");
+      console.log("[App Proxy] Results saved, session marked COMPLETE. billedCount=", billedCount);
 
       // Log 3-layer pipeline metrics
       console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
 
-      // Charge session once for the final result count (prevents duplicate charges from multi-pass AI)
+      // Charge session based on delivered results, not requested (ONLY AFTER saving)
       // NOTE: Credits are charged regardless of cache hit/miss - you're paying for the ranking service, not the OpenAI API call
-      const deliveredCount = productHandles.length;
-      if (deliveredCount === 0) {
-        console.log("[Billing] Skipping charge: deliveredCount=0");
+      const credits = creditsForDeliveredCount(billedCount);
+      
+      if (billedCount === 0) {
+        console.log("[Billing] Skipping charge: billedCount=0");
       } else {
         try {
+          // Charge based on billedCount (delivered count)
           chargeResult = await chargeConciergeSessionOnce({
             sessionToken,
             shopId: shop.id,
-            resultCount: finalResultCount, // Use requested count (8/12/16), not actual returned count
+            resultCount: billedCount, // Use delivered count for billing
             experienceId: experience.id,
           });
-          console.log("[App Proxy] Session charged for", finalResultCount, "results, overage delta:", chargeResult.overageCreditsX2Delta);
+          console.log("[Billing] requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "credits=", credits, "sid=", sessionToken, "experienceId=", experienceIdUsed);
+          console.log("[App Proxy] Session charged for", deliveredCount, "delivered results, overage delta:", chargeResult.overageCreditsX2Delta);
 
           // Handle overage charges if any
           if (chargeResult.overageCreditsX2Delta > 0) {

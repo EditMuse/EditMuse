@@ -717,7 +717,15 @@ export async function rankProductsWithAI(
   
   // Log payload size
   const productListJsonChars = productList.length;
-  console.log("[AI Ranking] productListJsonChars=", productListJsonChars);
+  const candidateCount = candidates.length;
+  console.log("[AI Ranking] productListJsonChars=", productListJsonChars, "candidateCount=", candidateCount);
+  
+  // Adaptive compression: use compressed prompt on first attempt if payload too large
+  const shouldUseCompressedFirst = productListJsonChars > 35000 || candidateCount > 80;
+  if (shouldUseCompressedFirst) {
+    console.log("[AI Ranking] Using compressed prompt on first attempt (productListJsonChars=", productListJsonChars, ", candidateCount=", candidateCount, ")");
+    productList = buildProductList(false, true); // Rebuild with compressed mode
+  }
 
   const constraints = variantConstraints ?? { size: null, color: null, material: null };
   const prefs = variantPreferences ?? {};
@@ -830,7 +838,7 @@ CRITICAL OUTPUT FORMAT:
 - Use the exact schema provided below - no deviations
 
 HARD CONSTRAINT RULES:
-${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
+${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + overall relevance. Do NOT reject products for missing hardTerms since none were specified. Prioritize products that match soft terms, variant preferences, and overall relevance to the user's intent.` : trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
   a) At least one hardTerm match in (title OR productType OR tags OR desc1000 snippet)
   b) ALL hardFacets must match when provided (size, color, material)
   c) Must NOT contain any avoidTerms in title/tags/desc1000 (unless avoidTerms is empty)
@@ -1135,10 +1143,13 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const isRetry = attempt > 0;
-      const useCompressedPrompt = isRetry && lastParseFailReason !== undefined;
+      // Use compressed prompt if: retry with parse failure OR adaptive compression triggered on first attempt
+      const useCompressedPrompt = (isRetry && lastParseFailReason !== undefined) || (attempt === 0 && shouldUseCompressedFirst);
       
       if (isRetry) {
         console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}${useCompressedPrompt ? " (using compressed prompt)" : ""}`);
+      } else if (shouldUseCompressedFirst) {
+        console.log("[AI Ranking] First attempt using compressed prompt (adaptive compression)");
       }
 
       const controller = new AbortController();
