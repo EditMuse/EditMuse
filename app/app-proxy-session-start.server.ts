@@ -2584,6 +2584,9 @@ export async function proxySessionStartAction(
                 if (belongsToItem) {
                   finalHandles.push(candidate.handle);
                   usedSet.add(candidate.handle);
+                  if (!handlesByItem.has(currentItemIdx)) {
+                    handlesByItem.set(currentItemIdx, []);
+                  }
                   handlesByItem.get(currentItemIdx)!.push(candidate.handle);
                   topUpSourceCounts.set(currentItemIdx, (topUpSourceCounts.get(currentItemIdx) || 0) + 1);
                   break;
@@ -2861,6 +2864,9 @@ export async function proxySessionStartAction(
               if (belongsToItem) {
                 finalHandlesGuaranteed.push(candidate.handle);
                 have.add(candidate.handle);
+                if (!handlesByItem.has(currentItemIdx)) {
+                  handlesByItem.set(currentItemIdx, []);
+                }
                 handlesByItem.get(currentItemIdx)!.push(candidate.handle);
                 topUpSourceCounts.set(currentItemIdx, (topUpSourceCounts.get(currentItemIdx) || 0) + 1);
                 break;
@@ -3033,7 +3039,8 @@ export async function proxySessionStartAction(
       // Final reasoning string (include relaxation notes)
       const notes = [...relaxNotes];
       const reasoning = [...notes, ...reasoningParts].filter(Boolean).join(" ");
-      productHandles = diverseHandles.slice(0, targetCount);
+      const finalHandlesArray = Array.isArray(finalHandlesGuaranteed) ? finalHandlesGuaranteed : [];
+      productHandles = (Array.isArray(diverseHandles) ? diverseHandles : finalHandlesArray).slice(0, targetCount);
 
       console.log("[App Proxy] Final product handles:", productHandles.length, "out of", targetCount, "requested");
       
@@ -3051,12 +3058,16 @@ export async function proxySessionStartAction(
         console.log("[App Proxy] No products found - generated suggestions:", suggestions);
       }
       
+      // Ensure productHandles is always an array before saving
+      const finalHandlesToSave = Array.isArray(productHandles) ? productHandles : [];
+      console.log("[Bundle Save] handlesCount=", finalHandlesToSave.length, "handlesPreview=", finalHandlesToSave.slice(0, 5));
+      
       // Save results and mark session as COMPLETE
       await saveConciergeResult({
         sessionToken,
-        productHandles,
+        productHandles: finalHandlesToSave,
         productIds: null,
-        reasoning: productHandles.length > 0 
+        reasoning: finalHandlesToSave.length > 0 
           ? reasoning
           : finalReasoning,
       });
