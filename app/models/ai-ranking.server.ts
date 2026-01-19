@@ -298,7 +298,8 @@ function extractBalancedJSON(text: string): string | null {
 function validateRankingSchema(
   parsed: any,
   trustFallback: boolean,
-  candidateHandles: Set<string>
+  candidateHandles: Set<string>,
+  hardTermsCount: number
 ): { valid: boolean; reason?: string } {
   if (!parsed || typeof parsed !== "object") {
     return { valid: false, reason: "Not an object" };
@@ -342,9 +343,11 @@ function validateRankingSchema(
       return { valid: false, reason: "Invalid matchedHardTerms array" };
     }
     
-    // If trustFallback=false, require at least one matchedHardTerm
-    if (!trustFallback && item.evidence.matchedHardTerms.length === 0) {
-      return { valid: false, reason: "No matchedHardTerms when trustFallback=false" };
+    // If trustFallback=false AND hardTerms exist, require at least one matchedHardTerm
+    // If hardTerms.length===0, allow matchedHardTerms to be empty
+    const allowEmptyMatchedHardTerms = hardTermsCount === 0;
+    if (!trustFallback && !allowEmptyMatchedHardTerms && item.evidence.matchedHardTerms.length === 0) {
+      return { valid: false, reason: "No matchedHardTerms when trustFallback=false and hardTerms exist" };
     }
     
     if (typeof item.reason !== "string") {
@@ -613,11 +616,16 @@ export async function rankProductsWithAI(
 
   // Extract hard constraints (with defaults)
   const hardTerms = hardConstraints?.hardTerms || [];
+  const hardTermsCount = hardTerms.length;
   const hardFacetsRaw = hardConstraints?.hardFacets || {};
   const avoidTermsFromConstraints = hardConstraints?.avoidTerms || [];
   const trustFallback = hardConstraints?.trustFallback || false;
   const isBundle = hardConstraints?.isBundle || false;
   const bundleItems = hardConstraints?.bundleItems || [];
+  
+  // Log hardTerms count and whether empty matchedHardTerms are allowed
+  const allowEmptyMatchedHardTerms = hardTermsCount === 0;
+  console.log("[AI Ranking] hardTermsCount=", hardTermsCount, "allowEmptyMatchedHardTerms=", allowEmptyMatchedHardTerms);
   
   // Convert hardFacets from single values to arrays if needed
   // Also merge avoidTerms (from params and constraints)
@@ -777,6 +785,14 @@ CRITICAL OUTPUT FORMAT:
 - Output must be parseable JSON.parse() directly
 - Use the exact bundle schema provided below - no deviations
 
+REASONING QUALITY (CRITICAL):
+- Each product's "reason" field must be written in natural, professional, conversational language
+- Write as if you're a knowledgeable sales associate explaining to a customer why this product matches their needs
+- Be specific and helpful: mention how it fits their request, style, occasion, or preferences
+- Avoid technical jargon or robotic phrases like "Product matches hardTerm X" or "This item satisfies criteria Y"
+- Instead use human-like language: "This elegant navy suit is perfect for formal occasions and professional settings" not "Matches suit category and navy color"
+- Each reason should be ONE sentence maximum, engaging, and customer-facing
+
 BUNDLE REQUIREMENTS:
 - You will receive ${bundleItems.length} bundle items, each with its own candidate group
 - For each itemIndex, choose exactly 1 primary selection from that item's candidate group
@@ -827,8 +843,13 @@ REQUIREMENTS:
 - No duplicate handles
 - evidence.matchedHardTerms must not be empty when trustFallback=false
 - evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
-- Each reason must be 1 sentence maximum and written in natural, conversational language
-- Write reasons as if explaining to a customer why this product matches their needs
+- CRITICAL: Each "reason" must be professional, human-like, and conversational:
+  * Write as if you're a knowledgeable sales associate speaking directly to the customer
+  * Use natural language that highlights benefits, style, occasion, or fit
+  * Be specific: mention colors, materials, occasions, or use cases when relevant
+  * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
+  * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
+  * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
 - rejected_candidates array is optional but include up to 20 if helpful for debugging`
     : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
@@ -836,6 +857,14 @@ CRITICAL OUTPUT FORMAT:
 - Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
 - Output must be parseable JSON.parse() directly
 - Use the exact schema provided below - no deviations
+
+REASONING QUALITY (CRITICAL):
+- Each product's "reason" field must be written in natural, professional, conversational language
+- Write as if you're a knowledgeable sales associate explaining to a customer why this product matches their needs
+- Be specific and helpful: mention how it fits their request, style, occasion, preferences, or use case
+- Avoid technical jargon or robotic phrases like "Product matches hardTerm X" or "This item satisfies criteria Y"
+- Instead use human-like language: "This elegant navy suit is perfect for formal occasions and professional settings" not "Matches suit category and navy color"
+- Each reason should be ONE sentence maximum, engaging, and customer-facing
 
 HARD CONSTRAINT RULES:
 ${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + overall relevance. Do NOT reject products for missing hardTerms since none were specified. Prioritize products that match soft terms, variant preferences, and overall relevance to the user's intent.` : trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
@@ -887,8 +916,14 @@ REQUIREMENTS:
 - No duplicate handles
 - evidence.matchedHardTerms must not be empty when trustFallback=false
 - evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
-- Each reason must be 1 sentence maximum and written in natural, conversational language
-- Write reasons as if explaining to a customer why this product matches their needs (e.g., "This navy suit perfectly matches your formal wear requirements" not "Product matches hardTerm 'suit' and color 'navy'")
+- CRITICAL: Each "reason" must be professional, human-like, and conversational:
+  * Write as if you're a knowledgeable sales associate speaking directly to the customer
+  * Use natural language that highlights benefits, style, occasion, or fit
+  * Be specific: mention colors, materials, occasions, or use cases when relevant
+  * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
+  * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
+  * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
+  * Each reason should be ONE sentence maximum, engaging, and customer-facing
 - rejected_candidates array is optional but include up to 20 if helpful for debugging`;
 
   // Build hard constraints object for prompt
@@ -979,7 +1014,7 @@ For each selected item in selected_by_item:
    - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
    - Score: 0-100 based on match quality
    - Evidence: Which hardTerms matched, which facets matched, which fields were used
-   - Reason: Write a natural, conversational 1-sentence explanation
+   - Reason: Write a natural, professional, conversational 1-sentence explanation as if speaking directly to the customer. Be specific about benefits, style, occasion, or use case. Avoid technical jargon or robotic phrases.
 
 Return ONLY the JSON object matching the bundle schema - no markdown, no prose outside JSON.`;
     }
@@ -1029,7 +1064,7 @@ ${matchingRequirements}
    - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
    - Score: 0-100 based on match quality
    - Evidence: Which hardTerms matched, which facets matched, which fields were used
-   - Reason: Write a natural, conversational 1-sentence explanation as if speaking to the customer (e.g., "This navy suit is perfect for formal occasions" rather than "Matches suit category and navy color")
+   - Reason: Write a natural, professional, conversational 1-sentence explanation as if you're a knowledgeable sales associate speaking directly to the customer. Be specific about benefits, style, occasion, or use case. Example: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look" (NOT "Matches suit category and navy color")
 
 4. Optionally include up to 20 rejected candidates with brief "why" explanations.
 
@@ -1364,7 +1399,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       // Validate against expected schema (single-item mode)
-      const validation = validateRankingSchema(structuredResult as StructuredRankingResult, trustFallback, candidateHandles);
+      const validation = validateRankingSchema(structuredResult as StructuredRankingResult, trustFallback, candidateHandles, hardTermsCount);
       
       if (!validation.valid) {
         // Before retrying, try to parse as old format as a fallback

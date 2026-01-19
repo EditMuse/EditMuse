@@ -2469,13 +2469,29 @@ export async function proxySessionStartAction(
               "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
               "budgetExceeded=", selectionResult.budgetExceeded);
             
-            // Build improved reasoning
-            const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-            const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
-            
-            let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-            if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
-              reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+            // Build reasoning - prioritize AI's human-like reasons from aiBundle.reasoning
+            let reasoningText = "";
+            if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
+              // Use AI's human-like reasoning as primary source
+              reasoningText = aiBundle.reasoning.trim();
+              
+              // Add budget context if needed (but keep it natural)
+              if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
+                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+                // Only add budget note if AI reasoning doesn't already mention it
+                if (!reasoningText.toLowerCase().includes('budget') && !reasoningText.toLowerCase().includes('$')) {
+                  reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options. ${reasoningText}`;
+                }
+              }
+            } else {
+              // Fallback to generic reasoning if AI didn't provide reasons
+              const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+              const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+              
+              reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+              if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
+                reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+              }
             }
             
             // Add delivered vs requested count to reasoning (will be finalized after top-up)
@@ -2485,7 +2501,7 @@ export async function proxySessionStartAction(
             }
             
             reasoningParts.push(reasoningText);
-            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles, final after budget-aware selection:", finalHandles.length);
+            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles with reasoning:", aiBundle.reasoning ? "present" : "missing", "final after budget-aware selection:", finalHandles.length);
           } else {
             // Fallback to deterministic selection if AI fails
             console.log("[Bundle] AI failed, using deterministic fallback");

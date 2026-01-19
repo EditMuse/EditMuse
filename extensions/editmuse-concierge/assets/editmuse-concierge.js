@@ -1377,8 +1377,13 @@
         sessionId: null,
         loading: false,
         error: null,
-        stillWorking: false
+        stillWorking: false,
+        status: 'idle' // 'idle' | 'submitting' | 'stillWorking' | 'done' | 'error'
       };
+      
+      // Polling state
+      this.pollingController = null;
+      this.pollingTimeout = null;
       
       // Quiz answers storage (for backward compatibility and step restoration)
       this.quizAnswers = {};
@@ -2658,6 +2663,276 @@
       this.render();
     }
 
+    // ============================================
+    // ROBUST SESSION MANAGEMENT FUNCTIONS
+    // ============================================
+
+    /**
+     * Start session with timeout - returns sid if received, throws TimeoutError if timeout
+     */
+    async startSessionWithTimeout(payload, timeoutMs) {
+      var abortController = new AbortController();
+      var timeoutId = setTimeout(function() {
+        abortController.abort();
+      }, timeoutMs);
+
+      try {
+        var response = await fetch(proxyUrl('/session/start'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(payload),
+          signal: abortController.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          var errorData = await response.json().catch(function() { return {}; });
+          throw new Error(errorData.error || 'Failed to submit');
+        }
+
+        var data = await response.json();
+        if (data.ok && data.sessionId) {
+          return data.sessionId;
+        } else if (data.sid) {
+          // Support both sessionId and sid
+          return data.sid;
+        } else {
+          throw new Error(data.error || 'Invalid response from server');
+        }
+      } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError' || error.message.includes('aborted')) {
+          var timeoutError = new Error('Request timed out');
+          timeoutError.name = 'TimeoutError';
+          throw timeoutError;
+        }
+        throw error;
+      }
+    }
+
+    /**
+     * Resume session (idempotent) - returns sid quickly if session exists
+     */
+    async resumeSession(payload) {
+      try {
+        var response = await fetch(proxyUrl('/session/start'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          var errorData = await response.json().catch(function() { return {}; });
+          throw new Error(errorData.error || 'Failed to resume session');
+        }
+
+        var data = await response.json();
+        if (data.ok && data.sessionId) {
+          return data.sessionId;
+        } else if (data.sid) {
+          return data.sid;
+        } else {
+          throw new Error(data.error || 'Invalid response from server');
+        }
+      } catch (error) {
+        // Wrap network errors but preserve server errors
+        if (!error.message || (!error.message.includes('Failed to resume') && !error.message.includes('Invalid response'))) {
+          var networkError = new Error('Resume request failed: ' + (error.message || 'network error'));
+          networkError.name = 'NetworkError';
+          throw networkError;
+        }
+        throw error;
+      }
+    }
+
+    /**
+     * Poll session until complete - throws if error status, returns when complete
+     */
+    async pollSession(sid) {
+      var maxPollTime = 60000; // 60 seconds
+      var pollInterval = 1200; // 1.2 seconds base
+      var startTime = Date.now();
+      var attempt = 0;
+      
+      // Create AbortController for polling
+      if (this.pollingController) {
+        this.pollingController.abort();
+      }
+      this.pollingController = new AbortController();
+      
+      // Clear any existing polling timeout
+      if (this.pollingTimeout) {
+        clearTimeout(this.pollingTimeout);
+      }
+
+      var self = this;
+
+      return new Promise(function(resolve, reject) {
+        function poll() {
+          attempt++;
+          var elapsed = Date.now() - startTime;
+          
+          // Check max poll time
+          if (elapsed >= maxPollTime) {
+            // Max time reached - don't reject, just stop polling and keep "Still working..."
+            console.debug('[Concierge] polling sid=', sid, 'attempt=', attempt, 'MAX_TIMEOUT reached - keeping stillWorking state');
+            self.state.status = 'stillWorking';
+            self.state.stillWorking = true;
+            self.render();
+            // Note: We intentionally don't reject - UI will show "Still working..." with option to continue
+            return;
+          }
+
+          // Add jitter to poll interval (0.8x to 1.2x)
+          var jitter = 0.8 + Math.random() * 0.4;
+          var currentInterval = Math.round(pollInterval * jitter);
+
+          var url = proxyUrl('/session') + '?sid=' + encodeURIComponent(sid);
+          var currentParams = new URLSearchParams(window.location.search);
+          var shop = currentParams.get('shop');
+          if (shop) {
+            url += '&shop=' + encodeURIComponent(shop);
+          }
+
+          fetch(url, {
+            method: 'GET',
+            credentials: 'same-origin',
+            signal: self.pollingController.signal
+          })
+          .then(function(response) {
+            if (!response.ok) {
+              var errorData = response.json().catch(function() { return {}; });
+              return errorData.then(function(data) {
+                throw new Error(data.error || 'Failed to fetch session');
+              });
+            }
+            return response.json();
+          })
+          .then(function(data) {
+            var status = data.status;
+            var products = data.products || (data.result && data.result.products) || [];
+            var productCount = Array.isArray(products) ? products.length : 0;
+
+            console.debug('[Concierge] polling sid=', sid, 'attempt=', attempt, 'status=', status, 'products=', productCount);
+
+            // Check for error status
+            if (status === 'ERROR' || (data.ok === false && !status)) {
+              throw new Error(data.error || 'Session error occurred');
+            }
+
+            // Check if complete (has products or status is COMPLETE)
+            if (productCount > 0 || status === 'COMPLETE') {
+              console.debug('[Concierge] done sid=', sid);
+              // Release lock before redirect
+              window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+              window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+
+              // Store sid
+              self.state.sessionId = sid;
+              sessionStorage.setItem('editmuse_sid', sid);
+
+              // Redirect to results
+              var redirectUrl = self.getResultUrl();
+              var u = new URL(redirectUrl, window.location.origin);
+              u.searchParams.set('sid', sid);
+              
+              // Preserve Shopify params
+              var cur = new URL(window.location.href);
+              var shop = cur.searchParams.get('shop');
+              var signature = cur.searchParams.get('signature');
+              var timestamp = cur.searchParams.get('timestamp');
+              if (shop) u.searchParams.set('shop', shop);
+              if (signature) u.searchParams.set('signature', signature);
+              if (timestamp) u.searchParams.set('timestamp', timestamp);
+              
+              var previewThemeId = cur.searchParams.get('preview_theme_id');
+              if (previewThemeId) {
+                u.searchParams.set('preview_theme_id', previewThemeId);
+              }
+              
+              window.location.href = u.pathname + u.search;
+              resolve();
+              return;
+            }
+
+            // Still processing - continue polling
+            if (self.pollingController && !self.pollingController.signal.aborted) {
+              self.pollingTimeout = setTimeout(poll, currentInterval);
+            }
+          })
+          .catch(function(error) {
+            if (error.name === 'AbortError') {
+              // Polling was aborted - don't reject, just stop
+              return;
+            }
+            
+            // Network error - retry after interval
+            console.debug('[Concierge] polling error:', error.message, '- retrying');
+            if (self.pollingController && !self.pollingController.signal.aborted) {
+              self.pollingTimeout = setTimeout(poll, currentInterval);
+            } else {
+              // Real error - reject
+              reject(error);
+            }
+          });
+        }
+
+        // Start polling
+        poll();
+      });
+    }
+
+    /**
+     * Poll session with resume attempts when sid is not available
+     */
+    async pollSessionWithResume(payload) {
+      var maxResumeAttempts = 5;
+      var resumeAttempt = 0;
+      
+      while (resumeAttempt < maxResumeAttempts) {
+        try {
+          var sid = await this.resumeSession(payload);
+          if (sid) {
+            console.debug('[Concierge] resume succeeded during polling sid=', sid);
+            await this.pollSession(sid);
+            return;
+          }
+        } catch (resumeError) {
+          resumeAttempt++;
+          if (resumeAttempt >= maxResumeAttempts) {
+            // Max resume attempts reached - keep polling with error state but don't fail
+            console.debug('[Concierge] max resume attempts reached, continuing polling');
+            break;
+          }
+          // Wait before next resume attempt
+          await new Promise(function(resolve) { setTimeout(resolve, 2000); });
+        }
+      }
+
+      // If we still don't have sid, we can't poll - but don't error out
+      // Keep "Still working..." state
+      this.state.status = 'stillWorking';
+      this.state.stillWorking = true;
+      this.render();
+    }
+
+    /**
+     * Stop polling (cleanup)
+     */
+    stopPolling() {
+      if (this.pollingController) {
+        this.pollingController.abort();
+        this.pollingController = null;
+      }
+      if (this.pollingTimeout) {
+        clearTimeout(this.pollingTimeout);
+        this.pollingTimeout = null;
+      }
+    }
+
     // Handle Submit (unified for text + select)
     async handleSubmit(e) {
       if (e) {
@@ -2761,162 +3036,105 @@
         // Do not send resultCount in request body
           
         debugLog('Submitting answers:', messages);
-        debugLog('[EditMuse] Submitting with clientRequestId', window.__EDITMUSE_SUBMIT_LOCK);
+        console.debug('[Concierge] submit start clientRequestId=', window.__EDITMUSE_SUBMIT_LOCK.requestId);
 
-        // Create AbortController with timeout (65000ms = 65 seconds)
-        var abortController = new AbortController();
-        var timeoutId = setTimeout(function() {
-          abortController.abort();
-        }, 65000);
+        this.state.status = 'submitting';
+        this.state.loading = true;
+        this.state.error = null;
+        this.render();
 
         try {
-          var response = await fetch(proxyUrl('/session/start'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              credentials: 'same-origin',
-              body: JSON.stringify(requestBody),
-              signal: abortController.signal
-          });
-
-          clearTimeout(timeoutId);
-
-          if (!response.ok) {
-            var errorData = await response.json().catch(function() { return {}; });
-            throw new Error(errorData.error || 'Failed to submit');
-          }
-
-          var data = await response.json();
-          debugLog('Submit response:', data);
-
-            if (data.ok && data.sessionId) {
-          this.state.sessionId = data.sessionId;
-              sessionStorage.setItem('editmuse_sid', data.sessionId);
-
-          // Release lock before redirect
-          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-
-          // Redirect
-          var redirectUrl = this.getResultUrl();
-              var u = new URL(redirectUrl, window.location.origin);
-              u.searchParams.set('sid', data.sessionId);
-              
-          // Preserve Shopify params
-              var cur = new URL(window.location.href);
-                var shop = cur.searchParams.get('shop');
-                var signature = cur.searchParams.get('signature');
-                var timestamp = cur.searchParams.get('timestamp');
-                if (shop) u.searchParams.set('shop', shop);
-                if (signature) u.searchParams.set('signature', signature);
-                if (timestamp) u.searchParams.set('timestamp', timestamp);
-                
-              var previewThemeId = cur.searchParams.get('preview_theme_id');
-              if (previewThemeId) {
-                u.searchParams.set('preview_theme_id', previewThemeId);
-              }
-              
-          window.location.href = u.pathname + u.search;
-            } else {
-              throw new Error(data.error || 'Invalid response from server');
-            }
-        } catch (fetchError) {
-          clearTimeout(timeoutId);
-          
-          // Check if this is a timeout/abort error
-          if (fetchError.name === 'AbortError' || fetchError.message.includes('aborted')) {
-            // Timeout occurred - show "Still working..." state and retry
-            debugLog('[EditMuse] Request timed out, showing still working state');
+          // Step 1: Try to start session with timeout (25s)
+          var sid = null;
+          try {
+            sid = await this.startSessionWithTimeout(requestBody, 25000);
+            console.debug('[Concierge] startSessionWithTimeout succeeded sid=', sid);
+          } catch (timeoutError) {
+            // Timeout is NOT an error - transition to stillWorking state
+            console.debug('[Concierge] submit timeout → stillWorking');
+            this.state.status = 'stillWorking';
             this.state.stillWorking = true;
-            this.state.loading = true;
             this.render();
             
-            // Retry the request (server may still be processing)
+            // Step 2: Resume session (idempotent - server returns existing sid)
             try {
-              debugLog('[EditMuse] Retrying after timeout...');
-              var retryResponse = await fetch(proxyUrl('/session/start'), {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  credentials: 'same-origin',
-                  body: JSON.stringify(requestBody)
-              });
-              
-              if (!retryResponse.ok) {
-                var retryErrorData = await retryResponse.json().catch(function() { return {}; });
-                throw new Error(retryErrorData.error || 'Failed to submit');
-              }
-              
-              var retryData = await retryResponse.json();
-              debugLog('Retry response:', retryData);
-              
-              if (retryData.ok && retryData.sessionId) {
-                this.state.sessionId = retryData.sessionId;
-                sessionStorage.setItem('editmuse_sid', retryData.sessionId);
-                this.state.stillWorking = false;
-                
-                // Release lock before redirect
-                window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-                window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-                
-                // Redirect
-                var redirectUrl = this.getResultUrl();
-                var u = new URL(redirectUrl, window.location.origin);
-                u.searchParams.set('sid', retryData.sessionId);
-                
-                // Preserve Shopify params
-                var cur = new URL(window.location.href);
-                var shop = cur.searchParams.get('shop');
-                var signature = cur.searchParams.get('signature');
-                var timestamp = cur.searchParams.get('timestamp');
-                if (shop) u.searchParams.set('shop', shop);
-                if (signature) u.searchParams.set('signature', signature);
-                if (timestamp) u.searchParams.set('timestamp', timestamp);
-                
-                var previewThemeId = cur.searchParams.get('preview_theme_id');
-                if (previewThemeId) {
-                  u.searchParams.set('preview_theme_id', previewThemeId);
-                }
-                
-                window.location.href = u.pathname + u.search;
-                return;
+              sid = await this.resumeSession(requestBody);
+              console.debug('[Concierge] resume sid=', sid);
+            } catch (resumeError) {
+              // Resume failed - check if it's a real error or still processing
+              if (resumeError.message && resumeError.message.includes('timeout')) {
+                // Still processing - continue to polling without sid (will need to retry resume)
+                console.debug('[Concierge] resume also timed out, will poll after resume retry');
               } else {
-                throw new Error(retryData.error || 'Invalid response from server');
+                // Real error from server
+                throw resumeError;
               }
-            } catch (retryError) {
-              // Retry also failed - show error
-              debugLog('[EditMuse] Retry also failed:', retryError);
-              this.state.stillWorking = false;
-              this.state.error = retryError.message || 'Request timed out and retry failed';
-              this.state.loading = false;
-              this.stopConciergeLoadingAnimation();
-              this.render();
-              
-              // Release lock on error
-              window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-              window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-              return;
             }
-          } else {
-            // Other error - handle normally
-            throw fetchError;
           }
+
+          // Step 3: If we have sid, poll for completion; otherwise try one more resume then poll
+          if (!sid) {
+            // One final resume attempt
+            try {
+              sid = await this.resumeSession(requestBody);
+              console.debug('[Concierge] final resume attempt sid=', sid);
+            } catch (finalResumeError) {
+              // If still no sid, we'll need to keep retrying resume in polling
+              console.debug('[Concierge] final resume failed, will retry during polling');
+            }
+          }
+
+          if (sid) {
+            // Step 4: Poll until complete
+            await this.pollSession(sid);
+          } else {
+            // No sid yet - keep polling with resume attempts
+            await this.pollSessionWithResume(requestBody);
+          }
+
         } catch (error) {
-          // Release lock on error
-          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-          
-          this.state.error = error.message;
-          this.state.loading = false;
-          this.state.stillWorking = false;
-          this.stopConciergeLoadingAnimation(); // Stop animation on error
-          this.render();
-          debugLog('Error in handleSubmit:', error);
+          // Only set error state for real errors (non-timeout)
+          if (error.name !== 'TimeoutError' && !error.message.includes('aborted') && !error.message.includes('timeout')) {
+            this.state.status = 'error';
+            this.state.error = error.message || 'Failed to submit';
+            this.state.loading = false;
+            this.state.stillWorking = false;
+            this.stopConciergeLoadingAnimation();
+            this.render();
+            
+            // Release lock on error
+            window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+            window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+            console.debug('Error in handleSubmit:', error);
+          } else {
+            // Timeout - keep in stillWorking state
+            this.state.status = 'stillWorking';
+            this.state.stillWorking = true;
+            this.render();
+          }
         }
+      } catch (outerError) {
+        // Fallback error handler for any unexpected errors
+        this.state.status = 'error';
+        this.state.error = outerError.message || 'An unexpected error occurred';
+        this.state.loading = false;
+        this.state.stillWorking = false;
+        this.stopConciergeLoadingAnimation();
+        this.render();
+        
+        // Release lock on error
+        window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+        window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+        console.debug('Error in handleSubmit:', outerError);
+      }
     }
 
     // Handle Close
     handleClose() {
+      this.stopPolling(); // Clean up polling when closing
       this.state.open = false;
       this.state.error = null;
+      this.state.status = 'idle';
       this.hideModal();
       this.render();
     }
