@@ -1238,42 +1238,76 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           }
         }
         
-        // Validate bundle response
-        const itemIndices = new Set(bundleResult.selected_by_item.map(item => item.itemIndex));
-        const expectedIndices = new Set(bundleItems.map((_, idx) => idx));
-        const missingIndices = Array.from(expectedIndices).filter(idx => !itemIndices.has(idx));
+        // Validate and remap handles to correct item pools
+        const remappedItems: BundleSelectedItem[] = [];
+        let remappedCount = 0;
+        const handleToItemIndex = new Map<string, number[]>(); // Track which pools contain each handle
         
-        if (missingIndices.length > 0 && !bundleResult.trustFallback) {
-          lastError = new Error(`Missing selections for itemIndices: ${missingIndices.join(", ")}`);
-          lastParseFailReason = `Missing selections for itemIndices: ${missingIndices.join(", ")}`;
-          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-          continue;
+        // Build reverse index: handle -> itemIndices that contain it
+        for (const [itemIdx, pool] of candidatesByItem.entries()) {
+          for (const handle of pool) {
+            if (!handleToItemIndex.has(handle)) {
+              handleToItemIndex.set(handle, []);
+            }
+            handleToItemIndex.get(handle)!.push(itemIdx);
+          }
         }
         
-        // Validate handles belong to correct item pools
-        const invalidHandles: string[] = [];
+        // Remap handles to correct itemIndex if needed
         for (const item of bundleResult.selected_by_item) {
-          const itemPool = candidatesByItem.get(item.itemIndex);
-          if (!itemPool || !itemPool.has(item.handle)) {
-            if (!bundleResult.trustFallback) {
-              invalidHandles.push(`${item.handle} (itemIndex ${item.itemIndex})`);
+          const declaredPool = candidatesByItem.get(item.itemIndex);
+          const handleExistsInDeclaredPool = declaredPool && declaredPool.has(item.handle);
+          
+          if (handleExistsInDeclaredPool) {
+            // Handle is in correct pool, keep as-is
+            remappedItems.push(item);
+          } else {
+            // Handle not in declared pool, try to find correct pool
+            const correctPools = handleToItemIndex.get(item.handle) || [];
+            
+            if (correctPools.length === 0) {
+              // Handle not in ANY pool - this is invalid
+              if (!bundleResult.trustFallback) {
+                lastError = new Error(`Handle ${item.handle} not found in any item pool`);
+                lastParseFailReason = `Handle ${item.handle} not found in any item pool`;
+                console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+                continue; // Try again if retries remaining
+              }
+              // If trustFallback, skip invalid handle
+              continue;
+            } else if (correctPools.length === 1) {
+              // Handle exists in exactly one pool - remap to that pool
+              remappedItems.push({ ...item, itemIndex: correctPools[0] });
+              remappedCount++;
+            } else {
+              // Handle exists in multiple pools - keep original itemIndex
+              remappedItems.push(item);
             }
           }
         }
         
-        if (invalidHandles.length > 0 && !bundleResult.trustFallback) {
-          lastError = new Error(`Handles not in correct item pools: ${invalidHandles.join(", ")}`);
-          lastParseFailReason = `Handles not in correct item pools: ${invalidHandles.join(", ")}`;
-          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-          continue;
+        // Check for missing itemIndices after remapping
+        const remappedIndices = new Set(remappedItems.map(item => item.itemIndex));
+        const expectedIndices = new Set(bundleItems.map((_, idx) => idx));
+        const missingIndices = Array.from(expectedIndices).filter(idx => !remappedIndices.has(idx));
+        
+        if (missingIndices.length > 0) {
+          // Missing itemIndices - log but don't fail (will be handled by top-up or fallback)
+          console.log("[AI Bundle] missingItemIndices=", missingIndices.join(","), "after remapping");
         }
         
+        // Update bundleResult with remapped items
+        bundleResult.selected_by_item = remappedItems;
+        
         // Successfully validated bundle response
+        const finalItemIndices = new Set(bundleResult.selected_by_item.map(item => item.itemIndex));
         console.log("[AI Bundle] structuredOk=true, itemCount=", bundleResult.selected_by_item.length, 
-          "returnedPerItem=", Array.from(itemIndices).map(idx => {
+          "returnedPerItem=", Array.from(finalItemIndices).map(idx => {
             const count = bundleResult.selected_by_item.filter(item => item.itemIndex === idx).length;
             return `item${idx}:${count}`;
           }).join(","),
+          "remappedCount=", remappedCount,
+          "missingItemIndices=", missingIndices.length > 0 ? missingIndices.join(",") : "none",
           "trustFallback=", bundleResult.trustFallback);
         
         // Calculate total price for budget check

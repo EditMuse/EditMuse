@@ -1376,7 +1376,8 @@
         mode: 'hybrid', // 'hybrid' | 'quiz' | 'chat'
         sessionId: null,
         loading: false,
-        error: null
+        error: null,
+        stillWorking: false
       };
       
       // Quiz answers storage (for backward compatibility and step restoration)
@@ -2766,20 +2767,30 @@
         debugLog('Submitting answers:', messages);
         debugLog('[EditMuse] Submitting with clientRequestId', window.__EDITMUSE_SUBMIT_LOCK);
 
-        var response = await fetch(proxyUrl('/session/start'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
-            body: JSON.stringify(requestBody)
-        });
+        // Create AbortController with timeout (65000ms = 65 seconds)
+        var abortController = new AbortController();
+        var timeoutId = setTimeout(function() {
+          abortController.abort();
+        }, 65000);
 
-        if (!response.ok) {
-          var errorData = await response.json().catch(() => ({}));
-          throw new Error(errorData.error || 'Failed to submit');
-        }
+        try {
+          var response = await fetch(proxyUrl('/session/start'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify(requestBody),
+              signal: abortController.signal
+          });
 
-        var data = await response.json();
-        debugLog('Submit response:', data);
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            var errorData = await response.json().catch(function() { return {}; });
+            throw new Error(errorData.error || 'Failed to submit');
+          }
+
+          var data = await response.json();
+          debugLog('Submit response:', data);
 
             if (data.ok && data.sessionId) {
           this.state.sessionId = data.sessionId;
@@ -2812,17 +2823,98 @@
             } else {
               throw new Error(data.error || 'Invalid response from server');
             }
+        } catch (fetchError) {
+          clearTimeout(timeoutId);
+          
+          // Check if this is a timeout/abort error
+          if (fetchError.name === 'AbortError' || fetchError.message.includes('aborted')) {
+            // Timeout occurred - show "Still working..." state and retry
+            debugLog('[EditMuse] Request timed out, showing still working state');
+            this.state.stillWorking = true;
+            this.state.loading = true;
+            this.render();
+            
+            // Retry the request (server may still be processing)
+            try {
+              debugLog('[EditMuse] Retrying after timeout...');
+              var retryResponse = await fetch(proxyUrl('/session/start'), {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'same-origin',
+                  body: JSON.stringify(requestBody)
+              });
+              
+              if (!retryResponse.ok) {
+                var retryErrorData = await retryResponse.json().catch(function() { return {}; });
+                throw new Error(retryErrorData.error || 'Failed to submit');
+              }
+              
+              var retryData = await retryResponse.json();
+              debugLog('Retry response:', retryData);
+              
+              if (retryData.ok && retryData.sessionId) {
+                this.state.sessionId = retryData.sessionId;
+                sessionStorage.setItem('editmuse_sid', retryData.sessionId);
+                this.state.stillWorking = false;
+                
+                // Release lock before redirect
+                window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+                window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+                
+                // Redirect
+                var redirectUrl = this.getResultUrl();
+                var u = new URL(redirectUrl, window.location.origin);
+                u.searchParams.set('sid', retryData.sessionId);
+                
+                // Preserve Shopify params
+                var cur = new URL(window.location.href);
+                var shop = cur.searchParams.get('shop');
+                var signature = cur.searchParams.get('signature');
+                var timestamp = cur.searchParams.get('timestamp');
+                if (shop) u.searchParams.set('shop', shop);
+                if (signature) u.searchParams.set('signature', signature);
+                if (timestamp) u.searchParams.set('timestamp', timestamp);
+                
+                var previewThemeId = cur.searchParams.get('preview_theme_id');
+                if (previewThemeId) {
+                  u.searchParams.set('preview_theme_id', previewThemeId);
+                }
+                
+                window.location.href = u.pathname + u.search;
+                return;
+              } else {
+                throw new Error(retryData.error || 'Invalid response from server');
+              }
+            } catch (retryError) {
+              // Retry also failed - show error
+              debugLog('[EditMuse] Retry also failed:', retryError);
+              this.state.stillWorking = false;
+              this.state.error = retryError.message || 'Request timed out and retry failed';
+              this.state.loading = false;
+              this.stopConciergeLoadingAnimation();
+              this.render();
+              
+              // Release lock on error
+              window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+              window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+              return;
+            }
+          } else {
+            // Other error - handle normally
+            throw fetchError;
+          }
         } catch (error) {
-        // Release lock on error
-        window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-        window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-        
-        this.state.error = error.message;
-        this.state.loading = false;
-        this.stopConciergeLoadingAnimation(); // Stop animation on error
-        this.render();
-        debugLog('Error in handleSubmit:', error);
-      }
+          // Release lock on error
+          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+          
+          this.state.error = error.message;
+          this.state.loading = false;
+          this.state.stillWorking = false;
+          this.stopConciergeLoadingAnimation(); // Stop animation on error
+          this.render();
+          debugLog('Error in handleSubmit:', error);
+        }
     }
 
     // Handle Close
@@ -3097,7 +3189,7 @@
                   <div class="editmuse-concierge-loading" data-editmuse-concierge-loading>
                     <div class="editmuse-spinner"></div>
                     <div class="editmuse-loading-messages">
-                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>Analyzing your preferences...</p>
+                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>${this.state.stillWorking ? 'Still working... This may take a moment.' : 'Analyzing your preferences...'}</p>
                     </div>
                   </div>
                 ` : questionHTML}

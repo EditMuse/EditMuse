@@ -1932,11 +1932,60 @@ export async function proxySessionStartAction(
               }
             }
             
+            // Select cheapest items per pool that stay within allocated budget
+            let totalSelectedPrice = 0;
+            let needsTrustFallback = false;
+            
             for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+              const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
               const pool = itemPools.get(itemIdx) || [];
-              if (pool.length > 0) {
-                bundleFinalHandles.push(pool[0].handle);
+              
+              if (pool.length === 0) {
+                needsTrustFallback = true;
+                continue;
               }
+              
+              // Filter pool by budget if allocated
+              let candidatesInBudget = pool;
+              if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
+                const budgetMax = bundleItem.budgetMax;
+                candidatesInBudget = pool.filter(c => {
+                  const price = c.price ? parseFloat(String(c.price)) : NaN;
+                  return !Number.isFinite(price) || price <= budgetMax;
+                });
+                
+                // If no candidates in budget, use cheapest from pool and mark trustFallback
+                if (candidatesInBudget.length === 0) {
+                  candidatesInBudget = pool;
+                  needsTrustFallback = true;
+                }
+              }
+              
+              // Sort by price (cheapest first) to prefer budget-friendly options
+              candidatesInBudget.sort((a, b) => {
+                const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
+                const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
+                return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
+              });
+              
+              // Select cheapest candidate
+              const selected = candidatesInBudget[0];
+              bundleFinalHandles.push(selected.handle);
+              
+              const selectedPrice = selected.price ? parseFloat(String(selected.price)) : 0;
+              if (Number.isFinite(selectedPrice)) {
+                totalSelectedPrice += selectedPrice;
+              }
+            }
+            
+            // Check total budget if present
+            if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+              needsTrustFallback = true;
+              console.log("[Bundle] deterministic fallback exceeds totalBudget:", totalSelectedPrice.toFixed(2), ">", bundleIntent.totalBudget.toFixed(2));
+            }
+            
+            if (needsTrustFallback) {
+              trustFallback = true;
             }
             
             const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
@@ -1959,11 +2008,60 @@ export async function proxySessionStartAction(
             }
           }
           
+          // Select cheapest items per pool that stay within allocated budget
+          let totalSelectedPrice = 0;
+          let needsTrustFallback = false;
+          
           for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+            const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
             const pool = itemPools.get(itemIdx) || [];
-            if (pool.length > 0) {
-              bundleFinalHandles.push(pool[0].handle);
+            
+            if (pool.length === 0) {
+              needsTrustFallback = true;
+              continue;
             }
+            
+            // Filter pool by budget if allocated
+            let candidatesInBudget = pool;
+            if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
+              const budgetMax = bundleItem.budgetMax;
+              candidatesInBudget = pool.filter(c => {
+                const price = c.price ? parseFloat(String(c.price)) : NaN;
+                return !Number.isFinite(price) || price <= budgetMax;
+              });
+              
+              // If no candidates in budget, use cheapest from pool and mark trustFallback
+              if (candidatesInBudget.length === 0) {
+                candidatesInBudget = pool;
+                needsTrustFallback = true;
+              }
+            }
+            
+            // Sort by price (cheapest first) to prefer budget-friendly options
+            candidatesInBudget.sort((a, b) => {
+              const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
+              const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
+              return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
+            });
+            
+            // Select cheapest candidate
+            const selected = candidatesInBudget[0];
+            bundleFinalHandles.push(selected.handle);
+            
+            const selectedPrice = selected.price ? parseFloat(String(selected.price)) : 0;
+            if (Number.isFinite(selectedPrice)) {
+              totalSelectedPrice += selectedPrice;
+            }
+          }
+          
+          // Check total budget if present
+          if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+            needsTrustFallback = true;
+            console.log("[Bundle] deterministic fallback exceeds totalBudget:", totalSelectedPrice.toFixed(2), ">", bundleIntent.totalBudget.toFixed(2));
+          }
+          
+          if (needsTrustFallback) {
+            trustFallback = true;
           }
           
           const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
