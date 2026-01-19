@@ -1766,7 +1766,8 @@ export async function proxySessionStartAction(
           const itemHardTerms = bundleItem.hardTerms;
           
           // Gate candidates for this item using existing gating logic
-          const itemGated: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+          // First pass: facet + hard term matching (no budget filter)
+          const itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
             // Apply facet gating
             if (hardFacets.size && c.sizes.length > 0) {
               const sizeMatch = c.sizes.some((s: string) => 
@@ -1805,14 +1806,26 @@ export async function proxySessionStartAction(
             const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
             if (!hasItemMatch) return false;
             
-            // Apply budget constraint if present
-            if (bundleItem.budgetMax) {
-              const price = c.price ? parseFloat(String(c.price)) : NaN;
-              if (Number.isFinite(price) && price > bundleItem.budgetMax) return false;
-            }
-            
             return true;
           });
+          
+          // Second pass: apply budget filter if allocated
+          let itemGated: EnrichedCandidate[] = itemGatedUnfiltered;
+          if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
+            const budgetMax = bundleItem.budgetMax;
+            const itemGatedFiltered = itemGatedUnfiltered.filter(c => {
+              const price = c.price ? parseFloat(String(c.price)) : NaN;
+              return !Number.isFinite(price) || price <= budgetMax;
+            });
+            
+            // If filtered pool is empty, keep unfiltered but mark for trustFallback
+            if (itemGatedFiltered.length > 0) {
+              itemGated = itemGatedFiltered;
+            } else {
+              itemGated = itemGatedUnfiltered;
+              // Will set trustFallback later if needed
+            }
+          }
           
           // Pre-rank with BM25 for this item
           const itemTokens = itemHardTerms.flatMap(t => tokenize(t));
@@ -1880,7 +1893,11 @@ export async function proxySessionStartAction(
       // Bundle handling: use AI bundle ranking
       if (isBundleMode && bundleIntent.items.length >= 2) {
         console.log("[Bundle] Using AI bundle ranking");
-        const window1 = buildWindow(offset, used);
+        
+        // For bundle mode, pass ALL candidates (don't use aiWindow cap)
+        // The candidates are already capped per-item (30 each) during gating
+        const bundleCandidatesForAI = sortedCandidates.filter(c => !used.has(c.handle));
+        console.log("[Bundle] aiCandidatesSent=", bundleCandidatesForAI.length);
         
         // Convert hardFacets to array format for AI prompt
         const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
@@ -1891,7 +1908,7 @@ export async function proxySessionStartAction(
         try {
           const aiBundle = await rankProductsWithAI(
             userIntent,
-            window1,
+            bundleCandidatesForAI,
             targetCount,
             shop.id,
             sessionToken,
@@ -1914,9 +1931,175 @@ export async function proxySessionStartAction(
           );
           
           if (aiBundle.rankedHandles?.length) {
-            finalHandles = aiBundle.rankedHandles;
-            reasoningParts.push(aiBundle.reasoning);
-            console.log("[Bundle] AI returned", finalHandles.length, "handles");
+            // Build item pools from sortedCandidates for filling missing items
+            const itemPools = new Map<number, EnrichedCandidate[]>();
+            for (const c of sortedCandidates) {
+              const itemIdx = (c as any)._bundleItemIndex;
+              if (typeof itemIdx === "number") {
+                if (!itemPools.has(itemIdx)) {
+                  itemPools.set(itemIdx, []);
+                }
+                itemPools.get(itemIdx)!.push(c);
+              }
+            }
+            
+            // Group AI handles by itemIndex
+            const handlesByItem = new Map<number, string[]>();
+            for (const handle of aiBundle.rankedHandles) {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const itemIdx = (candidate as any)._bundleItemIndex;
+                if (typeof itemIdx === "number") {
+                  if (!handlesByItem.has(itemIdx)) {
+                    handlesByItem.set(itemIdx, []);
+                  }
+                  handlesByItem.get(itemIdx)!.push(handle);
+                }
+              }
+            }
+            
+            // Fill missing itemIndices deterministically
+            const filledMissing: string[] = [];
+            for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+              if (!handlesByItem.has(itemIdx) || handlesByItem.get(itemIdx)!.length === 0) {
+                const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
+                const pool = itemPools.get(itemIdx) || [];
+                
+                if (pool.length > 0) {
+                  // Filter by budget if allocated
+                  let candidatesInBudget = pool;
+                  let needsFallback = false;
+                  
+                  if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
+                    const budgetMax = bundleItem.budgetMax;
+                    candidatesInBudget = pool.filter(c => {
+                      const price = c.price ? parseFloat(String(c.price)) : NaN;
+                      return !Number.isFinite(price) || price <= budgetMax;
+                    });
+                    
+                    if (candidatesInBudget.length === 0) {
+                      candidatesInBudget = pool;
+                      needsFallback = true;
+                    }
+                  }
+                  
+                  // Sort by price (cheapest first)
+                  candidatesInBudget.sort((a, b) => {
+                    const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
+                    const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
+                    return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
+                  });
+                  
+                  const selected = candidatesInBudget[0];
+                  filledMissing.push(selected.handle);
+                  
+                  if (!handlesByItem.has(itemIdx)) {
+                    handlesByItem.set(itemIdx, []);
+                  }
+                  handlesByItem.get(itemIdx)!.push(selected.handle);
+                  
+                  if (needsFallback) {
+                    trustFallback = true;
+                  }
+                  
+                  console.log("[AI Bundle] filledMissingItemIndices=item", itemIdx, ":", selected.handle);
+                }
+              }
+            }
+            
+            // Build final handles via round-robin across items
+            const finalHandlesRoundRobin: string[] = [];
+            const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+            let itemIdx = 0;
+            let added = 0;
+            
+            // First pass: ensure at least 1 per item
+            for (let i = 0; i < bundleItemsWithBudget.length; i++) {
+              const handles = handlesByItem.get(i) || [];
+              if (handles.length > 0) {
+                finalHandlesRoundRobin.push(handles[0]);
+                added++;
+              }
+            }
+            
+            // Second pass: round-robin to fill remaining slots
+            const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+            let roundRobinIdx = 0;
+            
+            while (added < resultCountUsed && roundRobinIdx < 100) { // Safety limit
+              const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+              const handles = handlesByItem.get(currentItemIdx) || [];
+              const alreadyAdded = finalHandlesRoundRobin.filter(h => handles.includes(h)).length;
+              
+              if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
+                const nextHandle = handles[alreadyAdded];
+                if (!finalHandlesRoundRobin.includes(nextHandle)) {
+                  finalHandlesRoundRobin.push(nextHandle);
+                  added++;
+                }
+              }
+              
+              roundRobinIdx++;
+              if (roundRobinIdx > 100) break; // Safety
+            }
+            
+            finalHandles = finalHandlesRoundRobin.slice(0, resultCountUsed);
+            
+            // Count final handles per item for logging
+            const finalCountsByItem = new Map<number, number>();
+            for (const handle of finalHandles) {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const itemIdx = (candidate as any)._bundleItemIndex;
+                if (typeof itemIdx === "number") {
+                  finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+                }
+              }
+            }
+            
+            const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
+              const count = finalCountsByItem.get(idx) || 0;
+              const itemName = item.hardTerms[0];
+              return `${itemName}=${count}`;
+            }).join(" ");
+            console.log("[Bundle] finalCounts per item:", finalCountsText);
+            
+            // Build improved reasoning
+            const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+            const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+            
+            // Check if budget was exceeded
+            const candidateMap = new Map(sortedCandidates.map(c => [c.handle, c]));
+            const totalPrice = finalHandles.reduce((sum, handle) => {
+              const candidate = candidateMap.get(handle);
+              if (candidate && candidate.price) {
+                const price = parseFloat(String(candidate.price));
+                return sum + (Number.isFinite(price) ? price : 0);
+              }
+              return sum;
+            }, 0);
+            
+            let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+            if (bundleIntent.totalBudget && totalPrice > bundleIntent.totalBudget) {
+              reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+            }
+            
+            if (filledMissing.length > 0) {
+              const filledItemNames = filledMissing.map(handle => {
+                const candidate = sortedCandidates.find(c => c.handle === handle);
+                if (candidate) {
+                  const itemIdx = (candidate as any)._bundleItemIndex;
+                  if (typeof itemIdx === "number") {
+                    return bundleItemsWithBudget[itemIdx]?.hardTerms[0] || "item";
+                  }
+                }
+                return "item";
+              }).join(", ");
+              reasoningText += ` (Some items filled via fallback: ${filledItemNames})`;
+            }
+            
+            reasoningParts.push(reasoningText);
+            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles, final after round-robin:", finalHandles.length);
           } else {
             // Fallback to deterministic selection if AI fails
             console.log("[Bundle] AI failed, using deterministic fallback");
@@ -1933,6 +2116,8 @@ export async function proxySessionStartAction(
             }
             
             // Select cheapest items per pool that stay within allocated budget
+            // Build handlesByItem for round-robin distribution
+            const handlesByItem = new Map<number, string[]>();
             let totalSelectedPrice = 0;
             let needsTrustFallback = false;
             
@@ -1942,6 +2127,7 @@ export async function proxySessionStartAction(
               
               if (pool.length === 0) {
                 needsTrustFallback = true;
+                handlesByItem.set(itemIdx, []);
                 continue;
               }
               
@@ -1968,14 +2154,56 @@ export async function proxySessionStartAction(
                 return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
               });
               
-              // Select cheapest candidate
-              const selected = candidatesInBudget[0];
-              bundleFinalHandles.push(selected.handle);
-              
-              const selectedPrice = selected.price ? parseFloat(String(selected.price)) : 0;
-              if (Number.isFinite(selectedPrice)) {
-                totalSelectedPrice += selectedPrice;
+              // Store all candidates for this item (for round-robin)
+              handlesByItem.set(itemIdx, candidatesInBudget.map(c => c.handle));
+            }
+            
+            // Build final handles via round-robin
+            const bundleFinalHandlesRoundRobin: string[] = [];
+            const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+            
+            // First pass: ensure at least 1 per item
+            for (let i = 0; i < bundleItemsWithBudget.length; i++) {
+              const handles = handlesByItem.get(i) || [];
+              if (handles.length > 0) {
+                bundleFinalHandlesRoundRobin.push(handles[0]);
+                const candidate = sortedCandidates.find(c => c.handle === handles[0]);
+                if (candidate && candidate.price) {
+                  const price = parseFloat(String(candidate.price));
+                  if (Number.isFinite(price)) {
+                    totalSelectedPrice += price;
+                  }
+                }
               }
+            }
+            
+            // Second pass: round-robin to fill remaining slots
+            const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+            let roundRobinIdx = 0;
+            let added = bundleFinalHandlesRoundRobin.length;
+            
+            while (added < resultCountUsed && roundRobinIdx < 100) {
+              const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+              const handles = handlesByItem.get(currentItemIdx) || [];
+              const alreadyAdded = bundleFinalHandlesRoundRobin.filter(h => handles.includes(h)).length;
+              
+              if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
+                const nextHandle = handles[alreadyAdded];
+                if (!bundleFinalHandlesRoundRobin.includes(nextHandle)) {
+                  bundleFinalHandlesRoundRobin.push(nextHandle);
+                  added++;
+                  const candidate = sortedCandidates.find(c => c.handle === nextHandle);
+                  if (candidate && candidate.price) {
+                    const price = parseFloat(String(candidate.price));
+                    if (Number.isFinite(price)) {
+                      totalSelectedPrice += price;
+                    }
+                  }
+                }
+              }
+              
+              roundRobinIdx++;
+              if (roundRobinIdx > 100) break;
             }
             
             // Check total budget if present
@@ -1988,15 +2216,41 @@ export async function proxySessionStartAction(
               trustFallback = true;
             }
             
+            finalHandles = bundleFinalHandlesRoundRobin.slice(0, resultCountUsed);
+            
+            // Count final handles per item for logging
+            const finalCountsByItem = new Map<number, number>();
+            for (const handle of finalHandles) {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const itemIdx = (candidate as any)._bundleItemIndex;
+                if (typeof itemIdx === "number") {
+                  finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+                }
+              }
+            }
+            
+            const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
+              const count = finalCountsByItem.get(idx) || 0;
+              const itemName = item.hardTerms[0];
+              return `${itemName}=${count}`;
+            }).join(" ");
+            console.log("[Bundle] finalCounts per item:", finalCountsText);
+            
             const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
             const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
-            finalHandles = bundleFinalHandles.slice(0, resultCountUsed);
-            reasoningParts.push(`Built a bundle: ${itemNames}${budgetText}.`);
+            
+            // Build improved reasoning
+            let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+            if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+              reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+            }
+            
+            reasoningParts.push(reasoningText);
           }
         } catch (error) {
           console.error("[Bundle] AI ranking error:", error);
-          // Fallback to deterministic selection
-          const bundleFinalHandles: string[] = [];
+          // Fallback to deterministic selection with round-robin
           const itemPools = new Map<number, EnrichedCandidate[]>();
           for (const c of sortedCandidates) {
             const itemIdx = (c as any)._bundleItemIndex;
@@ -2008,7 +2262,8 @@ export async function proxySessionStartAction(
             }
           }
           
-          // Select cheapest items per pool that stay within allocated budget
+          // Build handlesByItem for round-robin distribution
+          const handlesByItem = new Map<number, string[]>();
           let totalSelectedPrice = 0;
           let needsTrustFallback = false;
           
@@ -2018,6 +2273,7 @@ export async function proxySessionStartAction(
             
             if (pool.length === 0) {
               needsTrustFallback = true;
+              handlesByItem.set(itemIdx, []);
               continue;
             }
             
@@ -2044,14 +2300,56 @@ export async function proxySessionStartAction(
               return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
             });
             
-            // Select cheapest candidate
-            const selected = candidatesInBudget[0];
-            bundleFinalHandles.push(selected.handle);
-            
-            const selectedPrice = selected.price ? parseFloat(String(selected.price)) : 0;
-            if (Number.isFinite(selectedPrice)) {
-              totalSelectedPrice += selectedPrice;
+            // Store all candidates for this item (for round-robin)
+            handlesByItem.set(itemIdx, candidatesInBudget.map(c => c.handle));
+          }
+          
+          // Build final handles via round-robin
+          const bundleFinalHandlesRoundRobin: string[] = [];
+          const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+          
+          // First pass: ensure at least 1 per item
+          for (let i = 0; i < bundleItemsWithBudget.length; i++) {
+            const handles = handlesByItem.get(i) || [];
+            if (handles.length > 0) {
+              bundleFinalHandlesRoundRobin.push(handles[0]);
+              const candidate = sortedCandidates.find(c => c.handle === handles[0]);
+              if (candidate && candidate.price) {
+                const price = parseFloat(String(candidate.price));
+                if (Number.isFinite(price)) {
+                  totalSelectedPrice += price;
+                }
+              }
             }
+          }
+          
+          // Second pass: round-robin to fill remaining slots
+          const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+          let roundRobinIdx = 0;
+          let added = bundleFinalHandlesRoundRobin.length;
+          
+          while (added < resultCountUsed && roundRobinIdx < 100) {
+            const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+            const handles = handlesByItem.get(currentItemIdx) || [];
+            const alreadyAdded = bundleFinalHandlesRoundRobin.filter(h => handles.includes(h)).length;
+            
+            if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
+              const nextHandle = handles[alreadyAdded];
+              if (!bundleFinalHandlesRoundRobin.includes(nextHandle)) {
+                bundleFinalHandlesRoundRobin.push(nextHandle);
+                added++;
+                const candidate = sortedCandidates.find(c => c.handle === nextHandle);
+                if (candidate && candidate.price) {
+                  const price = parseFloat(String(candidate.price));
+                  if (Number.isFinite(price)) {
+                    totalSelectedPrice += price;
+                  }
+                }
+              }
+            }
+            
+            roundRobinIdx++;
+            if (roundRobinIdx > 100) break;
           }
           
           // Check total budget if present
@@ -2064,10 +2362,37 @@ export async function proxySessionStartAction(
             trustFallback = true;
           }
           
+          finalHandles = bundleFinalHandlesRoundRobin.slice(0, resultCountUsed);
+          
+          // Count final handles per item for logging
+          const finalCountsByItem = new Map<number, number>();
+          for (const handle of finalHandles) {
+            const candidate = sortedCandidates.find(c => c.handle === handle);
+            if (candidate) {
+              const itemIdx = (candidate as any)._bundleItemIndex;
+              if (typeof itemIdx === "number") {
+                finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+              }
+            }
+          }
+          
+          const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
+            const count = finalCountsByItem.get(idx) || 0;
+            const itemName = item.hardTerms[0];
+            return `${itemName}=${count}`;
+          }).join(" ");
+          console.log("[Bundle] finalCounts per item:", finalCountsText);
+          
           const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
           const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
-          finalHandles = bundleFinalHandles.slice(0, resultCountUsed);
-          reasoningParts.push(`Built a bundle: ${itemNames}${budgetText}.`);
+          
+          // Build improved reasoning
+          let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+          if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+            reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+          }
+          
+          reasoningParts.push(reasoningText);
         }
         
         console.log("[Bundle] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
