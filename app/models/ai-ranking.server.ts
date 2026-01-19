@@ -35,6 +35,46 @@ interface RankingResult {
   reasoning: string;
 }
 
+interface HardConstraints {
+  hardTerms: string[];
+  hardFacets?: {
+    size?: string[];
+    color?: string[];
+    material?: string[];
+  };
+  avoidTerms: string[];
+  trustFallback: boolean;
+}
+
+interface Evidence {
+  matchedHardTerms: string[];
+  matchedFacets?: {
+    size?: string[];
+    color?: string[];
+    material?: string[];
+  };
+  fieldsUsed: string[];
+}
+
+interface SelectedItem {
+  handle: string;
+  label: "exact" | "alternative";
+  score: number;
+  evidence: Evidence;
+  reason: string;
+}
+
+interface RejectedCandidate {
+  handle: string;
+  why: string;
+}
+
+interface StructuredRankingResult {
+  trustFallback: boolean;
+  selected: SelectedItem[];
+  rejected_candidates?: RejectedCandidate[];
+}
+
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = 12000; // 12 seconds
@@ -303,6 +343,7 @@ async function setCachedRanking(
  * @param variantPreferences - Variant option preferences
  * @param includeTerms - Keywords to include in results
  * @param avoidTerms - Keywords to avoid in results
+ * @param hardConstraints - Hard constraints (hardTerms, hardFacets, avoidTerms, trustFallback)
  * @returns Ranked product handles and reasoning (always returns a result, falls back to deterministic ranking if AI fails)
  */
 export async function rankProductsWithAI(
@@ -314,7 +355,8 @@ export async function rankProductsWithAI(
   variantConstraints?: { size: string | null; color: string | null; material: string | null },
   variantPreferences?: Record<string, string>,
   includeTerms?: string[],
-  avoidTerms?: string[]
+  avoidTerms?: string[],
+  hardConstraints?: HardConstraints
 ): Promise<{ rankedHandles: string[]; reasoning: string }> {
   if (candidates.length === 0) {
     console.log("[AI Ranking] No candidates to rank - using deterministic fallback");
@@ -357,32 +399,68 @@ export async function rankProductsWithAI(
   const enhancedIntent = enhanceUserIntent(userIntent);
   console.log("[AI Ranking] Enhanced user intent length:", enhancedIntent.length);
 
+  // Extract hard constraints (with defaults)
+  const hardTerms = hardConstraints?.hardTerms || [];
+  const hardFacetsRaw = hardConstraints?.hardFacets || {};
+  const avoidTermsFromConstraints = hardConstraints?.avoidTerms || [];
+  const trustFallback = hardConstraints?.trustFallback || false;
+  
+  // Convert hardFacets from single values to arrays if needed
+  // Also merge avoidTerms (from params and constraints)
+  const finalAvoidTerms = [...new Set([...(avoidTerms || []), ...avoidTermsFromConstraints])];
+  
+  // Build hardFacets object for prompt (only include if present)
+  const hardFacetsForPrompt: { size?: string[]; color?: string[]; material?: string[] } = {};
+  if (hardFacetsRaw.size && hardFacetsRaw.size.length > 0) {
+    hardFacetsForPrompt.size = hardFacetsRaw.size;
+  }
+  if (hardFacetsRaw.color && hardFacetsRaw.color.length > 0) {
+    hardFacetsForPrompt.color = hardFacetsRaw.color;
+  }
+  if (hardFacetsRaw.material && hardFacetsRaw.material.length > 0) {
+    hardFacetsForPrompt.material = hardFacetsRaw.material;
+  }
+  // If variantConstraints provided but not in hardFacets, check if we should include them
+  if (variantConstraints && Object.keys(hardFacetsForPrompt).length === 0) {
+    if (variantConstraints.size) {
+      hardFacetsForPrompt.size = [variantConstraints.size];
+    }
+    if (variantConstraints.color) {
+      hardFacetsForPrompt.color = [variantConstraints.color];
+    }
+    if (variantConstraints.material) {
+      hardFacetsForPrompt.material = [variantConstraints.material];
+    }
+  }
+  
   // Build product list for prompt (limit to 200)
-  // Use full descriptions (cleaned) instead of truncating to 200 chars
+  // Use desc1000 if available (from Layer 1 enrichment), otherwise clean description
   const productList = candidates.slice(0, 200).map((p, idx) => {
     const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.join(", ") : "none";
     const colors = (p.colors && p.colors.length > 0) ? p.colors.join(", ") : "none";
     const materials = (p.materials && p.materials.length > 0) ? p.materials.join(", ") : "none";
     const optionValues = p.optionValues ? JSON.stringify(p.optionValues) : "{}";
     
-    // Clean and use full description (up to MAX_DESCRIPTION_LENGTH)
-    const cleanedDescription = cleanDescription(p.description);
-    const descriptionText = cleanedDescription.length > MAX_DESCRIPTION_LENGTH
-      ? cleanedDescription.substring(0, MAX_DESCRIPTION_LENGTH) + "..."
-      : cleanedDescription || "No description available";
+    // Use desc1000 if available (from Layer 1 enrichment), otherwise clean description
+    const descriptionText = (p as any).desc1000 
+      ? (p as any).desc1000 
+      : cleanDescription(p.description) || "No description available";
     
-    return `${idx + 1}. Handle: ${p.handle}
-   Title: ${p.title}
-   Tags: ${p.tags.join(", ") || "none"}
-   Type: ${p.productType || "unknown"}
-   Vendor: ${p.vendor || "unknown"}
-   Price: ${p.price || "unknown"}
-   Description: ${descriptionText}
-   Available: ${p.available ? "yes" : "no"}
-   Sizes: ${sizes}
-   Colors: ${colors}
-   Materials: ${materials}
-   OptionValues: ${optionValues}`;
+    // Include searchText if available
+    const searchTextField = (p as any).searchText ? `   searchText: ${(p as any).searchText}` : "";
+    
+    return `${idx + 1}. handle: ${p.handle}
+   title: ${p.title}
+   productType: ${p.productType || "unknown"}
+   vendor: ${p.vendor || "unknown"}
+   tags: ${p.tags.join(", ") || "none"}
+   available: ${p.available ? "yes" : "no"}
+   price: ${p.price || "unknown"}
+   sizes: ${sizes}
+   colors: ${colors}
+   materials: ${materials}
+   optionValues: ${optionValues}
+   desc1000: ${descriptionText}${searchTextField ? "\n" + searchTextField : ""}`;
   }).join("\n\n");
 
   const constraints = variantConstraints ?? { size: null, color: null, material: null };
@@ -427,82 +505,110 @@ Rules:
 `
     : "";
 
-  const systemPrompt = `You are an expert product recommendation assistant for an e-commerce store. Your task is to deeply understand the shopper's intent and match it with the most relevant products from the catalog.
+  const systemPrompt = `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
-CRITICAL RULES:
-- Return ONLY valid JSON matching the schema
-- You MUST use the EXACT handle values from the candidate list (case-sensitive, no modifications)
-- Copy handles EXACTLY as shown in the "Handle: ..." field
-- Do NOT modify, truncate, or change the handle values in any way
+CRITICAL OUTPUT FORMAT:
+- Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
+- Output must be parseable JSON.parse() directly
+- Use the exact schema provided below - no deviations
 
-MATCHING STRATEGY (in priority order):
-1. **Semantic Understanding**: Read the FULL product description carefully. Understand not just keywords but the product's purpose, use cases, features, benefits, and context. Match products that solve the user's problem or meet their need, even if exact keywords don't match.
+HARD CONSTRAINT RULES:
+${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
+  a) At least one hardTerm match in (title OR productType OR tags OR desc1000 snippet)
+  b) ALL hardFacets must match when provided (size, color, material)
+  c) Must NOT contain any avoidTerms in title/tags/desc1000 (unless avoidTerms is empty)
+  d) Evidence must not be empty - must specify which hardTerms matched and which fields were used`}
 
-2. **Intent Alignment**: Consider the user's intent holistically:
-   - What problem are they trying to solve?
-   - What occasion or use case do they have in mind?
-   - What are their implicit needs (quality, style, functionality)?
-   - Are they looking for something specific or exploring options?
+CATEGORY DRIFT PREVENTION:
+- If hardTerm includes a specific category (e.g., "suit", "sofa", "treadmill", "serum"), do NOT return adjacent categories:
+  * "suit" → do NOT return "shirt", "trousers", "blazer", "jacket" unless trustFallback=true AND labeled "alternative"
+  * "sofa" → do NOT return "chair", "loveseat", "futon" unless trustFallback=true AND labeled "alternative"
+  * "treadmill" → do NOT return "exercise bike", "elliptical", "rower" unless trustFallback=true AND labeled "alternative"
+  * "serum" → do NOT return "moisturizer", "cleanser", "toner" unless trustFallback=true AND labeled "alternative"
+- Only exact category matches can be labeled "exact"
+- Adjacent categories can only be "alternative" when trustFallback=true
 
-3. **Product Attributes**: Prioritize matches based on:
-   - Title relevance (exact keyword matches are good, but semantic meaning is better)
-   - Tags that indicate category, style, or features
-   - Product type alignment with intent
-   - Full description analysis (read the entire description - it contains key details about features, materials, use cases, and benefits)
-   - Vendor/brand if mentioned in intent
-   - Price range alignment with budget preferences
-   - Availability (prefer in-stock items when stock-only filtering is enabled)
+MATCHING REQUIREMENTS:
+1. Read the FULL desc1000 field for each candidate (up to 1000 characters)
+2. Check title, productType, tags, and desc1000 for hardTerm matches
+3. Verify hardFacet matches in sizes/colors/materials arrays
+4. Exclude products containing avoidTerms in title/tags/desc1000
+5. Score 0-100 based on relevance (higher = better match)
 
-4. **Variant Matching**: ${constraintsText || prefsText !== "Variant option preferences: none" ? "When variant preferences are specified (size/color/material/optionValues), prioritize products that offer those exact options. However, do not exclude products that match the intent well but lack exact variant matches - use variant matching as a tie-breaker rather than a hard filter." : "Consider variant options (sizes, colors, materials) as secondary factors - they can boost relevance but shouldn't exclude otherwise perfect matches."}
-
-5. **Keyword Relevance**: ${include.length > 0 || avoid.length > 0 ? `Include terms suggest desired features/categories. Avoid terms indicate undesired features. Use these as guidance, but prioritize semantic understanding over exact keyword matching.` : "Keyword matching (include/avoid) is secondary to semantic understanding."}
-
-6. **Quality vs Quantity**: It's better to return fewer high-quality matches than to include products that don't truly fit the intent. If fewer than ${resultCount} products genuinely match the intent, return only the ones that do.
-
-RANKING GUIDELINES:
-- Most relevant products first (deep semantic match + attribute alignment)
-- Consider description content thoroughly - it often contains critical details not in title/tags
-- Prefer products that clearly solve the stated problem or meet the stated need
-- When in doubt, prioritize products where the description explicitly addresses the user's intent
-- Use variant preferences as a tie-breaker when multiple products have similar relevance
-
-OUTPUT REQUIREMENTS:
-- Return exactly ${resultCount} products (or fewer if genuinely fewer matches exist)
-- Do NOT include products that don't match the intent
-- Do NOT include PII or personal information in reasoning
-- Provide clear, concise reasoning explaining why these products were selected
-
-Output schema (MUST be valid JSON):
+OUTPUT SCHEMA (MUST be exactly this structure):
 {
-  "ranked_handles": ["exact-handle-1", "exact-handle-2", ...],
-  "reasoning": "Brief explanation of why these products were selected, focusing on how they match the user's intent"
-}`;
+  "trustFallback": ${trustFallback},
+  "selected": [
+    {
+      "handle": "exact-handle-from-candidate-list",
+      "label": "exact" | "alternative",
+      "score": 85,
+      "evidence": {
+        "matchedHardTerms": ["suit"],
+        "matchedFacets": { "color": ["navy", "blue"] },
+        "fieldsUsed": ["title", "productType", "desc1000"]
+      },
+      "reason": "Navy blue suit matches category and color requirements."
+    }
+  ],
+  "rejected_candidates": [
+    { "handle": "some-handle", "why": "Does not match hardTerm 'suit'" }
+  ]
+}
+
+REQUIREMENTS:
+- "selected" array MUST contain exactly ${resultCount} items
+- All handles must exist in the candidate list (copy exactly as shown)
+- No duplicate handles
+- evidence.matchedHardTerms must not be empty when trustFallback=false
+- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
+- Each reason must be 1 sentence maximum
+- rejected_candidates array is optional but include up to 20 if helpful for debugging`;
+
+  // Build hard constraints object for prompt
+  const hardConstraintsJson = JSON.stringify({
+    hardTerms,
+    ...(Object.keys(hardFacetsForPrompt).length > 0 ? { hardFacets: hardFacetsForPrompt } : {}),
+    avoidTerms: finalAvoidTerms,
+    trustFallback,
+  }, null, 2);
 
   const userPrompt = `Shopper Intent:
-${enhancedIntent}${constraintsText}
+${enhancedIntent}
 
-${prefsText}${rulesText}${keywordText}
+Hard Constraints:
+${hardConstraintsJson}
 
-ANALYSIS INSTRUCTIONS:
-1. Carefully read the shopper's intent above. What are they really looking for? What problem are they solving?
-2. For each candidate product below, read the FULL description. The description contains detailed information about:
-   - Product features and benefits
-   - Materials and construction
-   - Use cases and occasions
-   - Care instructions and details
-   - Style, fit, and design notes
-3. Match products where the description indicates they meet the user's needs, even if the title/tags don't have exact keyword matches.
-4. Consider implicit needs: If someone asks for "something comfortable," look for products where the description mentions comfort, softness, or ergonomic design.
+${constraintsText ? `Variant Preferences:
+${constraintsText}` : ""}
+
+${prefsText && prefsText !== "Variant option preferences: none" ? `${prefsText}${rulesText}` : ""}
+
+${keywordText || ""}
 
 Candidate Products (${candidates.length} total):
 ${productList}
 
-IMPORTANT: 
-- Copy handle values EXACTLY as shown above (e.g., "Handle: my-product-handle" → use "my-product-handle" exactly)
-- Read each product's full description - it contains critical matching information
-- Prioritize deep semantic matches over surface-level keyword matches
+TASK:
+1. For each candidate, check if it satisfies the hard constraints:
+   - At least one hardTerm in title/productType/tags/desc1000
+   - All hardFacets match (size/color/material in candidate arrays)
+   - No avoidTerms in title/tags/desc1000
 
-Rank the top ${resultCount} products that best match the shopper's intent based on thorough analysis of their descriptions and attributes. Return ONLY the JSON object with ranked_handles array (using exact handles) and reasoning string.`;
+2. Select exactly ${resultCount} products:
+   ${trustFallback ? "- If ${resultCount} exact matches exist, return all as 'exact'" : "- ALL must be 'exact' matches (satisfy all hard constraints)"}
+   ${trustFallback ? "- If fewer than ${resultCount} exact matches, fill with 'alternative' matches closest to intent" : "- If fewer than ${resultCount} exact matches exist, return only the exact matches you find"}
+
+3. For each selected item, provide:
+   - Exact handle (copy from candidate list)
+   - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
+   - Score: 0-100 based on match quality
+   - Evidence: Which hardTerms matched, which facets matched, which fields were used
+   - Reason: 1 sentence explaining the match
+
+4. Optionally include up to 20 rejected candidates with brief "why" explanations.
+
+Return ONLY the JSON object matching the schema - no markdown, no prose outside JSON.`;
 
   // Attempt AI ranking with retries
   let lastError: any = null;
@@ -554,63 +660,179 @@ Rank the top ${resultCount} products that best match the shopper's intent based 
 
       console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
 
+      // Robust JSON extraction - trim whitespace and extract first {...} block
+      let jsonContent = content.trim();
+      
+      // If wrapped in markdown code blocks, extract JSON
+      const codeBlockMatch = jsonContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+      if (codeBlockMatch) {
+        jsonContent = codeBlockMatch[1].trim();
+      } else {
+        // Extract first {...} JSON block
+        const jsonMatch = jsonContent.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          jsonContent = jsonMatch[0];
+        }
+      }
+
       // Parse JSON response
-      let rankingResult: RankingResult;
+      let structuredResult: StructuredRankingResult;
+      let structuredOk = false;
+      let fallbackUsed = false;
+      
       try {
-        rankingResult = JSON.parse(content);
+        structuredResult = JSON.parse(jsonContent);
+        // Validate it's the new structured format
+        if (structuredResult.selected && Array.isArray(structuredResult.selected)) {
+          structuredOk = true;
+        } else {
+          // Not the new format, try old format
+          fallbackUsed = true;
+          throw new Error("Not structured format");
+        }
       } catch (parseError) {
-        console.error("[AI Ranking] Failed to parse JSON response:", parseError);
-        console.error("[AI Ranking] Raw content that failed to parse:", content);
+        console.error("[AI Ranking] Failed to parse structured JSON response:", parseError);
+        console.error("[AI Ranking] Attempted to parse:", jsonContent.substring(0, 500));
+        // Fall back to old format parsing
+        fallbackUsed = true;
+        try {
+          const oldFormat: RankingResult = JSON.parse(jsonContent);
+          if (oldFormat.ranked_handles && Array.isArray(oldFormat.ranked_handles)) {
+            console.log("[AI Ranking] Falling back to old format parsing");
+            const candidateHandles = new Set(candidates.map(p => p.handle));
+            const validHandles = oldFormat.ranked_handles
+              .filter((h): h is string => typeof h === "string" && h.trim().length > 0 && candidateHandles.has(h.trim()))
+              .map(h => h.trim())
+              .slice(0, resultCount);
+            if (validHandles.length > 0) {
+              // Debug log for fallback
+              console.log("[AI Ranking] structuredOk=", false, "fallbackUsed=", true, "trustFallback=", hardConstraints?.trustFallback ?? null);
+              return {
+                rankedHandles: validHandles,
+                reasoning: oldFormat.reasoning || "AI-ranked products based on user intent",
+              };
+            }
+          }
+        } catch (fallbackError) {
+          // Both failed, continue to retry
+        }
         lastError = parseError;
         continue; // Try again if retries remaining
       }
+      
+      // Debug log for structured format
+      console.log("[AI Ranking] structuredOk=", structuredOk, "fallbackUsed=", fallbackUsed, "trustFallback=", hardConstraints?.trustFallback ?? null);
 
       // Validate response structure
-      if (!rankingResult.ranked_handles || !Array.isArray(rankingResult.ranked_handles)) {
-        console.error("[AI Ranking] Invalid response structure - missing ranked_handles array");
-        lastError = new Error("Invalid response structure");
+      if (!structuredResult.selected || !Array.isArray(structuredResult.selected)) {
+        console.error("[AI Ranking] Invalid response structure - missing selected array");
+        lastError = new Error("Invalid response structure - missing selected array");
         continue; // Try again if retries remaining
       }
 
       // Validate handles exist in candidates
       const candidateHandles = new Set(candidates.map(p => p.handle));
-      const candidateHandlesArray = Array.from(candidateHandles);
+      const candidateMap = new Map(candidates.map(p => [p.handle, p]));
       
-      console.log("[AI Ranking] AI returned", rankingResult.ranked_handles.length, "handles");
-      console.log("[AI Ranking] AI handles:", rankingResult.ranked_handles);
-      console.log("[AI Ranking] Expected candidate handles:", candidateHandlesArray);
+      console.log("[AI Ranking] AI returned", structuredResult.selected.length, "selected items");
       
-      // Try to match handles (case-insensitive, trimmed)
-      const validHandles = rankingResult.ranked_handles
-        .map(h => {
-          if (!h || typeof h !== "string") return null;
-          const trimmed = h.trim();
-          // Try exact match first
-          if (candidateHandles.has(trimmed)) return trimmed;
-          // Try case-insensitive match
-          const lower = trimmed.toLowerCase();
-          for (const candidate of candidateHandlesArray) {
-            if (candidate.toLowerCase() === lower) {
-              return candidate; // Return the original case
+      // Validate and filter selected items
+      const validSelectedItems: SelectedItem[] = [];
+      
+      for (const item of structuredResult.selected) {
+        if (!item.handle || typeof item.handle !== "string") {
+          console.warn("[AI Ranking] Skipping item with invalid handle:", item);
+          continue;
+        }
+        
+        const handle = item.handle.trim();
+        if (!candidateHandles.has(handle)) {
+          console.warn("[AI Ranking] Skipping item with handle not in candidates:", handle);
+          continue;
+        }
+        
+        // If trustFallback=false, validate constraints
+        if (!trustFallback) {
+          const candidate = candidateMap.get(handle);
+          if (!candidate) continue;
+          
+          // Check if evidence has matchedHardTerms
+          if (!item.evidence || !item.evidence.matchedHardTerms || item.evidence.matchedHardTerms.length === 0) {
+            console.warn(`[AI Ranking] Skipping ${handle} - no matchedHardTerms when trustFallback=false`);
+            continue;
+          }
+          
+          // Basic validation: check if hardTerm appears in candidate fields
+          const candidateText = [
+            candidate.title || "",
+            candidate.productType || "",
+            ...(candidate.tags || []),
+            (candidate as any).desc1000 || cleanDescription(candidate.description) || "",
+          ].join(" ").toLowerCase();
+          
+          const hasHardTermMatch = item.evidence.matchedHardTerms.some((term: string) =>
+            candidateText.includes(term.toLowerCase())
+          );
+          
+          if (!hasHardTermMatch && hardTerms.length > 0) {
+            console.warn(`[AI Ranking] Skipping ${handle} - claimed hardTerm match not found in candidate`);
+            continue;
+          }
+          
+          // Check avoidTerms
+          if (finalAvoidTerms.length > 0) {
+            const hasAvoidTerm = finalAvoidTerms.some(avoid =>
+              candidateText.includes(avoid.toLowerCase())
+            );
+            if (hasAvoidTerm) {
+              console.warn(`[AI Ranking] Skipping ${handle} - contains avoidTerm`);
+              continue;
             }
           }
-          return null;
-        })
-        .filter((h): h is string => h !== null);
+        }
+        
+        validSelectedItems.push(item);
+      }
       
-      console.log("[AI Ranking] Matched", validHandles.length, "out of", rankingResult.ranked_handles.length, "handles");
+      console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", structuredResult.selected.length, "selected items");
       
-      if (validHandles.length === 0) {
-        console.error("[AI Ranking] No valid handles in AI response");
-        console.error("[AI Ranking] AI returned handles:", JSON.stringify(rankingResult.ranked_handles));
-        console.error("[AI Ranking] Expected handles:", JSON.stringify(candidateHandlesArray));
-        lastError = new Error("No valid handles in AI response");
+      if (validSelectedItems.length === 0) {
+        console.error("[AI Ranking] No valid selected items after validation");
+        lastError = new Error("No valid selected items after validation");
         continue; // Try again if retries remaining
       }
 
-      // Limit to resultCount
-      const rankedHandles = validHandles.slice(0, resultCount);
-      const reasoning = rankingResult.reasoning || "AI-ranked products based on user intent";
+      // Extract handles and build reasoning
+      const rankedHandles = validSelectedItems
+        .slice(0, resultCount)
+        .map(item => item.handle.trim());
+      
+      // Build reasoning from evidence and reasons
+      let reasoning: string;
+      if (!trustFallback && hardTerms.length > 0) {
+        const matchedTerms = [...new Set(validSelectedItems.flatMap(item => item.evidence?.matchedHardTerms || []))];
+        const facetParts: string[] = [];
+        if (hardFacetsForPrompt.size) facetParts.push(`size: ${hardFacetsForPrompt.size.join(", ")}`);
+        if (hardFacetsForPrompt.color) facetParts.push(`color: ${hardFacetsForPrompt.color.join(", ")}`);
+        if (hardFacetsForPrompt.material) facetParts.push(`material: ${hardFacetsForPrompt.material.join(", ")}`);
+        const facetsText = facetParts.length > 0 ? ` + ${facetParts.join(", ")}` : "";
+        reasoning = `Matched: ${matchedTerms.join(", ")}${facetsText}.`;
+      } else if (trustFallback && hardTerms.length > 0) {
+        reasoning = `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`;
+      } else {
+        reasoning = "AI-ranked products based on user intent.";
+      }
+      
+      // Add item reasons (concatenate, keep short)
+      const itemReasons = validSelectedItems
+        .slice(0, resultCount)
+        .map(item => item.reason)
+        .filter(Boolean)
+        .slice(0, 5); // Limit to first 5 to keep reasoning concise
+      
+      if (itemReasons.length > 0) {
+        reasoning += " " + itemReasons.join(" ");
+      }
 
       console.log("[AI Ranking] Successfully ranked", rankedHandles.length, "products");
       
@@ -683,4 +905,5 @@ export function fallbackRanking(
 
   return sorted.slice(0, resultCount).map(p => p.handle);
 }
+
 

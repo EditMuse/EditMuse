@@ -2744,6 +2744,8 @@
 
       this.state.loading = true;
       this.render();
+      // Start loading animation after render
+      this.startConciergeLoadingAnimation();
 
       try {
           var requestBody = {
@@ -2817,6 +2819,7 @@
         
         this.state.error = error.message;
         this.state.loading = false;
+        this.stopConciergeLoadingAnimation(); // Stop animation on error
         this.render();
         debugLog('Error in handleSubmit:', error);
       }
@@ -2890,6 +2893,80 @@
         if (errorEl) {
           errorEl.style.display = 'none';
           errorEl.textContent = '';
+        }
+      }
+    }
+
+    // Loading animation messages
+    getLoadingMessages() {
+      return [
+        'Analyzing your preferences...',
+        'Searching through our catalog...',
+        'Matching products to your style...',
+        'Fine-tuning recommendations...'
+      ];
+    }
+
+    // Start loading animation for concierge block
+    startConciergeLoadingAnimation() {
+      var self = this;
+      var modal = this.modalElement;
+      if (!modal) {
+        // Retry after a short delay if modal not ready
+        setTimeout(function() {
+          self.startConciergeLoadingAnimation();
+        }, 100);
+        return;
+      }
+      
+      var loadingText = modal.querySelector('[data-editmuse-concierge-loading-text]');
+      if (!loadingText) {
+        // Retry after a short delay if text element not ready
+        setTimeout(function() {
+          self.startConciergeLoadingAnimation();
+        }, 100);
+        return;
+      }
+
+      // Stop any existing interval
+      if (this._loadingMessageInterval) {
+        clearInterval(this._loadingMessageInterval);
+      }
+
+      var loadingMessages = this.getLoadingMessages();
+      var currentIndex = 0;
+
+      // Update message immediately
+      loadingText.textContent = loadingMessages[0];
+      loadingText.className = 'editmuse-loading-text fade-in';
+
+      // Cycle through messages every 4 seconds with fade animation
+      this._loadingMessageInterval = setInterval(function() {
+        // Fade out
+        loadingText.className = 'editmuse-loading-text fade-out';
+        
+        // After fade out completes, change text and fade in
+        setTimeout(function() {
+          if (!loadingText) return; // Safety check
+          currentIndex = (currentIndex + 1) % loadingMessages.length;
+          loadingText.textContent = loadingMessages[currentIndex];
+          loadingText.className = 'editmuse-loading-text fade-in';
+        }, 400); // Half of transition duration (0.6s / 1.5 = ~400ms)
+      }, 4000);
+    }
+
+    // Stop loading animation for concierge block
+    stopConciergeLoadingAnimation() {
+      if (this._loadingMessageInterval) {
+        clearInterval(this._loadingMessageInterval);
+        this._loadingMessageInterval = null;
+      }
+      var modal = this.modalElement;
+      if (modal) {
+        var loadingText = modal.querySelector('[data-editmuse-concierge-loading-text]');
+        if (loadingText) {
+          loadingText.classList.remove('fade-in', 'fade-out');
+          loadingText.textContent = '';
         }
       }
     }
@@ -3016,7 +3093,14 @@
             <div class="em-progress" data-em-progress aria-hidden="${showProgress ? 'false' : 'true'}" ${showProgress ? '' : 'style="display: none;"'}><div class="em-progress-bar"></div></div>
             <div class="em-modal-body">
               <div class="em-modal-content-area">
-                ${this.state.loading ? '<div style="text-align: center; padding: 2rem;">Loading...</div>' : questionHTML}
+                ${this.state.loading ? `
+                  <div class="editmuse-concierge-loading" data-editmuse-concierge-loading>
+                    <div class="editmuse-spinner"></div>
+                    <div class="editmuse-loading-messages">
+                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>Analyzing your preferences...</p>
+                    </div>
+                  </div>
+                ` : questionHTML}
                 <div class="editmuse-concierge-error" style="display: ${this.state.error ? 'block' : 'none'};">${this.state.error ? this.escapeHtml(this.state.error) : ''}</div>
               </div>
               <div class="editmuse-concierge-navigation">

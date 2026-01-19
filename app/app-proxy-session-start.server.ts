@@ -9,6 +9,14 @@ import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/
 import { createOverageUsageCharge } from "~/models/shopify-billing.server";
 import { withProxyLogging } from "~/utils/proxy-logging.server";
 import { ensureResultDiversity, generateEmptyResultSuggestions } from "~/models/result-quality.server";
+import {
+  normalizeText,
+  tokenize,
+  cleanDescription,
+  buildSearchText,
+  bm25Score,
+  calculateIDF,
+} from "~/utils/text-indexing.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
@@ -99,6 +107,170 @@ function parseConstraintsFromText(text: string): VariantConstraints {
   }
 
   return { size, color, material };
+}
+
+/**
+ * Parse user intent into hard terms, soft terms, avoid terms, and facets
+ * Industry-agnostic intent parsing
+ */
+function parseIntentGeneric(
+  userText: string,
+  answersJson: string,
+  variantConstraints: VariantConstraints
+): {
+  hardTerms: string[];
+  softTerms: string[];
+  avoidTerms: string[];
+  hardFacets: { size: string | null; color: string | null; material: string | null };
+} {
+  const lowerText = userText.toLowerCase();
+  
+  // Strong category phrases across industries (non-exhaustive, can be expanded)
+  const categoryPhrases = [
+    // Apparel
+    "suit", "dress", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "hoodie", "t-shirt", "tshirt",
+    "shorts", "skirt", "blouse", "polo", "tank", "blazer", "cardigan", "vest", "jumpsuit", "romper",
+    // Home/Garden
+    "sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug",
+    "lamp", "vase", "mirror", "shelf", "cabinet", "drawer", "plant", "lawn mower", "mower", "shed",
+    "fence", "garden tool", "watering can", "pot", "planter", "outdoor furniture",
+    // Beauty/Fitness
+    "serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner",
+    "perfume", "cologne", "shampoo", "conditioner", "treadmill", "dumbbell", "yoga mat", "resistance band",
+    "exercise bike", "rowing machine", "elliptical",
+    // Electronics
+    "phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch",
+    // General
+    "book", "bag", "backpack", "wallet", "watch", "jewelry", "necklace", "ring", "earring", "bracelet",
+    "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper",
+  ];
+  
+  // Minimal synonym expansion for category-like hard terms (industry-agnostic, easy to extend)
+  // Conservative: only expands specific terms, avoids broad words like "clothing"
+  const categorySynonyms: Record<string, string[]> = {
+    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit"],
+    "dress": ["dress", "gown", "frock", "ladies dress"],
+    "shirt": ["shirt", "button-up", "button down", "dress shirt"],
+    "sofa": ["sofa", "couch", "settee", "chesterfield"],
+    "treadmill": ["treadmill", "running machine", "running treadmill"],
+    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
+    "mattress": ["mattress", "bed mattress", "sleep mattress"],
+    "perfume": ["perfume", "fragrance", "cologne", "eau de parfum"],
+    "laptop": ["laptop", "notebook", "laptop computer"],
+    "headphone": ["headphone", "headphones", "earphones", "earbuds"],
+  };
+  
+  /**
+   * Expand hard terms with synonyms (conservative, only for known categories)
+   */
+  function expandHardTermsWithSynonyms(terms: string[]): string[] {
+    const expanded = new Set<string>();
+    for (const term of terms) {
+      expanded.add(term);
+      const synonyms = categorySynonyms[term.toLowerCase()];
+      if (synonyms && synonyms.length > 0) {
+        // Add 2-6 synonyms max per term (already limited by map)
+        for (const synonym of synonyms.slice(0, 6)) {
+          if (synonym.toLowerCase() !== term.toLowerCase()) {
+            expanded.add(synonym);
+          }
+        }
+      }
+    }
+    return Array.from(expanded);
+  }
+  
+  const hardTerms: string[] = [];
+  const softTerms: string[] = [];
+  const avoidTerms: string[] = [];
+  
+  // Extract avoid terms first
+  const avoidPatterns = [
+    /\bno\s+([a-z\s]{3,30})\b/gi,
+    /\bnot\s+([a-z\s]{3,30})\b/gi,
+    /\bwithout\s+([a-z\s]{3,30})\b/gi,
+    /\bavoid\s+([a-z\s]{3,30})\b/gi,
+    /\bdon't\s+want\s+([a-z\s]{3,30})\b/gi,
+    /\bdon't\s+like\s+([a-z\s]{3,30})\b/gi,
+  ];
+  
+  for (const pattern of avoidPatterns) {
+    let match;
+    while ((match = pattern.exec(lowerText)) !== null) {
+      const phrase = match[1].trim();
+      const tokens = tokenize(phrase);
+      avoidTerms.push(...tokens);
+    }
+  }
+  
+  // Find category phrases (hard terms)
+  for (const phrase of categoryPhrases) {
+    const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "i");
+    if (regex.test(lowerText)) {
+      hardTerms.push(phrase);
+    }
+  }
+  
+  // Expand hard terms with synonyms (conservative, only for known categories)
+  const expandedHardTerms = expandHardTermsWithSynonyms(hardTerms);
+  
+  // Parse answers JSON for additional context
+  let answersData: any = {};
+  try {
+    answersData = typeof answersJson === "string" ? JSON.parse(answersJson) : answersJson;
+    if (Array.isArray(answersData)) {
+      // If array, concatenate strings
+      const answerText = answersData
+        .filter((a: any) => typeof a === "string")
+        .join(" ")
+        .toLowerCase();
+      
+      // Check for category mentions in answers
+      for (const phrase of categoryPhrases) {
+        if (answerText.includes(phrase) && !expandedHardTerms.includes(phrase)) {
+          expandedHardTerms.push(phrase);
+        }
+      }
+    } else if (typeof answersData === "object") {
+      // Check object keys/values for categories
+      const answerText = JSON.stringify(answersData).toLowerCase();
+      for (const phrase of categoryPhrases) {
+        if (answerText.includes(phrase) && !expandedHardTerms.includes(phrase)) {
+          expandedHardTerms.push(phrase);
+        }
+      }
+    }
+  } catch {
+    // Ignore parse errors
+  }
+  
+  // Apply synonym expansion to any newly found terms
+  const finalHardTerms = expandHardTermsWithSynonyms(expandedHardTerms);
+  
+  // Extract soft terms (remaining meaningful tokens)
+  const allTokens = tokenize(userText);
+  const avoidSet = new Set(avoidTerms);
+  const hardSet = new Set(finalHardTerms.flatMap((t: string) => tokenize(t)));
+  
+  for (const token of allTokens) {
+    if (!avoidSet.has(token) && !hardSet.has(token) && token.length >= 3) {
+      softTerms.push(token);
+    }
+  }
+  
+  // Hard facets from variant constraints
+  const hardFacets = {
+    size: variantConstraints.size,
+    color: variantConstraints.color,
+    material: variantConstraints.material,
+  };
+  
+  return {
+    hardTerms: Array.from(new Set(finalHardTerms)),
+    softTerms: Array.from(new Set(softTerms)),
+    avoidTerms: Array.from(new Set(avoidTerms)),
+    hardFacets,
+  };
 }
 
 function mergeConstraints(a: VariantConstraints, b: VariantConstraints): VariantConstraints {
@@ -996,13 +1168,18 @@ export async function proxySessionStartAction(
         };
       }
       
-      // Extract keywords early so they can be used for filtering
-      const { includeTerms, avoidTerms } = extractKeywords(userIntent);
-      console.log("[App Proxy] Include terms:", includeTerms);
-      console.log("[App Proxy] Avoid terms:", avoidTerms);
-
-      // Build candidates from filteredProducts
-      let allCandidates = filteredProducts.map(p => ({
+      // ============================================
+      // 3-LAYER RECOMMENDATION PIPELINE
+      // ============================================
+      
+      // LAYER 1: Description Enrichment
+      // Build enriched candidates with normalized text and search tokens
+      console.log("[App Proxy] [Layer 1] Building enriched candidates with description data");
+      let allCandidates = filteredProducts.map(p => {
+        const descPlain = cleanDescription((p as any).description || null);
+        const desc1000 = descPlain.substring(0, 1000);
+        
+        return {
         handle: p.handle,
         title: p.title,
         productType: (p as any).productType || null,
@@ -1010,40 +1187,243 @@ export async function proxySessionStartAction(
         vendor: (p as any).vendor || null,
         price: p.priceAmount || p.price || null,
         description: (p as any).description || null,
+          descPlain,
+          desc1000,
         available: p.available,
         sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
         colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
         materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
         optionValues: (p as any).optionValues ?? {},
-      }));
-
-      // Apply avoidTerms as a soft filter BEFORE AI ranking
-      if (avoidTerms.length > 0) {
-        const beforeAvoidFilter = allCandidates.length;
-        const filteredByAvoid = allCandidates.filter(candidate => {
-          const titleLower = (candidate.title || "").toLowerCase();
-          const tagsLower = (candidate.tags || []).map((t: string) => t.toLowerCase());
-          
-          // Check if title or tags contain any avoid term
-          for (const avoidTerm of avoidTerms) {
-            if (titleLower.includes(avoidTerm) || tagsLower.some((tag: string) => tag.includes(avoidTerm))) {
-              return false; // Exclude this product
-            }
-          }
-          return true; // Keep this product
+        };
+      });
+      
+      // Build searchText for each candidate
+      type EnrichedCandidate = typeof allCandidates[0] & { searchText: string };
+      const enrichedCandidates: EnrichedCandidate[] = allCandidates.map(c => {
+        const searchText = buildSearchText({
+          title: c.title,
+          productType: c.productType,
+          vendor: c.vendor,
+          tags: c.tags,
+          optionValues: c.optionValues,
+          sizes: c.sizes,
+          colors: c.colors,
+          materials: c.materials,
+          desc1000: c.desc1000,
         });
+        return {
+          ...c,
+          searchText,
+        } as EnrichedCandidate;
+      });
+      // Use enrichedCandidates for all subsequent operations
+      let allCandidatesEnriched: EnrichedCandidate[] = enrichedCandidates;
+      
+      // Tokenize all candidates for indexing
+      const candidateDocs = enrichedCandidates.map(c => ({
+        candidate: c,
+        tokens: tokenize(c.searchText),
+      }));
+      
+      console.log("[App Proxy] [Layer 1] Enriched", candidateDocs.length, "candidates");
+      
+      // LAYER 2: Intent Parsing + Local Indexing + Gating
+      // Parse intent into hard/soft/avoid terms and facets
+      console.log("[App Proxy] [Layer 2] Parsing intent and building local index");
+      
+      // Get variant constraints for intent parsing
+      const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
+      const fromTextForIntent = parseConstraintsFromText(userIntent);
+      const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
+      
+      // Parse intent (will update includeTerms/avoidTerms)
+      const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
+      const { hardTerms, softTerms, avoidTerms, hardFacets } = intentParse;
+      
+      console.log("[App Proxy] [Layer 2] Hard terms:", hardTerms);
+      console.log("[App Proxy] [Layer 2] Soft terms:", softTerms);
+      console.log("[App Proxy] [Layer 2] Avoid terms:", avoidTerms);
+      console.log("[App Proxy] [Layer 2] Hard facets:", hardFacets);
+      
+      // Tokenize query terms
+      const hardTermTokens = hardTerms.flatMap(t => tokenize(t));
+      const softTermTokens = softTerms.flatMap(t => tokenize(t));
+      const allQueryTokens = [...hardTermTokens, ...softTermTokens];
+      
+      // Build BM25 index
+      const idf = calculateIDF(candidateDocs.map(d => ({ tokens: d.tokens })));
+      const avgDocLen = candidateDocs.reduce((sum, d) => sum + d.tokens.length, 0) / candidateDocs.length || 1;
+      
+      // Calculate BM25 scores and apply gating
+      console.log("[App Proxy] [Layer 2] Applying hard gating");
+      
+      // Gate 1: Hard facets (size/color/material must match)
+      let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+        if (hardFacets.size && c.sizes.length > 0) {
+          const sizeMatch = c.sizes.some((s: string) => 
+            normalizeText(s) === normalizeText(hardFacets.size) ||
+            normalizeText(s).includes(normalizeText(hardFacets.size)) ||
+            normalizeText(hardFacets.size).includes(normalizeText(s))
+          );
+          if (!sizeMatch) return false;
+        }
+        if (hardFacets.color && c.colors.length > 0) {
+          const colorMatch = c.colors.some((col: string) => 
+            normalizeText(col) === normalizeText(hardFacets.color) ||
+            normalizeText(col).includes(normalizeText(hardFacets.color)) ||
+            normalizeText(hardFacets.color).includes(normalizeText(col))
+          );
+          if (!colorMatch) return false;
+        }
+        if (hardFacets.material && c.materials.length > 0) {
+          const materialMatch = c.materials.some((m: string) => 
+            normalizeText(m) === normalizeText(hardFacets.material) ||
+            normalizeText(m).includes(normalizeText(hardFacets.material)) ||
+            normalizeText(hardFacets.material).includes(normalizeText(m))
+          );
+          if (!materialMatch) return false;
+        }
+        return true;
+      });
+      
+      console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+      
+      // Gate 2: Hard terms (must match at least one hard term if hard terms exist)
+      let trustFallback = false;
+      const strictGate: EnrichedCandidate[] = [];
+      
+      if (hardTermTokens.length > 0) {
+        // Products must contain at least one hard term token in searchText
+        for (const candidate of gatedCandidates) {
+          const candidateTokens = new Set(tokenize(candidate.searchText));
+          const hasHardTerm = hardTermTokens.some(ht => candidateTokens.has(ht));
+          
+          // Also check for phrase matches in title/productType/tags
+          const searchFields = [
+            candidate.title || "",
+            candidate.productType || "",
+            ...(candidate.tags || []),
+          ].join(" ").toLowerCase();
+          
+          const hasPhraseMatch = hardTerms.some(phrase => searchFields.includes(phrase.toLowerCase()));
+          
+          if (hasHardTerm || hasPhraseMatch) {
+            strictGate.push(candidate);
+          }
+        }
         
-        // Check if filtering would cause pool < minNeeded
-        if (filteredByAvoid.length < minNeeded) {
-          relaxNotes.push("Avoid terms relaxed to fill results.");
-          // Keep original candidates (don't filter)
+        console.log("[App Proxy] [Layer 2] Strict gate (hard terms + facets):", strictGate.length, "candidates");
+        
+        // Check if strict gate meets minimum requirements
+        const minRequired = Math.max(MIN_CANDIDATES_FOR_AI, resultCountUsed * 2);
+        if (strictGate.length >= minRequired || strictGate.length >= MIN_CANDIDATES_FOR_AI) {
+          gatedCandidates = strictGate;
+          console.log("[App Proxy] [Layer 2] Using strict gate");
         } else {
-          allCandidates = filteredByAvoid;
-          console.log("[App Proxy] Applied avoid terms filter:", allCandidates.length, "candidates (filtered from", beforeAvoidFilter, ")");
+          // Relax: broaden hard term matching (token overlap instead of exact phrase)
+          console.log("[App Proxy] [Layer 2] Strict gate too small, broadening...");
+          
+          // First try: token overlap with any hard term
+          const broadGate = gatedCandidates.filter(candidate => {
+            const candidateTokens = new Set(tokenize(candidate.searchText));
+            return hardTermTokens.some(ht => candidateTokens.has(ht));
+          });
+          
+          if (broadGate.length >= MIN_CANDIDATES_FOR_AI) {
+            gatedCandidates = broadGate;
+            relaxNotes.push(`Broadened category matching to find ${broadGate.length} candidates.`);
+            console.log("[App Proxy] [Layer 2] Using broad gate (token overlap):", broadGate.length);
+          } else {
+            // Last resort: trust fallback (allow cross-catalog)
+            trustFallback = true;
+            relaxNotes.push(`No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`);
+            console.log("[App Proxy] [Layer 2] Trust fallback enabled - allowing cross-catalog results");
+            // Keep gatedCandidates as-is (already facet-filtered)
+          }
+        }
+      } else {
+        // No hard terms, use facet-gated candidates
+        console.log("[App Proxy] [Layer 2] No hard terms, using facet-gated candidates");
+      }
+      
+      // Filter avoid terms (penalty/filter)
+      if (avoidTerms.length > 0 && !trustFallback) {
+        const beforeAvoid = gatedCandidates.length;
+        gatedCandidates = gatedCandidates.filter(c => {
+          const searchLower = c.searchText.toLowerCase();
+          return !avoidTerms.some(avoid => searchLower.includes(avoid.toLowerCase()));
+        });
+        if (gatedCandidates.length < beforeAvoid) {
+          console.log("[App Proxy] [Layer 2] Avoid terms filtered:", gatedCandidates.length, "candidates (from", beforeAvoid, ")");
         }
       }
+      
+      const strictGateCount = strictGate.length;
+      console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
+      
+      // Pre-rank gated candidates with BM25 + boosts
+      console.log("[App Proxy] [Layer 2] Pre-ranking candidates with BM25");
+      const rankedCandidates = gatedCandidates.map(c => {
+        const docTokens = tokenize(c.searchText);
+        const docTokenFreq = new Map<string, number>();
+        for (const token of docTokens) {
+          docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+        }
+        
+        // BM25 score
+        let score = bm25Score(allQueryTokens, docTokens, docTokenFreq, docTokens.length, avgDocLen, idf);
+        
+        // Boost for exact phrase match in title/productType/tags
+        const searchFields = [
+          c.title || "",
+          c.productType || "",
+          ...(c.tags || []),
+        ].join(" ").toLowerCase();
+        
+        for (const hardTerm of hardTerms) {
+          if (searchFields.includes(hardTerm.toLowerCase())) {
+            score += 2.0; // Boost for exact phrase
+          }
+        }
+        
+        // Boost for facet matches
+        if (hardFacets.size && c.sizes.some((s: string) => normalizeText(s) === normalizeText(hardFacets.size))) {
+          score += 1.5;
+        }
+        if (hardFacets.color && c.colors.some((col: string) => normalizeText(col) === normalizeText(hardFacets.color))) {
+          score += 1.5;
+        }
+        if (hardFacets.material && c.materials.some((m: string) => normalizeText(m) === normalizeText(hardFacets.material))) {
+          score += 1.5;
+        }
+        
+        // Penalty for avoid terms
+        if (avoidTerms.length > 0) {
+          const searchLower = c.searchText.toLowerCase();
+          const avoidMatches = avoidTerms.filter(avoid => searchLower.includes(avoid.toLowerCase())).length;
+          score -= avoidMatches * 1.0;
+        }
+        
+        return { candidate: c, score };
+      });
+      
+      // Sort by score descending
+      rankedCandidates.sort((a, b) => b.score - a.score);
+      
+      // Take top aiWindow candidates for AI
+      const topCandidates = rankedCandidates.slice(0, aiWindow).map(r => r.candidate);
+      
+      console.log("[App Proxy] [Layer 2] Pre-ranked top", topCandidates.length, "candidates for AI");
+      
+      // Update allCandidates to use gated pool for AI ranking
+      // Store full pool for top-up, but AI only sees gated candidates
+      const allCandidatesForTopUp = allCandidatesEnriched; // Full pool for fallback
+      allCandidates = gatedCandidates; // Gated pool for AI (will be typed correctly when used)
+      
+      // Keep includeTerms for backward compatibility (used in existing code)
+      const includeTerms = softTerms;
 
-      // Build variantPreferences with priority (Answers > Text)
+      // Build variantPreferences with priority (Answers > Text) - needed for AI prompt
       const prefsFromAnswers = parsePreferencesFromAnswers(answersJson, knownOptionNames);
       const prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
       const variantPreferences = mergePreferences(prefsFromAnswers, prefsFromText);
@@ -1061,9 +1441,9 @@ export async function proxySessionStartAction(
         material: materialKey ? (variantPreferences[materialKey] ?? null) : null,
       };
 
-      const fromAnswers = parseConstraintsFromAnswers(answersJson);
-      const fromText = parseConstraintsFromText(userIntent);
-      const variantConstraints = mergeConstraints(fromAnswers, fromText);
+      const fromAnswersForVariant = parseConstraintsFromAnswers(answersJson);
+      const fromTextForVariant = parseConstraintsFromText(userIntent);
+      const variantConstraints = mergeConstraints(fromAnswersForVariant, fromTextForVariant);
       const variantConstraints2 = mergeConstraints(variantConstraints, derived);
       console.log("[App Proxy] Variant constraints:", variantConstraints2);
 
@@ -1086,33 +1466,14 @@ export async function proxySessionStartAction(
         });
       }
 
-      function preferenceScore(candidate: any, prefs: VariantPreferences): number {
-        let score = 0;
-        if (candidate.available) score += 10;
-
-        // +6 per matched preference, cap to avoid over-biasing
-        let matched = 0;
-        for (const [k, v] of Object.entries(prefs)) {
-          if (!v) continue;
-          const list = getCandidateOptionValues(candidate, k);
-          if (list.length && valueMatches(list, v)) {
-            matched++;
-            score += 6;
-          }
-        }
-        if (matched >= 3) score += 2; // small bonus for meeting many prefs
-
-        return score;
-      }
-
-      const sortedCandidates = [...allCandidates].sort((a, b) => {
-        const sa = preferenceScore(a, variantPreferences);
-        const sb = preferenceScore(b, variantPreferences);
-        if (sa !== sb) return sb - sa;
-        return a.handle.localeCompare(b.handle);
-      });
-
-      console.log("[App Proxy] Built", sortedCandidates.length, "candidates for AI ranking");
+      // LAYER 3: AI Rerank (intent-safe)
+      // Use pre-ranked topCandidates (already BM25 scored and gated)
+      console.log("[App Proxy] [Layer 3] Preparing candidates for AI ranking");
+      
+      // Use pre-ranked top candidates (already sorted by BM25 + boosts)
+      const sortedCandidates = topCandidates;
+      
+      console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "pre-ranked candidates to AI");
 
       // AI pass #1 + Top-up passes (no extra charge)
       const targetCount = Math.min(resultCountUsed, sortedCandidates.length);
@@ -1131,6 +1492,13 @@ export async function proxySessionStartAction(
       let offset = 0;
 
       const window1 = buildWindow(offset, used);
+      
+      // Convert hardFacets to array format for AI prompt
+      const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
+      if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
+      if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
+      if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
+      
       const ai1 = await rankProductsWithAI(
         userIntent,
         window1,
@@ -1140,14 +1508,20 @@ export async function proxySessionStartAction(
         variantConstraints2,
         variantPreferences,
         includeTerms,
-        avoidTerms
+        avoidTerms,
+        {
+          hardTerms,
+          hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+          avoidTerms,
+          trustFallback,
+        }
       );
 
       if (ai1.rankedHandles?.length) {
         // Filter cached handles against current product availability
         // This ensures out-of-stock products from cache are excluded
         const validHandles = ai1.rankedHandles.filter((handle: string) => {
-          const candidate = allCandidates.find(c => c.handle === handle);
+          const candidate = sortedCandidates.find(c => c.handle === handle);
           if (!candidate) {
             console.log("[App Proxy] Cached handle not found in current candidates:", handle);
             return false; // Product no longer exists or was filtered out
@@ -1192,13 +1566,19 @@ export async function proxySessionStartAction(
           variantConstraints2,
           variantPreferences,
           includeTerms,
-          avoidTerms
+          avoidTerms,
+          {
+            hardTerms,
+            hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+            avoidTerms,
+            trustFallback,
+          }
         );
 
         if (aiTopUp.rankedHandles?.length) {
           // Filter cached handles against current product availability
           const validTopUpHandles = aiTopUp.rankedHandles.filter((handle: string) => {
-            const candidate = allCandidates.find(c => c.handle === handle);
+            const candidate = sortedCandidates.find(c => c.handle === handle);
             if (!candidate) return false;
             // If inStockOnly is enabled, filter out unavailable products
             if (experience.inStockOnly && !candidate.available) return false;
@@ -1221,21 +1601,93 @@ export async function proxySessionStartAction(
         pass++;
       }
 
-      // FINAL FILL (only if still short)
-      if (finalHandles.length < targetCount) {
-        const remaining = sortedCandidates.filter(c => !used.has(c.handle));
-        const fallbackHandles = fallbackRanking(remaining, targetCount - finalHandles.length);
-        finalHandles = [...finalHandles, ...fallbackHandles];
+      // LAYER 3: Post-validation (validate final handles against hard constraints)
+      console.log("[App Proxy] [Layer 3] Validating final handles");
+      
+      /**
+       * Validate final handles against hard constraints (when trustFallback=false)
+       */
+      function validateFinalHandles(
+        handles: string[],
+        candidates: EnrichedCandidate[],
+        hardTerms: string[],
+        hardFacets: { size: string | null; color: string | null; material: string | null },
+        trustFallback: boolean
+      ): string[] {
+        if (trustFallback) {
+          // Trust fallback: allow all handles
+          return handles;
+        }
+        
+        const validHandles: string[] = [];
+        
+        for (const handle of handles) {
+          const candidate = candidates.find(c => c.handle === handle);
+          if (!candidate) continue;
+          
+          // Check hard facets
+          let passesFacets = true;
+          if (hardFacets.size && candidate.sizes.length > 0) {
+            const sizeMatch = candidate.sizes.some((s: string) => 
+              normalizeText(s) === normalizeText(hardFacets.size) ||
+              normalizeText(s).includes(normalizeText(hardFacets.size)) ||
+              normalizeText(hardFacets.size).includes(normalizeText(s))
+            );
+            if (!sizeMatch) passesFacets = false;
+          }
+          if (hardFacets.color && candidate.colors.length > 0 && passesFacets) {
+            const colorMatch = candidate.colors.some((col: string) => 
+              normalizeText(col) === normalizeText(hardFacets.color) ||
+              normalizeText(col).includes(normalizeText(hardFacets.color)) ||
+              normalizeText(hardFacets.color).includes(normalizeText(col))
+            );
+            if (!colorMatch) passesFacets = false;
+          }
+          if (hardFacets.material && candidate.materials.length > 0 && passesFacets) {
+            const materialMatch = candidate.materials.some((m: string) => 
+              normalizeText(m) === normalizeText(hardFacets.material) ||
+              normalizeText(m).includes(normalizeText(hardFacets.material)) ||
+              normalizeText(hardFacets.material).includes(normalizeText(m))
+            );
+            if (!materialMatch) passesFacets = false;
+          }
+          
+          // Check hard terms (if any)
+          if (hardTerms.length > 0 && passesFacets) {
+            const candidateTokens = new Set(tokenize(candidate.searchText));
+            const hasHardTerm = hardTermTokens.some(ht => candidateTokens.has(ht));
+            const searchFields = [
+              candidate.title || "",
+              candidate.productType || "",
+              ...(candidate.tags || []),
+            ].join(" ").toLowerCase();
+            const hasPhraseMatch = hardTerms.some(phrase => searchFields.includes(phrase.toLowerCase()));
+            
+            if (!hasHardTerm && !hasPhraseMatch) {
+              passesFacets = false;
+            }
+          }
+          
+          if (passesFacets) {
+            validHandles.push(handle);
+          }
+        }
+        
+        return validHandles;
       }
-
-      // Helper functions for guaranteed top-up
+      
+      // Validate final handles (use enriched candidates)
+      const validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+      console.log("[App Proxy] [Layer 3] Validated handles:", validatedHandles.length, "out of", finalHandles.length);
+      
+      // Top-up ONLY from gated pool (intent-safe)
       function uniq<T>(arr: T[]) {
         return Array.from(new Set(arr));
       }
 
-      function topUpHandles(
+      function topUpHandlesFromGated(
         ranked: string[],
-        pool: Array<{ handle: string }>,
+        pool: typeof allCandidates,
         target: number
       ) {
         const have = new Set(ranked);
@@ -1252,16 +1704,63 @@ export async function proxySessionStartAction(
         return out.slice(0, target);
       }
 
-      // Hard guarantee: top-up after AI ranking
-      // rankedHandles is what AI produced across passes (may be short)
-      let finalHandlesGuaranteed = uniq(finalHandles);
+      // Hard guarantee: top-up after AI ranking (intent-safe enforcement)
+      let finalHandlesGuaranteed = uniq(validatedHandles);
 
-      // IMPORTANT: use the relaxed pool here (NOT only strict filteredProducts)
-      finalHandlesGuaranteed = topUpHandles(finalHandlesGuaranteed, allCandidates, resultCountUsed);
-
-      // Safety: if still short (tiny store), fall back to baseProducts
-      if (finalHandlesGuaranteed.length < resultCountUsed) {
-        finalHandlesGuaranteed = topUpHandles(finalHandlesGuaranteed, baseProducts, resultCountUsed);
+      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+      if (!trustFallback) {
+        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+        if (gatedCandidates.length > 0) {
+          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+        }
+        // If still short after gated top-up, return fewer results (better than drift)
+        console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
+      } else {
+        // Trust fallback: can use broader pool, but prefer gated first
+        if (gatedCandidates.length > 0) {
+          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+        }
+        
+        // If still short, use broader pool (allCandidatesForTopUp)
+        if (finalHandlesGuaranteed.length < resultCountUsed && allCandidatesForTopUp.length > 0) {
+          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, resultCountUsed);
+        }
+        
+        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+        if (finalHandlesGuaranteed.length < resultCountUsed) {
+          const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
+            const descPlain = cleanDescription((p as any).description || null);
+            const desc1000 = descPlain.substring(0, 1000);
+            return {
+              handle: p.handle,
+              title: p.title,
+              productType: (p as any).productType || null,
+              tags: p.tags || [],
+              vendor: (p as any).vendor || null,
+              price: p.priceAmount || p.price || null,
+              description: (p as any).description || null,
+              descPlain,
+              desc1000,
+              searchText: buildSearchText({
+                title: p.title,
+                productType: (p as any).productType || null,
+                vendor: (p as any).vendor || null,
+                tags: p.tags || [],
+                optionValues: (p as any).optionValues ?? {},
+                sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                desc1000,
+              }),
+              available: p.available,
+              sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+              colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+              materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+              optionValues: (p as any).optionValues ?? {},
+            } as EnrichedCandidate;
+          });
+          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, resultCountUsed);
+        }
       }
 
       console.log(
@@ -1273,6 +1772,25 @@ export async function proxySessionStartAction(
 
       finalHandles = finalHandlesGuaranteed;
 
+      // Add trust signals to reasoning
+      if (!trustFallback && (hardTerms.length > 0 || hardFacets.size || hardFacets.color || hardFacets.material)) {
+        const matchParts: string[] = [];
+        if (hardTerms.length > 0) {
+          matchParts.push(`category: ${hardTerms.join(", ")}`);
+        }
+        if (hardFacets.size) matchParts.push(`size: ${hardFacets.size}`);
+        if (hardFacets.color) matchParts.push(`color: ${hardFacets.color}`);
+        if (hardFacets.material) matchParts.push(`material: ${hardFacets.material}`);
+        if (matchParts.length > 0) {
+          reasoningParts.unshift(`Matched: ${matchParts.join(", ")}.`);
+        }
+      } else if (trustFallback) {
+        const fallbackNote = hardTerms.length > 0
+          ? `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`
+          : "No exact matches found; showing closest alternatives.";
+        reasoningParts.unshift(fallbackNote);
+      }
+      
       // Reasoning header (generic, all industries)
       const prefPairs = Object.entries(variantPreferences).filter(([,v]) => !!v);
       if (prefPairs.length) {
@@ -1292,9 +1810,24 @@ export async function proxySessionStartAction(
 
       // Ensure result diversity (vendor, type, price variety)
       // This improves user experience by avoiding too many similar products
+      // Convert enriched candidates to format expected by ensureResultDiversity
+      const candidatesForDiversity = gatedCandidates.map(c => ({
+        handle: c.handle,
+        title: c.title,
+        tags: c.tags,
+        productType: c.productType,
+        vendor: c.vendor,
+        price: c.price,
+        description: c.description,
+        available: c.available,
+        sizes: c.sizes,
+        colors: c.colors,
+        materials: c.materials,
+        optionValues: c.optionValues,
+      }));
       const diverseHandles = ensureResultDiversity(
         finalHandlesGuaranteed.slice(0, targetCount),
-        allCandidates,
+        candidatesForDiversity,
         resultCountUsed
       );
       console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandlesGuaranteed.slice(0, targetCount).length, ")");
@@ -1319,7 +1852,7 @@ export async function proxySessionStartAction(
           : "No products available. Please try adjusting your search criteria or filters.";
         console.log("[App Proxy] No products found - generated suggestions:", suggestions);
       }
-
+      
       // Save results and mark session as COMPLETE
       await saveConciergeResult({
         sessionToken,
@@ -1331,6 +1864,9 @@ export async function proxySessionStartAction(
       });
 
       console.log("[App Proxy] Results saved, session marked COMPLETE");
+
+      // Log 3-layer pipeline metrics
+      console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
 
       // Charge session once for the final result count (prevents duplicate charges from multi-pass AI)
       // NOTE: Credits are charged regardless of cache hit/miss - you're paying for the ranking service, not the OpenAI API call

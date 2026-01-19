@@ -1500,6 +1500,48 @@ textarea.editmuse-concierge-input {
   font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
 }
 
+/* Animated loading messages for concierge and results */
+.editmuse-loading-messages {
+  position: relative;
+  min-height: 1.5em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.editmuse-loading-text {
+  margin: 0;
+  font-size: calc(var(--em-font-scale, 102%) * 1rem / 100);
+  color: var(--em-muted, rgba(11,11,15,0.62));
+  font-weight: 400;
+  opacity: 1;
+  transition: opacity 0.6s ease-in-out, transform 0.4s ease-in-out;
+  transform: translateY(0);
+  text-align: center;
+}
+
+.editmuse-loading-text.fade-out {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.editmuse-loading-text.fade-in {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Concierge modal loading state */
+.editmuse-concierge-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--em-space, 16px) * 2.5) calc(var(--em-space, 16px) * 1.25);
+  gap: calc(var(--em-space, 16px) * 1);
+  min-height: 200px;
+}
+
 .editmuse-results-empty,
 .editmuse-results-error {
   text-align: center;
