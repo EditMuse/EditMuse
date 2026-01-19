@@ -2270,10 +2270,8 @@
         debugLog('[EditMuse] WARNING: No experience ID found. Request will use default experience.');
       }
       
-      var resultCount = this.getResultCount();
-      if (resultCount !== undefined && resultCount !== null) {
-        requestBody.resultCount = resultCount;
-      }
+      // resultCount is now controlled by Experience.resultCount on the backend
+      // Do not send resultCount in request body
 
       try {
         var response = await fetch(proxyUrl('/session/start'), {
@@ -2759,10 +2757,8 @@
             requestBody.experienceId = experienceId;
           }
 
-        var resultCount = this.getResultCount();
-          if (resultCount !== undefined && resultCount !== null) {
-            requestBody.resultCount = resultCount;
-          }
+        // resultCount is now controlled by Experience.resultCount on the backend
+        // Do not send resultCount in request body
           
         debugLog('Submitting answers:', messages);
         debugLog('[EditMuse] Submitting with clientRequestId', window.__EDITMUSE_SUBMIT_LOCK);

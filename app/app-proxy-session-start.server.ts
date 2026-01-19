@@ -906,6 +906,10 @@ export async function proxySessionStartAction(
   experienceIdUsed = experience.id;
   console.log("[App Proxy] ✅ FINAL: Using experienceId:", experienceIdUsed, "| Source:", experienceIdSource, "| Was default created:", wasDefaultCreated, "| Name:", experience.name);
 
+  // Experience.resultCount is the ONLY source of truth for number of results
+  const finalResultCount = Number(experience.resultCount ?? 8);
+  console.log("[ResultCount] source=experience value=", finalResultCount, "experienceId=", experienceIdUsed, "bodyResultCount=", resultCount);
+
   // Validate and determine mode (must be quiz/chat/hybrid, fallback to hybrid)
   const validModes = ["quiz", "chat", "hybrid"];
   const modeUsed = validModes.includes(experience.mode) ? experience.mode : "hybrid";
@@ -997,17 +1001,11 @@ export async function proxySessionStartAction(
   if (!hasAnswers) {
     console.log("[App Proxy] No answers provided - returning questions only");
     
-    // Validate and determine resultCount for response (must be 8/12/16)
-    const validResultCounts = [8, 12, 16];
-    const resultCountUsed = resultCount && validResultCounts.includes(resultCount)
-      ? resultCount
-      : (validResultCounts.includes(experience.resultCount) ? experience.resultCount : 8);
-
     console.log("[App Proxy] Returning questions-only response:", {
       ok: true,
       experienceIdUsed,
       modeUsed,
-      resultCountUsed,
+      finalResultCount: finalResultCount,
       questionsCount: questions.length,
       planTier: entitlements.planTier,
     });
@@ -1016,7 +1014,7 @@ export async function proxySessionStartAction(
       ok: true,
       experienceIdUsed: experienceIdUsed,
       modeUsed: modeUsed,
-      resultCountUsed: resultCountUsed,
+      finalResultCount: finalResultCount,
       questions: questions, // Always return array, even if empty
       billing: {
         planTier: entitlements.planTier,
@@ -1041,17 +1039,9 @@ export async function proxySessionStartAction(
     }, { status: 403 });
   }
 
-  // Validate and determine resultCount (must be 8/12/16)
-  // Prefer body.resultCount if valid, else experience.resultCount if valid, else 8
-  const validResultCounts = [8, 12, 16];
-  const resultCountUsed = resultCount && validResultCounts.includes(resultCount)
-    ? resultCount
-    : (validResultCounts.includes(experience.resultCount) ? experience.resultCount : 8);
-  console.log("[App Proxy] Using resultCount:", resultCountUsed);
-  
-  // Calculate dynamic AI window based on resultCount and entitlements
+  // Calculate dynamic AI window based on finalResultCount and entitlements
   // bundleWindow: 8->60, 12->90, 16->120
-  const bundleWindow = resultCountUsed === 8 ? 60 : resultCountUsed === 12 ? 90 : 120;
+  const bundleWindow = finalResultCount === 8 ? 60 : finalResultCount === 12 ? 90 : 120;
   const aiWindow = Math.min(entitlements.candidateCap, bundleWindow);
   console.log("[App Proxy] AI window:", aiWindow, "(bundleWindow:", bundleWindow, ", candidateCap:", entitlements.candidateCap, ")");
 
@@ -1064,18 +1054,18 @@ export async function proxySessionStartAction(
   const sessionToken = await createConciergeSession({
     shopId: shop.id,
     experienceId: experience.id,
-    resultCount: resultCountUsed,
+    resultCount: finalResultCount,
     answersJson,
     clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null,
   });
   
-  console.log('[App Proxy] Creating new session', { clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null, resultCount: resultCountUsed });
+  console.log('[App Proxy] Creating new session', { clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null, resultCount: finalResultCount });
 
   // Track usage: session started
   await trackUsageEvent(shop.id, "SESSION_STARTED" as UsageEventType, {
     sessionToken,
     experienceId: experience.id,
-    resultCount: resultCountUsed,
+    resultCount: finalResultCount,
   });
 
   console.log("[App Proxy] Session created:", sessionToken, "mode:", modeUsed, "experienceId:", experienceIdUsed);
@@ -1214,7 +1204,7 @@ export async function proxySessionStartAction(
 
       // ---- COUNT-AWARE RELAXATION LADDER ----
       // Relax if results are less than minimum needed (not just zero)
-      const minNeeded = Math.max(MIN_CANDIDATES_FOR_AI, MIN_CANDIDATES_FOR_DELIVERY, resultCountUsed);
+      const minNeeded = Math.max(MIN_CANDIDATES_FOR_AI, MIN_CANDIDATES_FOR_DELIVERY, finalResultCount);
       
       // If too few results, relax budget first (keep stock preference if enabled)
       if (filteredProducts.length < minNeeded && hadBudget) {
@@ -1784,7 +1774,7 @@ export async function proxySessionStartAction(
         console.log("[App Proxy] [Layer 2] Strict gate (hard terms + facets):", strictGate.length, "candidates");
         
         // Check if strict gate meets minimum requirements
-        const minRequired = Math.max(MIN_CANDIDATES_FOR_AI, resultCountUsed * 2);
+        const minRequired = Math.max(MIN_CANDIDATES_FOR_AI, finalResultCount * 2);
         if (strictGate.length >= minRequired || strictGate.length >= MIN_CANDIDATES_FOR_AI) {
           gatedCandidates = strictGate;
           console.log("[App Proxy] [Layer 2] Using strict gate");
@@ -2091,7 +2081,7 @@ export async function proxySessionStartAction(
       }
 
       // AI pass #1 + Top-up passes (no extra charge)
-      const targetCount = Math.min(resultCountUsed, sortedCandidates.length);
+      const targetCount = Math.min(finalResultCount, sortedCandidates.length);
 
       let finalHandles: string[] = [];
       let reasoningParts: string[] = [];
@@ -2187,7 +2177,7 @@ export async function proxySessionStartAction(
               itemPools,
               allocatedBudgets,
               bundleIntent.totalBudget,
-              resultCountUsed,
+              finalResultCount,
               bundleItemsWithBudget.length,
               rankedCandidatesByItem
             );
@@ -2245,7 +2235,7 @@ export async function proxySessionStartAction(
               itemPools,
               allocatedBudgets,
               bundleIntent.totalBudget,
-              resultCountUsed,
+              finalResultCount,
               bundleItemsWithBudget.length
             );
             
@@ -2300,7 +2290,7 @@ export async function proxySessionStartAction(
             itemPools,
             allocatedBudgets,
             bundleIntent.totalBudget,
-            resultCountUsed,
+            finalResultCount,
             bundleItemsWithBudget.length
           );
           
@@ -2451,9 +2441,9 @@ export async function proxySessionStartAction(
 
           pass++;
         }
-      } else if (isBundleMode && finalHandles.length < resultCountUsed) {
+      } else if (isBundleMode && finalHandles.length < finalResultCount) {
         // BUNDLE-SAFE TOP-UP: Only from bundle item pools
-        console.log("[Bundle] Top-up needed: have", finalHandles.length, "need", resultCountUsed);
+        console.log("[Bundle] Top-up needed: have", finalHandles.length, "need", finalResultCount);
         
         // Build itemPools STRICTLY: only candidates that match that item's hard term(s) using word-boundary matching
         const bundleItemPools = new Map<number, EnrichedCandidate[]>();
@@ -2499,7 +2489,7 @@ export async function proxySessionStartAction(
         }
         
         // Calculate target distribution (roughly even)
-        const targetPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+        const targetPerItem = Math.ceil(finalResultCount / bundleItemsWithBudget.length);
         const topUpSourceCounts = new Map<number, number>();
         
         // Round-robin top-up from bundle item pools
@@ -2507,7 +2497,7 @@ export async function proxySessionStartAction(
         let roundRobinIdx = 0;
         const rejectedTopUpHandles: string[] = [];
         
-        while (finalHandles.length < resultCountUsed && roundRobinIdx < 200) { // Safety limit
+        while (finalHandles.length < finalResultCount && roundRobinIdx < 200) { // Safety limit
           const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
           const pool = bundleItemPools.get(currentItemIdx) || [];
           const currentHandles = handlesByItem.get(currentItemIdx) || [];
@@ -2797,7 +2787,7 @@ export async function proxySessionStartAction(
         }
         
         // If we need top-up, use budget-aware helper
-        if (finalHandlesGuaranteed.length < resultCountUsed) {
+        if (finalHandlesGuaranteed.length < finalResultCount) {
           // Build allocated budgets map
           const allocatedBudgets = new Map<number, number>();
           bundleItemsWithBudget.forEach((item, idx) => {
@@ -2811,7 +2801,7 @@ export async function proxySessionStartAction(
             bundleItemPools,
             allocatedBudgets,
             bundleIntent.totalBudget,
-            resultCountUsed,
+            finalResultCount,
             bundleItemsWithBudget.length
           );
           
@@ -2821,7 +2811,7 @@ export async function proxySessionStartAction(
             if (!existingSet.has(handle)) {
               finalHandlesGuaranteed.push(handle);
               existingSet.add(handle);
-              if (finalHandlesGuaranteed.length >= resultCountUsed) break;
+              if (finalHandlesGuaranteed.length >= finalResultCount) break;
             }
           }
           
@@ -2863,30 +2853,30 @@ export async function proxySessionStartAction(
         }).join(" ");
         console.log("[Bundle] finalCounts per item:", finalCountsText);
         
-        console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
+        console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
       } else {
         // SINGLE-ITEM PATH: Existing top-up logic
         // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
         if (!trustFallback) {
           // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
           if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
           }
           // If still short after gated top-up, return fewer results (better than drift)
-          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
+          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
         } else {
           // Trust fallback: can use broader pool, but prefer gated first
           if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
           }
           
           // If still short, use broader pool (allCandidatesForTopUp)
-          if (finalHandlesGuaranteed.length < resultCountUsed && allCandidatesForTopUp.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, resultCountUsed);
+          if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
           }
           
           // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-        if (finalHandlesGuaranteed.length < resultCountUsed) {
+        if (finalHandlesGuaranteed.length < finalResultCount) {
             const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
               const descPlain = cleanDescription((p as any).description || null);
               const desc1000 = descPlain.substring(0, 1000);
@@ -2918,7 +2908,7 @@ export async function proxySessionStartAction(
                 optionValues: (p as any).optionValues ?? {},
               } as EnrichedCandidate;
             });
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, resultCountUsed);
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
           }
         }
       }
@@ -2927,7 +2917,7 @@ export async function proxySessionStartAction(
         "[App Proxy] Final handles after top-up:",
         finalHandlesGuaranteed.length,
         "requested:",
-        resultCountUsed
+        finalResultCount
       );
 
       finalHandles = finalHandlesGuaranteed;
@@ -2988,7 +2978,7 @@ export async function proxySessionStartAction(
       const diverseHandles = ensureResultDiversity(
         finalHandlesGuaranteed.slice(0, targetCount),
         candidatesForDiversity,
-        resultCountUsed
+        finalResultCount
       );
       console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandlesGuaranteed.slice(0, targetCount).length, ")");
 
@@ -3043,10 +3033,10 @@ export async function proxySessionStartAction(
           chargeResult = await chargeConciergeSessionOnce({
             sessionToken,
             shopId: shop.id,
-            resultCount: resultCountUsed, // Use requested count (8/12/16), not actual returned count
+            resultCount: finalResultCount, // Use requested count (8/12/16), not actual returned count
             experienceId: experience.id,
           });
-          console.log("[App Proxy] Session charged for", resultCountUsed, "results, overage delta:", chargeResult.overageCreditsX2Delta);
+          console.log("[App Proxy] Session charged for", finalResultCount, "results, overage delta:", chargeResult.overageCreditsX2Delta);
 
           // Handle overage charges if any
           if (chargeResult.overageCreditsX2Delta > 0) {
@@ -3207,7 +3197,7 @@ export async function proxySessionStartAction(
     sessionId: sessionToken,
     experienceIdUsed: experienceIdUsed,
     modeUsed: modeUsed,
-    resultCountUsed: resultCountUsed,
+    finalResultCount: finalResultCount,
     questions: questions,
     redirectTo: redirectPath,
     billing: {

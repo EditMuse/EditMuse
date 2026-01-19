@@ -22,7 +22,6 @@ export default function App() {
         <s-link href="/app/experiences">Experiences</s-link>
         <s-link href="/app/usage">Usage</s-link>
         <s-link href="/app/billing">Billing</s-link>
-        <s-link href="/app/settings">Settings</s-link>
         <s-link href="/app/experiments">Experiments</s-link>
         <s-link href="/app/diagnose">Diagnose</s-link>
       </s-app-nav>
