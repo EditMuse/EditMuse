@@ -2464,57 +2464,151 @@ export async function proxySessionStartAction(
         reasoningParts.push("Products selected using default ranking.");
       }
 
-      // TOP-UP PASSES
-      let pass = 2;
-      while (finalHandles.length < targetCount && pass <= MAX_AI_PASSES) {
-        offset += aiWindow;
-        const missing = targetCount - finalHandles.length;
-        const window = buildWindow(offset, used);
+      // TOP-UP PASSES (skip for bundle mode - handled separately)
+      if (!isBundleMode) {
+        let pass = 2;
+        while (finalHandles.length < targetCount && pass <= MAX_AI_PASSES) {
+          offset += aiWindow;
+          const missing = targetCount - finalHandles.length;
+          const window = buildWindow(offset, used);
 
-        if (window.length === 0) break;
+          if (window.length === 0) break;
 
-        const aiTopUp = await rankProductsWithAI(
-          userIntent,
-          window,
-          missing,
-          shop.id,
-          sessionToken, // IMPORTANT: prevents double charge within 5 minutes
-          variantConstraints2,
-          variantPreferences,
-          includeTerms,
-          avoidTerms,
-          {
-            hardTerms,
-            hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+          const aiTopUp = await rankProductsWithAI(
+            userIntent,
+            window,
+            missing,
+            shop.id,
+            sessionToken, // IMPORTANT: prevents double charge within 5 minutes
+            variantConstraints2,
+            variantPreferences,
+            includeTerms,
             avoidTerms,
-            trustFallback,
-          }
-        );
+            {
+              hardTerms,
+              hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+              avoidTerms,
+              trustFallback,
+            }
+          );
 
-        if (aiTopUp.rankedHandles?.length) {
-          // Filter cached handles against current product availability
-          const validTopUpHandles = aiTopUp.rankedHandles.filter((handle: string) => {
-            const candidate = sortedCandidates.find(c => c.handle === handle);
-            if (!candidate) return false;
-            // If inStockOnly is enabled, filter out unavailable products
-            if (experience.inStockOnly && !candidate.available) return false;
-            return true;
-          });
-          
-          let added = 0;
-          for (const h of validTopUpHandles) {
-            if (!used.has(h) && finalHandles.length < targetCount) {
-              used.add(h);
-              finalHandles.push(h);
-              added++;
+          if (aiTopUp.rankedHandles?.length) {
+            // Filter cached handles against current product availability
+            const validTopUpHandles = aiTopUp.rankedHandles.filter((handle: string) => {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (!candidate) return false;
+              // If inStockOnly is enabled, filter out unavailable products
+              if (experience.inStockOnly && !candidate.available) return false;
+              return true;
+            });
+            
+            let added = 0;
+            for (const h of validTopUpHandles) {
+              if (!used.has(h) && finalHandles.length < targetCount) {
+                used.add(h);
+                finalHandles.push(h);
+                added++;
+              }
+            }
+            if (added > 0) {
+              reasoningParts.push("Expanded search to find additional close matches.");
             }
           }
-          if (added > 0) {
-            reasoningParts.push("Expanded search to find additional close matches.");
+
+          pass++;
+        }
+      } else if (isBundleMode && finalHandles.length < resultCountUsed) {
+        // BUNDLE-SAFE TOP-UP: Only from bundle item pools
+        console.log("[Bundle] Top-up needed: have", finalHandles.length, "need", resultCountUsed);
+        
+        // Rebuild item pools from sortedCandidates (they have _bundleItemIndex metadata)
+        const bundleItemPools = new Map<number, EnrichedCandidate[]>();
+        for (const c of sortedCandidates) {
+          const itemIdx = (c as any)._bundleItemIndex;
+          if (typeof itemIdx === "number") {
+            if (!bundleItemPools.has(itemIdx)) {
+              bundleItemPools.set(itemIdx, []);
+            }
+            bundleItemPools.get(itemIdx)!.push(c);
           }
         }
-
-        pass++;
+        
+        // Count current handles per item
+        const handlesByItem = new Map<number, string[]>();
+        const usedSet = new Set(finalHandles);
+        
+        for (const handle of finalHandles) {
+          const candidate = sortedCandidates.find(c => c.handle === handle);
+          if (candidate) {
+            const itemIdx = (candidate as any)._bundleItemIndex;
+            if (typeof itemIdx === "number") {
+              if (!handlesByItem.has(itemIdx)) {
+                handlesByItem.set(itemIdx, []);
+              }
+              handlesByItem.get(itemIdx)!.push(handle);
+            }
+          }
+        }
+        
+        // Calculate target distribution (roughly even)
+        const targetPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+        const topUpSourceCounts = new Map<number, number>();
+        
+        // Round-robin top-up from bundle item pools
+        const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+        let roundRobinIdx = 0;
+        const rejectedTopUpHandles: string[] = [];
+        
+        while (finalHandles.length < resultCountUsed && roundRobinIdx < 200) { // Safety limit
+          const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+          const pool = bundleItemPools.get(currentItemIdx) || [];
+          const currentHandles = handlesByItem.get(currentItemIdx) || [];
+          
+          // Check if this item needs more handles
+          if (currentHandles.length < targetPerItem && pool.length > currentHandles.length) {
+            // Find next candidate from this item's pool that's not already used
+            for (const candidate of pool) {
+              if (!usedSet.has(candidate.handle)) {
+                // Category guard: verify candidate belongs to this item pool
+                const haystack = [
+                  candidate.title || "",
+                  candidate.productType || "",
+                  (candidate.tags || []).join(" "),
+                  candidate.vendor || "",
+                  candidate.searchText || "",
+                ].join(" ");
+                
+                const itemHardTerms = bundleItemsWithBudget[currentItemIdx].hardTerms;
+                const belongsToItem = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                
+                if (belongsToItem) {
+                  finalHandles.push(candidate.handle);
+                  usedSet.add(candidate.handle);
+                  handlesByItem.get(currentItemIdx)!.push(candidate.handle);
+                  topUpSourceCounts.set(currentItemIdx, (topUpSourceCounts.get(currentItemIdx) || 0) + 1);
+                  break;
+                } else {
+                  rejectedTopUpHandles.push(candidate.handle);
+                }
+              }
+            }
+          }
+          
+          roundRobinIdx++;
+          if (roundRobinIdx > 200) break;
+        }
+        
+        // Log top-up source counts
+        const topUpSourceText = bundleItemsWithBudget.map((item, idx) => {
+          const count = topUpSourceCounts.get(idx) || 0;
+          const itemName = item.hardTerms[0];
+          return `${itemName}=${count}`;
+        }).join(" ");
+        console.log("[Bundle] topUpSourceCounts:", topUpSourceText);
+        
+        if (rejectedTopUpHandles.length > 0) {
+          console.log("[Bundle] rejectedTopUpHandles:", rejectedTopUpHandles.slice(0, 10).join(", "), rejectedTopUpHandles.length > 10 ? `... (${rejectedTopUpHandles.length} total)` : "");
+        }
       }
       } // End of single-item path else block
 
@@ -2675,59 +2769,195 @@ export async function proxySessionStartAction(
       // Hard guarantee: top-up after AI ranking (intent-safe enforcement)
       let finalHandlesGuaranteed = uniq(validatedHandles);
 
-      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
-      if (!trustFallback) {
-        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
-        if (gatedCandidates.length > 0) {
-          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+      // Bundle-safe top-up: only from bundle item pools
+      if (isBundleMode && bundleIntent.items.length >= 2) {
+        // Rebuild bundle item pools from sortedCandidates
+        const bundleItemPools = new Map<number, EnrichedCandidate[]>();
+        for (const c of sortedCandidates) {
+          const itemIdx = (c as any)._bundleItemIndex;
+          if (typeof itemIdx === "number") {
+            if (!bundleItemPools.has(itemIdx)) {
+              bundleItemPools.set(itemIdx, []);
+            }
+            bundleItemPools.get(itemIdx)!.push(c);
+          }
         }
-        // If still short after gated top-up, return fewer results (better than drift)
-        console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
+        
+        // Union of all bundle item pools (bundle-safe source)
+        const bundleSafePool: EnrichedCandidate[] = [];
+        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+          const pool = bundleItemPools.get(itemIdx) || [];
+          bundleSafePool.push(...pool);
+        }
+        
+        // Category guard function: verify handle belongs to at least one bundle item
+        function belongsToBundleItem(candidate: EnrichedCandidate): boolean {
+          const haystack = [
+            candidate.title || "",
+            candidate.productType || "",
+            (candidate.tags || []).join(" "),
+            candidate.vendor || "",
+            candidate.searchText || "",
+          ].join(" ");
+          
+          for (const bundleItem of bundleItemsWithBudget) {
+            const hasMatch = bundleItem.hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasMatch) return true;
+          }
+          return false;
+        }
+        
+        // Top-up from bundle-safe pool with category guards and round-robin distribution
+        const have = new Set(finalHandlesGuaranteed);
+        const rejectedTopUpHandles: string[] = [];
+        
+        // Count current handles per item
+        const handlesByItem = new Map<number, string[]>();
+        for (const handle of finalHandlesGuaranteed) {
+          const candidate = sortedCandidates.find(c => c.handle === handle);
+          if (candidate) {
+            const itemIdx = (candidate as any)._bundleItemIndex;
+            if (typeof itemIdx === "number") {
+              if (!handlesByItem.has(itemIdx)) {
+                handlesByItem.set(itemIdx, []);
+              }
+              handlesByItem.get(itemIdx)!.push(handle);
+            }
+          }
+        }
+        
+        // Calculate target distribution (roughly even)
+        const targetPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+        const topUpSourceCounts = new Map<number, number>();
+        
+        // Round-robin top-up from bundle item pools
+        const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
+        let roundRobinIdx = 0;
+        
+        while (finalHandlesGuaranteed.length < resultCountUsed && roundRobinIdx < 200) {
+          const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+          const pool = bundleItemPools.get(currentItemIdx) || [];
+          const currentHandles = handlesByItem.get(currentItemIdx) || [];
+          
+          // Check if this item needs more handles
+          if (currentHandles.length < targetPerItem && pool.length > currentHandles.length) {
+            // Find next candidate from this item's pool that's not already used
+            for (const candidate of pool) {
+              if (!candidate?.handle) continue;
+              if (have.has(candidate.handle)) continue;
+              
+              // Category guard: verify candidate belongs to this item pool
+              const haystack = [
+                candidate.title || "",
+                candidate.productType || "",
+                (candidate.tags || []).join(" "),
+                candidate.vendor || "",
+                candidate.searchText || "",
+              ].join(" ");
+              
+              const itemHardTerms = bundleItemsWithBudget[currentItemIdx].hardTerms;
+              const belongsToItem = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+              
+              if (belongsToItem) {
+                finalHandlesGuaranteed.push(candidate.handle);
+                have.add(candidate.handle);
+                handlesByItem.get(currentItemIdx)!.push(candidate.handle);
+                topUpSourceCounts.set(currentItemIdx, (topUpSourceCounts.get(currentItemIdx) || 0) + 1);
+                break;
+              } else {
+                rejectedTopUpHandles.push(candidate.handle);
+              }
+            }
+          }
+          
+          roundRobinIdx++;
+          if (roundRobinIdx > 200) break;
+        }
+        
+        // Log top-up source counts
+        const topUpSourceText = bundleItemsWithBudget.map((item, idx) => {
+          const count = topUpSourceCounts.get(idx) || 0;
+          const itemName = item.hardTerms[0];
+          return `${itemName}=${count}`;
+        }).join(" ");
+        console.log("[Bundle] topUpSourceCounts:", topUpSourceText);
+        
+        if (rejectedTopUpHandles.length > 0) {
+          console.log("[Bundle] rejectedTopUpHandles:", rejectedTopUpHandles.slice(0, 10).join(", "), rejectedTopUpHandles.length > 10 ? `... (${rejectedTopUpHandles.length} total)` : "");
+        }
+        
+        // If trustFallback=true and still short, allow broader pool but still with category guards
+        if (trustFallback && finalHandlesGuaranteed.length < resultCountUsed) {
+          // Use allCandidatesForTopUp but filter by category guards
+          for (const candidate of allCandidatesForTopUp) {
+            if (finalHandlesGuaranteed.length >= resultCountUsed) break;
+            if (!candidate?.handle) continue;
+            if (have.has(candidate.handle)) continue;
+            
+            if (belongsToBundleItem(candidate)) {
+              have.add(candidate.handle);
+              finalHandlesGuaranteed.push(candidate.handle);
+            }
+          }
+        }
+        
+        console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
       } else {
-        // Trust fallback: can use broader pool, but prefer gated first
-        if (gatedCandidates.length > 0) {
-          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
-        }
-        
-        // If still short, use broader pool (allCandidatesForTopUp)
-        if (finalHandlesGuaranteed.length < resultCountUsed && allCandidatesForTopUp.length > 0) {
-          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, resultCountUsed);
-        }
-        
-        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-      if (finalHandlesGuaranteed.length < resultCountUsed) {
-          const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
-            const descPlain = cleanDescription((p as any).description || null);
-            const desc1000 = descPlain.substring(0, 1000);
-            return {
-              handle: p.handle,
-              title: p.title,
-              productType: (p as any).productType || null,
-              tags: p.tags || [],
-              vendor: (p as any).vendor || null,
-              price: p.priceAmount || p.price || null,
-              description: (p as any).description || null,
-              descPlain,
-              desc1000,
-              searchText: buildSearchText({
+        // SINGLE-ITEM PATH: Existing top-up logic
+        // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+        if (!trustFallback) {
+          // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+          if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+          }
+          // If still short after gated top-up, return fewer results (better than drift)
+          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
+        } else {
+          // Trust fallback: can use broader pool, but prefer gated first
+          if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, resultCountUsed);
+          }
+          
+          // If still short, use broader pool (allCandidatesForTopUp)
+          if (finalHandlesGuaranteed.length < resultCountUsed && allCandidatesForTopUp.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, resultCountUsed);
+          }
+          
+          // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+        if (finalHandlesGuaranteed.length < resultCountUsed) {
+            const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
+              const descPlain = cleanDescription((p as any).description || null);
+              const desc1000 = descPlain.substring(0, 1000);
+              return {
+                handle: p.handle,
                 title: p.title,
                 productType: (p as any).productType || null,
-                vendor: (p as any).vendor || null,
                 tags: p.tags || [],
-                optionValues: (p as any).optionValues ?? {},
+                vendor: (p as any).vendor || null,
+                price: p.priceAmount || p.price || null,
+                description: (p as any).description || null,
+                descPlain,
+                desc1000,
+                searchText: buildSearchText({
+                  title: p.title,
+                  productType: (p as any).productType || null,
+                  vendor: (p as any).vendor || null,
+                  tags: p.tags || [],
+                  optionValues: (p as any).optionValues ?? {},
+                  sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                  colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                  materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                  desc1000,
+                }),
+                available: p.available,
                 sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
                 colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
                 materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-                desc1000,
-              }),
-              available: p.available,
-              sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
-              colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
-              materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-              optionValues: (p as any).optionValues ?? {},
-            } as EnrichedCandidate;
-          });
-          finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, resultCountUsed);
+                optionValues: (p as any).optionValues ?? {},
+              } as EnrichedCandidate;
+            });
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, resultCountUsed);
+          }
         }
       }
 

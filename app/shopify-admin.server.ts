@@ -3,6 +3,7 @@
  */
 
 import prisma from "~/db.server";
+import { cleanDescription } from "~/utils/text-indexing.server";
 
 /**
  * Gets access token from Session table for a shop domain
@@ -303,84 +304,156 @@ export async function fetchShopifyProducts({
   available: boolean;
   status: string | null;
 }>> {
-  const apiVersion = "2025-01";
-  // Note: REST API variants may not include inventory_quantity by default
-  // If inventory tracking is disabled, inventory_quantity will be null/undefined
-  const fields = "id,title,handle,images,variants,options,tags,status";
-  
-  // If collectionIds provided, fetch from collections, otherwise fetch all products
-  let products: any[] = [];
-  
-  if (collectionIds && collectionIds.length > 0) {
-    // Fetch products from each collection and merge
-    const allProducts = new Map<string, any>();
+  // Try GraphQL first (primary)
+  try {
+    console.log("[Shopify Fetch] Using GraphQL (primary)");
+    const graphqlProducts = await fetchShopifyProductsGraphQL({
+      shopDomain,
+      accessToken,
+      limit,
+      collectionIds,
+    });
     
-    for (const collectionId of collectionIds) {
-      if (allProducts.size >= limit) break;
+    // Map GraphQL products to expected shape
+    return graphqlProducts.map(p => ({
+      handle: p.handle,
+      title: p.title,
+      image: p.image,
+      price: p.price,
+      priceAmount: p.priceAmount,
+      currencyCode: p.currencyCode,
+      tags: p.tags,
+      available: p.available,
+      status: p.status,
+      // GraphQL provides these additional fields
+      url: p.url,
+      productType: p.productType,
+      vendor: p.vendor,
+      description: p.description,
+    } as any));
+  } catch (error) {
+    // Fallback to REST on GraphQL error
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.log("[Shopify Fetch] GraphQL failed, falling back to REST:", errorMessage);
+    
+    // REST fallback implementation
+    const apiVersion = "2025-01";
+    // Include richer fields to match GraphQL output
+    const fields = "id,title,handle,images,variants,options,tags,status,product_type,vendor,body_html";
+    
+    // If collectionIds provided, fetch from collections, otherwise fetch all products
+    let products: any[] = [];
+    
+    if (collectionIds && collectionIds.length > 0) {
+      // Fetch products from each collection and merge
+      const allProducts = new Map<string, any>();
+      
+      for (const collectionId of collectionIds) {
+        if (allProducts.size >= limit) break;
 
-      try {
-        const url = `https://${shopDomain}/admin/api/${apiVersion}/collections/${collectionId}/products.json?limit=250&fields=${fields}`;
+        try {
+          const url = `https://${shopDomain}/admin/api/${apiVersion}/collections/${collectionId}/products.json?limit=250&fields=${fields}`;
 
-        const remaining = limit - allProducts.size;
-        const fetched = await fetchRestPaged<any>(url, accessToken, remaining);
+          const remaining = limit - allProducts.size;
+          const fetched = await fetchRestPaged<any>(url, accessToken, remaining);
 
-        for (const p of fetched) allProducts.set(p.id, p);
-      } catch (error) {
-        console.error(`[Shopify Admin] Error fetching collection ${collectionId}:`, error);
+          for (const p of fetched) allProducts.set(p.id, p);
+        } catch (error) {
+          console.error(`[Shopify Admin] Error fetching collection ${collectionId}:`, error);
+        }
       }
+      
+      products = Array.from(allProducts.values());
+    } else {
+      // Fetch all products with pagination
+      const baseUrl = `https://${shopDomain}/admin/api/${apiVersion}/products.json?limit=250&fields=${fields}`;
+      products = await fetchRestPaged<any>(baseUrl, accessToken, limit);
     }
-    
-    products = Array.from(allProducts.values());
-  } else {
-    // Fetch all products with pagination
-    const baseUrl = `https://${shopDomain}/admin/api/${apiVersion}/products.json?limit=250&fields=${fields}`;
-    products = await fetchRestPaged<any>(baseUrl, accessToken, limit);
-  }
 
-  return products.map((product: any) => {
-    const rawPrice = product.variants?.[0]?.price || null;
-    // REST API returns prices as strings in major units already
-    // Apply same conversion logic as GraphQL for consistency
-    let priceAmount: string | null = null;
-    if (rawPrice !== null) {
-      const numAmount = parseFloat(rawPrice);
-      // Heuristic: if amount > 10000, almost certainly in cents
-      // If amount between 1000-10000, check if dividing by 100 gives reasonable value (< 1000)
-      if (numAmount > 10000) {
-        priceAmount = (numAmount / 100).toFixed(2);
-      } else if (numAmount > 1000) {
-        const majorUnits = numAmount / 100;
-        // If dividing by 100 gives a value < 1000, assume it's in cents
-        if (majorUnits < 1000 && majorUnits >= 1) {
-          priceAmount = majorUnits.toFixed(2);
-        } else {
-          priceAmount = numAmount.toString();
+    const mapped = products.map((product: any) => {
+      const variants = Array.isArray(product.variants) ? product.variants : [];
+      
+      // Price calculation: compute min price across variants
+      let priceAmount: string | null = null;
+      if (variants.length > 0) {
+        const prices = variants
+          .map((v: any) => {
+            const priceStr = v?.price;
+            if (typeof priceStr === "string") {
+              const parsed = parseFloat(priceStr);
+              return isNaN(parsed) ? null : parsed;
+            }
+            return null;
+          })
+          .filter((p: number | null): p is number => p !== null);
+        
+        if (prices.length > 0) {
+          const min = Math.min(...prices);
+          priceAmount = isFinite(min) ? min.toFixed(2) : null;
+        }
+      }
+      
+      // Availability calculation: check inventory_quantity, fallback to status ACTIVE
+      let available = false;
+      if (variants.length > 0) {
+        // Check if any variant has inventory_quantity > 0
+        available = variants.some((v: any) => (v.inventory_quantity ?? 0) > 0);
+        
+        // If inventory_quantity is null/undefined for all variants, fallback to status check
+        if (!available && variants.every((v: any) => v.inventory_quantity === null || v.inventory_quantity === undefined)) {
+          available = product.status === "ACTIVE";
         }
       } else {
-        // Already in major units (or very small price)
-        priceAmount = numAmount.toString();
+        // No variants: use status as fallback
+        available = product.status === "ACTIVE";
       }
-    }
+      
+      // Clean description from body_html
+      const description = product.body_html ? cleanDescription(product.body_html) : null;
+      
+      // Extract optionValues and facet arrays from variants (REST fallback)
+      const facets = extractVariantFacetValues(product);
+      const optionValues = extractOptionValues(product);
+      
+      return {
+        handle: product.handle,
+        title: product.title,
+        image: product.images?.[0]?.src || null,
+        price: priceAmount, // Keep for backwards compatibility
+        priceAmount: priceAmount,
+        currencyCode: null, // REST API doesn't provide currency code
+        url: `/products/${product.handle}`,
+        tags: product.tags ? product.tags.split(",").map((t: string) => t.trim()) : [],
+        available: available,
+        productType: product.product_type || null,
+        vendor: product.vendor || null,
+        description: description,
+        status: product.status || null,
+        // Extract option intelligence from variants (REST fallback)
+        optionValues: optionValues,
+        sizes: facets.sizes,
+        colors: facets.colors,
+        materials: facets.materials,
+        // Preserve variants for downstream processing
+        variants: variants,
+      } as any;
+    });
     
-    const facets = extractVariantFacetValues(product);
-    const optionValues = extractOptionValues(product);
+    // Log REST fallback mapping stats
+    const totalVariants = mapped.reduce((sum, p) => sum + ((p as any).variants?.length || 0), 0);
+    const withDescription = mapped.filter(p => p.description).length;
+    const withProductType = mapped.filter(p => p.productType).length;
+    const withVendor = mapped.filter(p => p.vendor).length;
+    console.log("[Shopify Fetch] REST fallback products mapped", {
+      count: mapped.length,
+      withDescription,
+      withProductType,
+      withVendor,
+      totalVariants,
+    });
     
-    return {
-      handle: product.handle,
-      title: product.title,
-      image: product.images?.[0]?.src || null,
-      price: priceAmount, // Keep for backwards compatibility
-      priceAmount: priceAmount,
-      currencyCode: null, // REST API doesn't provide currency code easily
-      tags: product.tags ? product.tags.split(",").map((t: string) => t.trim()) : [],
-      available: computeAvailabilityFromVariants(product.variants),
-      status: product.status || null,
-      sizes: facets.sizes,
-      colors: facets.colors,
-      materials: facets.materials,
-      optionValues,
-    };
-  });
+    return mapped;
+  }
 }
 
 /**
@@ -448,6 +521,17 @@ export async function fetchShopifyProductsGraphQL({
                   vendor
                   description
                   status
+                  options {
+                    name
+                    values
+                  }
+                  variants(first: 1) {
+                    edges {
+                      node {
+                        inventoryPolicy
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -493,6 +577,17 @@ export async function fetchShopifyProductsGraphQL({
               vendor
               description
               status
+              options {
+                name
+                values
+              }
+              variants(first: 1) {
+                edges {
+                  node {
+                    inventoryPolicy
+                  }
+                }
+              }
             }
           }
         }
@@ -565,7 +660,7 @@ export async function fetchShopifyProductsGraphQL({
     products = data.data?.products?.edges?.map((edge: any) => edge.node) || [];
   }
 
-  return products.map((node: any) => {
+  const mapped = products.map((node: any) => {
     const priceData = node.priceRange?.minVariantPrice;
     const rawAmount = priceData?.amount || null;
     const currencyCode = priceData?.currencyCode || null;
@@ -594,6 +689,36 @@ export async function fetchShopifyProductsGraphQL({
       }
     }
     
+    // Extract optionValues from options
+    const optionValues: Record<string, string[]> = {};
+    const options = Array.isArray(node.options) ? node.options : [];
+    for (const opt of options) {
+      if (opt?.name && Array.isArray(opt.values)) {
+        const key = opt.name.toLowerCase();
+        optionValues[key] = opt.values.filter((v: any) => v != null).map((v: any) => String(v));
+      }
+    }
+    
+    // Build convenience arrays for sizes/colors/materials
+    const sizes: string[] = optionValues["size"] || [];
+    const colors: string[] = (optionValues["color"] || []).concat(optionValues["colour"] || []);
+    const materials: string[] = optionValues["material"] || [];
+    
+    // Improved availability heuristic
+    let available = false;
+    const totalInventory = node.totalInventory ?? 0;
+    if (totalInventory > 0) {
+      available = true;
+    } else {
+      // Check if first variant has inventoryPolicy = "CONTINUE"
+      const firstVariant = node.variants?.edges?.[0]?.node;
+      if (firstVariant?.inventoryPolicy === "CONTINUE") {
+        available = true;
+      } else {
+        available = false;
+      }
+    }
+    
     return {
       handle: node.handle,
       title: node.title,
@@ -603,13 +728,36 @@ export async function fetchShopifyProductsGraphQL({
       currencyCode: currencyCode,
       url: node.onlineStoreUrl || `/products/${node.handle}`,
       tags: node.tags || [],
-      available: (node.totalInventory ?? 0) > 0,
+      available: available,
       productType: node.productType || null,
       vendor: node.vendor || null,
       description: node.description || null,
       status: node.status || null,
-    };
+      // Add option intelligence
+      optionValues: optionValues,
+      sizes: sizes,
+      colors: colors,
+      materials: materials,
+    } as any;
   });
+  
+  // Debug log for GraphQL mapping
+  const withOptions = mapped.filter(p => Object.keys((p as any).optionValues || {}).length > 0).length;
+  const sizeValues = mapped.reduce((sum, p) => sum + ((p as any).sizes?.length || 0), 0);
+  const colorValues = mapped.reduce((sum, p) => sum + ((p as any).colors?.length || 0), 0);
+  const materialValues = mapped.reduce((sum, p) => sum + ((p as any).materials?.length || 0), 0);
+  const availableTrueCount = mapped.filter(p => p.available).length;
+  
+  console.log("[Shopify Fetch] GraphQL mapped", {
+    count: mapped.length,
+    withOptions,
+    avgSizeValues: mapped.length > 0 ? (sizeValues / mapped.length).toFixed(1) : "0",
+    avgColorValues: mapped.length > 0 ? (colorValues / mapped.length).toFixed(1) : "0",
+    avgMaterialValues: mapped.length > 0 ? (materialValues / mapped.length).toFixed(1) : "0",
+    availableTrueCount,
+  });
+  
+  return mapped;
 }
 
 /**
