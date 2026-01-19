@@ -68,13 +68,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // ✅ If results are already saved, fetch those exact products by handle and return.
   // This prevents "0 products" when the candidate pool is small/filtered.
   // Pure path: no experience filters, no candidate fetching, no inStockOnly filtering.
+  // NEVER re-rank when ConciergeResult exists - return immediately.
   if (session.result) {
     const raw = session.result.productHandles;
     const savedHandles = Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string") : [];
 
-    console.log("[App Proxy] Using saved ConciergeResult with", savedHandles.length, "handles - fetching by handles");
-    console.log("[App Proxy] Saved handles:", savedHandles);
-
+    console.log("[App Proxy] /session using saved ConciergeResult");
+    
     if (savedHandles.length > 0) {
       const savedProducts = await fetchShopifyProductsByHandlesGraphQL({
         shopDomain,
@@ -100,10 +100,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
       console.log("[App Proxy] Returning", ordered.length, "products (saved-by-handle)");
 
-      if (ordered.length === 0) {
-        console.log("[App Proxy] WARNING: Saved result exists but no products were fetched by handle.");
-      }
-
       return Response.json({
         ok: true,
         sid: sessionId,
@@ -113,8 +109,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         warning: ordered.length === 0 ? "Saved results could not be loaded (products missing/unpublished)" : null,
         mode: "saved",
       });
+    } else {
+      // ConciergeResult exists but has no handles - return empty but don't re-rank
+      console.log("[App Proxy] /session ConciergeResult exists but productHandles is empty - returning empty results");
+      return Response.json({
+        ok: true,
+        sid: sessionId,
+        status: "COMPLETE",
+        products: [],
+        reasoning: session.result.reasoning || null,
+        warning: "Saved result exists but contains no product handles",
+        mode: "saved",
+      });
     }
   }
+  
+  console.log("[App Proxy] /session missing ConciergeResult -> ranking");
 
   // Load Experience if available
   let experience = null;
@@ -181,23 +191,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       console.log("[App Proxy] After inStockOnly filter:", candidates.length, "products");
     }
 
-    // Check if session has saved result (ConciergeResult)
+    // No ConciergeResult - proceed with AI ranking
     let rankedHandles: string[] = [];
     let reasoning: string | null = null;
     let usedFallback = false;
-
-    if (session.result) {
-      // ConciergeResult exists - use saved handles in exact order, skip AI ranking
-      const productHandlesRaw = session.result.productHandles;
-      const savedHandles = Array.isArray(productHandlesRaw)
-        ? (productHandlesRaw as any[]).filter((h): h is string => typeof h === "string")
-        : [];
-      
-      console.log("[App Proxy] Using saved ConciergeResult with", savedHandles.length, "handles - skipping AI ranking");
-      rankedHandles = savedHandles;
-      reasoning = session.result.reasoning || null;
-      usedFallback = false; // Using saved results, not fallback
-    } else {
       // No ConciergeResult - proceed with AI ranking
       console.log("[App Proxy] No ConciergeResult found - proceeding with AI ranking");
 
@@ -381,7 +378,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           resultCount
         );
       }
-    }
 
     // Map handles back to products in the exact order of rankedHandles
     const handleMap = new Map(candidates.map(p => [p.handle, p]));

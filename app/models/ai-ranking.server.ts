@@ -77,7 +77,7 @@ interface StructuredRankingResult {
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
-const TIMEOUT_MS = 12000; // 12 seconds
+const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "45000"); // Configurable timeout, default 45 seconds
 const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
@@ -434,34 +434,54 @@ export async function rankProductsWithAI(
   }
   
   // Build product list for prompt (limit to 200)
-  // Use desc1000 if available (from Layer 1 enrichment), otherwise clean description
+  // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
   const productList = candidates.slice(0, 200).map((p, idx) => {
-    const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.join(", ") : "none";
-    const colors = (p.colors && p.colors.length > 0) ? p.colors.join(", ") : "none";
-    const materials = (p.materials && p.materials.length > 0) ? p.materials.join(", ") : "none";
-    const optionValues = p.optionValues ? JSON.stringify(p.optionValues) : "{}";
+    // Cap tags to max 20
+    const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
     
-    // Use desc1000 if available (from Layer 1 enrichment), otherwise clean description
+    // Cap sizes/colors/materials to max 20 each
+    const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 20).join(", ") : "none";
+    const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 20).join(", ") : "none";
+    const materials = (p.materials && p.materials.length > 0) ? p.materials.slice(0, 20).join(", ") : "none";
+    
+    // Cap optionValues: max 3 keys, max 10 values per key
+    let optionValuesJson = "{}";
+    if (p.optionValues && typeof p.optionValues === "object") {
+      const cappedOptionValues: Record<string, string[]> = {};
+      const keys = Object.keys(p.optionValues).slice(0, 3);
+      for (const key of keys) {
+        const values = (p.optionValues[key] || []);
+        if (Array.isArray(values)) {
+          cappedOptionValues[key] = values.slice(0, 10);
+        }
+      }
+      optionValuesJson = JSON.stringify(cappedOptionValues);
+    }
+    
+    // Use desc1000 if available, truncate to 500 chars (reduced from 1000)
     const descriptionText = (p as any).desc1000 
-      ? (p as any).desc1000 
-      : cleanDescription(p.description) || "No description available";
+      ? ((p as any).desc1000.substring(0, 500))
+      : (cleanDescription(p.description) || "No description available").substring(0, 500);
     
-    // Include searchText if available
-    const searchTextField = (p as any).searchText ? `   searchText: ${(p as any).searchText}` : "";
+    // Remove searchText entirely - not needed for AI prompt
     
     return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
    productType: ${p.productType || "unknown"}
    vendor: ${p.vendor || "unknown"}
-   tags: ${p.tags.join(", ") || "none"}
+   tags: ${tags}
    available: ${p.available ? "yes" : "no"}
    price: ${p.price || "unknown"}
    sizes: ${sizes}
    colors: ${colors}
    materials: ${materials}
-   optionValues: ${optionValues}
-   desc1000: ${descriptionText}${searchTextField ? "\n" + searchTextField : ""}`;
+   optionValues: ${optionValuesJson}
+   desc1000: ${descriptionText}`;
   }).join("\n\n");
+  
+  // Log payload size
+  const productListJsonChars = productList.length;
+  console.log("[AI Ranking] productListJsonChars=", productListJsonChars);
 
   const constraints = variantConstraints ?? { size: null, color: null, material: null };
   const prefs = variantPreferences ?? {};
