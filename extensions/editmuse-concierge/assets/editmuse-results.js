@@ -616,110 +616,173 @@
     }
     debug('fetching', url);
 
-    fetch(url, {
-      credentials: 'same-origin'
-    })
-    .then(function(r) {
-      debug('Response status:', r.status, r.statusText);
-      if (!r.ok) {
-        return r.json().then(function(data) {
-          throw new Error(data.error || 'Failed to load results');
-        });
-      }
-      return r.json();
-    })
-    .then(function(data) {
-      debug('Parsed JSON:', data);
-      
-      // Check if we have products array (new format) or recommendations array (old format)
-      var products = data.products || [];
-      
-      // Legacy support: if recommendations exist but products don't, convert recommendations
-      if (products.length === 0 && data.recommendations && data.recommendations.length > 0) {
-        // Old format - fetch product details from .js endpoint
-        var productPromises = data.recommendations.map(function(item) {
-          return fetch('/products/' + item.handle + '.js')
-            .then(function(r) {
-              if (!r.ok) throw new Error('Product not found');
-              return r.json();
-            })
-            .then(function(product) {
-              return {
-                handle: item.handle,
-                title: product.title || '',
-                image: product.featured_image || null,
-                price: product.variants && product.variants[0] ? product.variants[0].price : null,
-                url: '/products/' + item.handle
-              };
-            })
-            .catch(function(err) {
-              debug('Error fetching product', item.handle, ':', err);
-              return {
-                handle: item.handle,
-                title: item.handle,
-                image: null,
-                price: null,
-                url: '/products/' + item.handle
-              };
-            });
-        });
+    // Retry logic for pending responses
+    var retryCount = 0;
+    var maxRetries = 3;
+    
+    function fetchSession(attemptNumber) {
+      fetch(url, {
+        credentials: 'same-origin'
+      })
+      .then(function(r) {
+        debug('Response status:', r.status, r.statusText);
         
-        Promise.all(productPromises).then(function(fetchedProducts) {
-          renderProducts(fetchedProducts);
-          
-          // Fire RESULTS_VIEWED once after products render
-          var sessionId = getSessionId();
-          sendEvent('RESULTS_VIEWED', sessionId, {
-            page: window.location.pathname,
-            ref: document.referrer || null
-          });
-          
-          // For legacy format, use mode from API if provided, otherwise default to null (treated as AI)
-          var detectedMode = data.mode || null;
-          showReasoning(data.reasoning, detectedMode, data.error, fetchedProducts.length);
-        });
-        return;
-      }
-      
-      // New format: products array with full data
-      debug('Products array length:', products.length);
-      debug('Data ok:', data.ok, 'Status:', data.status, 'Mode:', data.mode);
-      
-      // Use mode from API if provided, otherwise default to null (will be treated as AI)
-      // Only treat as fallback if mode is explicitly 'placeholder' or 'fallback'
-      var detectedMode = data.mode || null;
-      
-      debug('API response - mode:', detectedMode, 'reasoning:', data.reasoning, 'error:', data.error);
-      
-      if (data.ok && products.length > 0) {
-        debug('Rendering', products.length, 'products');
-        renderProducts(products);
+        // Check content-type before parsing JSON
+        var contentType = r.headers.get('content-type') || '';
+        var isJson = contentType.includes('application/json');
         
-        // Fire RESULTS_VIEWED once after products render
-        var sessionId = getSessionId();
-        sendEvent('RESULTS_VIEWED', sessionId, {
-          page: window.location.pathname,
-          ref: document.referrer || null
-        });
-        showReasoning(data.reasoning, detectedMode, data.error, products.length);
-      } else if (data.ok && products.length === 0) {
-        debug('No products in response');
-        if (data.status === 'PROCESSING') {
-          showEmpty('Processing your recommendations. Please check back in a moment.');
-        } else if (data.status === 'COLLECTING') {
-          showEmpty('Session is still collecting information. Please complete the quiz first.');
-        } else {
-          showEmpty('No results available yet. Please check back soon.');
+        if (!isJson) {
+          // Not JSON - show retry UI instead of trying to parse
+          debug('Response is not JSON, content-type:', contentType);
+          if (attemptNumber < maxRetries) {
+            // Retry after delay
+            var delay = 1500 + (attemptNumber * 500); // 1500ms, 2000ms, 2500ms
+            debug('Retrying after', delay, 'ms (attempt', attemptNumber + 1, 'of', maxRetries, ')');
+            setTimeout(function() {
+              fetchSession(attemptNumber + 1);
+            }, delay);
+            return;
+          } else {
+            throw new Error('Response is not valid JSON. Please try again.');
+          }
         }
-      } else {
-        debug('Invalid response or no products');
-        showEmpty('No results available yet. Please check back soon.');
-      }
-    })
-    .catch(function(e) {
-      debug('Error:', e);
-      showError(e.message || 'Unable to load results. Please try again.');
-    });
+        
+        // Parse JSON response
+        return r.json().then(function(data) {
+          if (!r.ok) {
+            // Handle error responses
+            if (data.status === 'pending' && attemptNumber < maxRetries) {
+              // Pending status - retry after retryAfterMs
+              var delay = data.retryAfterMs || 1500;
+              debug('Status pending, retrying after', delay, 'ms (attempt', attemptNumber + 1, 'of', maxRetries, ')');
+              setTimeout(function() {
+                fetchSession(attemptNumber + 1);
+              }, delay);
+              return;
+            }
+            throw new Error(data.message || data.error || 'Failed to load results');
+          }
+          
+          // Success response - process it
+          debug('Parsed JSON:', data);
+          
+          // Check if we have products array (new format) or recommendations array (old format)
+          var products = data.products || [];
+          
+          // Legacy support: if recommendations exist but products don't, convert recommendations
+          if (products.length === 0 && data.recommendations && data.recommendations.length > 0) {
+            // Old format - fetch product details from .js endpoint
+            var productPromises = data.recommendations.map(function(item) {
+              return fetch('/products/' + item.handle + '.js')
+                .then(function(r) {
+                  if (!r.ok) throw new Error('Product not found');
+                  return r.json();
+                })
+                .then(function(product) {
+                  return {
+                    handle: item.handle,
+                    title: product.title || '',
+                    image: product.featured_image || null,
+                    price: product.variants && product.variants[0] ? product.variants[0].price : null,
+                    url: '/products/' + item.handle
+                  };
+                })
+                .catch(function(err) {
+                  debug('Error fetching product', item.handle, ':', err);
+                  return {
+                    handle: item.handle,
+                    title: item.handle,
+                    image: null,
+                    price: null,
+                    url: '/products/' + item.handle
+                  };
+                });
+            });
+            
+            Promise.all(productPromises).then(function(fetchedProducts) {
+              renderProducts(fetchedProducts);
+              
+              // Fire RESULTS_VIEWED once after products render
+              var sessionId = getSessionId();
+              sendEvent('RESULTS_VIEWED', sessionId, {
+                page: window.location.pathname,
+                ref: document.referrer || null
+              });
+              
+              // For legacy format, use mode from API if provided, otherwise default to null (treated as AI)
+              var detectedMode = data.mode || null;
+              showReasoning(data.reasoning, detectedMode, data.error, fetchedProducts.length);
+            });
+            return;
+          }
+          
+          // New format: products array with full data
+          debug('Products array length:', products.length);
+          debug('Data ok:', data.ok, 'Status:', data.status, 'Mode:', data.mode);
+          
+          // Handle pending status with retry
+          if (!data.ok && data.status === 'pending' && attemptNumber < maxRetries) {
+            var delay = data.retryAfterMs || 1500;
+            debug('Status pending, retrying after', delay, 'ms (attempt', attemptNumber + 1, 'of', maxRetries, ')');
+            setTimeout(function() {
+              fetchSession(attemptNumber + 1);
+            }, delay);
+            return;
+          }
+          
+          // Use mode from API if provided, otherwise default to null (will be treated as AI)
+          // Only treat as fallback if mode is explicitly 'placeholder' or 'fallback'
+          var detectedMode = data.mode || null;
+          
+          debug('API response - mode:', detectedMode, 'reasoning:', data.reasoning, 'error:', data.error);
+          
+          if (data.ok && products.length > 0) {
+            debug('Rendering', products.length, 'products');
+            renderProducts(products);
+            
+            // Fire RESULTS_VIEWED once after products render
+            var sessionId = getSessionId();
+            sendEvent('RESULTS_VIEWED', sessionId, {
+              page: window.location.pathname,
+              ref: document.referrer || null
+            });
+            showReasoning(data.reasoning, detectedMode, data.error, products.length);
+          } else if (data.ok && products.length === 0) {
+            debug('No products in response');
+            if (data.status === 'PROCESSING') {
+              showEmpty('Processing your recommendations. Please check back in a moment.');
+            } else if (data.status === 'COLLECTING') {
+              showEmpty('Session is still collecting information. Please complete the quiz first.');
+            } else {
+              showEmpty('No results available yet. Please check back soon.');
+            }
+          } else if (!data.ok && data.status === 'pending') {
+            // Max retries reached for pending status
+            debug('Max retries reached for pending status');
+            showEmpty('Results are still being processed. Please refresh the page in a moment.');
+          } else {
+            debug('Invalid response or no products');
+            showEmpty('No results available yet. Please check back soon.');
+          }
+        });
+      })
+      .catch(function(e) {
+        debug('Error:', e);
+        // On error, retry if we haven't exceeded max retries and it's not a parse error from non-JSON
+        if (attemptNumber < maxRetries && e.message && !e.message.includes('JSON')) {
+          var delay = 1500 + (attemptNumber * 500);
+          debug('Error occurred, retrying after', delay, 'ms (attempt', attemptNumber + 1, 'of', maxRetries, ')');
+          setTimeout(function() {
+            fetchSession(attemptNumber + 1);
+          }, delay);
+        } else {
+          showError(e.message || 'Unable to load results. Please try again.');
+        }
+      });
+    }
+    
+    // Start fetch with first attempt
+    fetchSession(0);
   }
 
   // Initialize - handle DOM ready and Shopify re-renders
