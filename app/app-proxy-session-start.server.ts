@@ -1417,6 +1417,191 @@ export async function proxySessionStartAction(
       
       // Allocate budget per item if total budget provided
       type BundleItemWithBudget = { hardTerms: string[]; quantity: number; budgetMin?: number; budgetMax?: number };
+      
+      /**
+       * Strict budget-aware bundle selection helper
+       * Rules:
+       * 1) Must select at least 1 item from each pool (if pool non-empty)
+       * 2) For each itemIndex, first pick the best-ranked candidate WITH price <= allocatedBudget[itemIndex]
+       * 3) After primaries, fill remaining slots round-robin, but only if budget constraints are met
+       * 4) If totalBudget exists and we can't reach requestedCount, stop early OR fill with cheapest but flag budgetExceeded
+       */
+      function selectBundleWithinBudget(
+        itemPools: Map<number, EnrichedCandidate[]>,
+        allocatedBudgets: Map<number, number>,
+        totalBudget: number | null,
+        requestedCount: number,
+        itemCount: number,
+        rankedCandidatesByItem?: Map<number, EnrichedCandidate[]>
+      ): {
+        handles: string[];
+        trustFallback: boolean;
+        budgetExceeded: boolean;
+        totalPrice: number;
+        chosenPrimaries: Map<number, string>;
+      } {
+        const handles: string[] = [];
+        let trustFallback = false;
+        let budgetExceeded = false;
+        let totalPrice = 0;
+        const chosenPrimaries = new Map<number, string>();
+        const used = new Set<string>();
+        
+        // Helper to get candidate price
+        const getPrice = (c: EnrichedCandidate): number => {
+          const price = c.price ? parseFloat(String(c.price)) : NaN;
+          return Number.isFinite(price) ? price : Infinity;
+        };
+        
+        // Step 1: Select primaries (at least 1 per itemIndex)
+        for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
+          const pool = itemPools.get(itemIdx) || [];
+          if (pool.length === 0) {
+            trustFallback = true;
+            continue;
+          }
+          
+          const allocatedBudget = allocatedBudgets.get(itemIdx);
+          
+          // Use ranked candidates if provided, otherwise use pool order
+          const candidatesToCheck = rankedCandidatesByItem?.get(itemIdx) || pool;
+          
+          // Find best candidate within allocated budget
+          let selected: EnrichedCandidate | null = null;
+          if (allocatedBudget !== undefined && allocatedBudget !== null) {
+            // Try to find candidate within allocated budget
+            for (const c of candidatesToCheck) {
+              if (used.has(c.handle)) continue;
+              const price = getPrice(c);
+              if (price <= allocatedBudget) {
+                selected = c;
+                break;
+              }
+            }
+            
+            // If none fit, pick cheapest and mark trustFallback
+            if (!selected) {
+              const sorted = [...pool].filter(c => !used.has(c.handle)).sort((a, b) => getPrice(a) - getPrice(b));
+              if (sorted.length > 0) {
+                selected = sorted[0];
+                trustFallback = true;
+              }
+            }
+          } else {
+            // No allocated budget, pick first available
+            for (const c of candidatesToCheck) {
+              if (!used.has(c.handle)) {
+                selected = c;
+                break;
+              }
+            }
+          }
+          
+          if (selected) {
+            const price = getPrice(selected);
+            // Check total budget constraint
+            if (totalBudget !== null && totalPrice + price > totalBudget) {
+              // Can't add primary without exceeding total budget
+              budgetExceeded = true;
+              trustFallback = true;
+            } else {
+              handles.push(selected.handle);
+              used.add(selected.handle);
+              totalPrice += price;
+              chosenPrimaries.set(itemIdx, selected.handle);
+            }
+          }
+        }
+        
+        // Step 2: Fill remaining slots round-robin, respecting budget constraints
+        const itemIndices = Array.from({ length: itemCount }, (_, i) => i);
+        let roundRobinIdx = 0;
+        const handlesByItem = new Map<number, string[]>();
+        
+        // Initialize handlesByItem with primaries
+        for (const [itemIdx, handle] of chosenPrimaries) {
+          handlesByItem.set(itemIdx, [handle]);
+        }
+        
+        while (handles.length < requestedCount && roundRobinIdx < 200) {
+          const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+          const pool = itemPools.get(currentItemIdx) || [];
+          const currentHandles = handlesByItem.get(currentItemIdx) || [];
+          const allocatedBudget = allocatedBudgets.get(currentItemIdx);
+          
+          // Find next candidate that fits budget constraints
+          let added = false;
+          for (const candidate of pool) {
+            if (used.has(candidate.handle)) continue;
+            if (handles.length >= requestedCount) break;
+            
+            const price = getPrice(candidate);
+            
+            // Check allocated budget constraint
+            if (allocatedBudget !== undefined && allocatedBudget !== null) {
+              const remainingAllocated = allocatedBudget - (currentHandles.reduce((sum, h) => {
+                const c = pool.find(p => p.handle === h);
+                return sum + (c ? getPrice(c) : 0);
+              }, 0));
+              if (price > remainingAllocated) {
+                continue; // Skip this candidate
+              }
+            }
+            
+            // Check total budget constraint
+            if (totalBudget !== null && totalPrice + price > totalBudget) {
+              // Can't add without exceeding total budget
+              budgetExceeded = true;
+              break; // Stop trying to add more
+            }
+            
+            // Add candidate
+            handles.push(candidate.handle);
+            used.add(candidate.handle);
+            totalPrice += price;
+            if (!handlesByItem.has(currentItemIdx)) {
+              handlesByItem.set(currentItemIdx, []);
+            }
+            handlesByItem.get(currentItemIdx)!.push(candidate.handle);
+            added = true;
+            break;
+          }
+          
+          // If we couldn't add any candidate and we're under requestedCount, try cheapest remaining
+          if (!added && handles.length < requestedCount && totalBudget === null) {
+            // No total budget constraint, try cheapest from any pool
+            let cheapest: { candidate: EnrichedCandidate; itemIdx: number } | null = null;
+            for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
+              const pool = itemPools.get(itemIdx) || [];
+              for (const c of pool) {
+                if (used.has(c.handle)) continue;
+                const price = getPrice(c);
+                if (!cheapest || price < getPrice(cheapest.candidate)) {
+                  cheapest = { candidate: c, itemIdx };
+                }
+              }
+            }
+            
+            if (cheapest) {
+              handles.push(cheapest.candidate.handle);
+              used.add(cheapest.candidate.handle);
+              totalPrice += getPrice(cheapest.candidate);
+              if (!handlesByItem.has(cheapest.itemIdx)) {
+                handlesByItem.set(cheapest.itemIdx, []);
+              }
+              handlesByItem.get(cheapest.itemIdx)!.push(cheapest.candidate.handle);
+            } else {
+              break; // No more candidates available
+            }
+          }
+          
+          roundRobinIdx++;
+          if (roundRobinIdx > 200) break;
+        }
+        
+        return { handles, trustFallback, budgetExceeded, totalPrice, chosenPrimaries };
+      }
+      
       function allocateBudgetPerItem(
         items: Array<{ hardTerms: string[]; quantity: number }>,
         totalBudget: number
@@ -1449,9 +1634,14 @@ export async function proxySessionStartAction(
         : bundleIntent.items.map(item => ({ ...item }));
       
       if (bundleIntent.isBundle) {
-        console.log("[Bundle] allocated budgets:", bundleItemsWithBudget.map((item, idx) => 
-          `item${idx}: ${item.hardTerms[0]} max=$${item.budgetMax?.toFixed(2) || "unlimited"}`
-        ));
+        const allocatedBudgetsMap = new Map<number, number>();
+        bundleItemsWithBudget.forEach((item, idx) => {
+          if (item.budgetMax !== undefined && item.budgetMax !== null) {
+            allocatedBudgetsMap.set(idx, item.budgetMax);
+          }
+        });
+        console.log("[Bundle Budget] totalBudget=", bundleIntent.totalBudget, "allocated=", 
+          Array.from(allocatedBudgetsMap.entries()).map(([idx, budget]) => `item${idx}=${budget.toFixed(2)}`).join(" "));
       }
       
       console.log("[App Proxy] [Layer 2] Hard terms:", hardTerms);
@@ -1957,7 +2147,7 @@ export async function proxySessionStartAction(
           );
           
           if (aiBundle.rankedHandles?.length) {
-            // Build item pools from sortedCandidates for filling missing items
+            // Build item pools from sortedCandidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
             for (const c of sortedCandidates) {
               const itemIdx = (c as any)._bundleItemIndex;
@@ -1969,167 +2159,68 @@ export async function proxySessionStartAction(
               }
             }
             
-            // Group AI handles by itemIndex
-            const handlesByItem = new Map<number, string[]>();
+            // Build ranked candidates by itemIndex from AI handles
+            const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
             for (const handle of aiBundle.rankedHandles) {
               const candidate = sortedCandidates.find(c => c.handle === handle);
               if (candidate) {
                 const itemIdx = (candidate as any)._bundleItemIndex;
                 if (typeof itemIdx === "number") {
-                  if (!handlesByItem.has(itemIdx)) {
-                    handlesByItem.set(itemIdx, []);
+                  if (!rankedCandidatesByItem.has(itemIdx)) {
+                    rankedCandidatesByItem.set(itemIdx, []);
                   }
-                  handlesByItem.get(itemIdx)!.push(handle);
+                  rankedCandidatesByItem.get(itemIdx)!.push(candidate);
                 }
               }
             }
             
-            // Fill missing itemIndices deterministically
-            const filledMissing: string[] = [];
-            for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
-              if (!handlesByItem.has(itemIdx) || handlesByItem.get(itemIdx)!.length === 0) {
-                const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
-                const pool = itemPools.get(itemIdx) || [];
-                
-                if (pool.length > 0) {
-                  // Filter by budget if allocated
-                  let candidatesInBudget = pool;
-                  let needsFallback = false;
-                  
-                  if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
-                    const budgetMax = bundleItem.budgetMax;
-                    candidatesInBudget = pool.filter(c => {
-                      const price = c.price ? parseFloat(String(c.price)) : NaN;
-                      return !Number.isFinite(price) || price <= budgetMax;
-                    });
-                    
-                    if (candidatesInBudget.length === 0) {
-                      candidatesInBudget = pool;
-                      needsFallback = true;
-                    }
-                  }
-                  
-                  // Sort by price (cheapest first)
-                  candidatesInBudget.sort((a, b) => {
-                    const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
-                    const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
-                    return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
-                  });
-                  
-                  const selected = candidatesInBudget[0];
-                  filledMissing.push(selected.handle);
-                  
-                  if (!handlesByItem.has(itemIdx)) {
-                    handlesByItem.set(itemIdx, []);
-                  }
-                  handlesByItem.get(itemIdx)!.push(selected.handle);
-                  
-                  if (needsFallback) {
-                    trustFallback = true;
-                  }
-                  
-                  console.log("[AI Bundle] filledMissingItemIndices=item", itemIdx, ":", selected.handle);
-                }
+            // Build allocated budgets map
+            const allocatedBudgets = new Map<number, number>();
+            bundleItemsWithBudget.forEach((item, idx) => {
+              if (item.budgetMax !== undefined && item.budgetMax !== null) {
+                allocatedBudgets.set(idx, item.budgetMax);
               }
+            });
+            
+            // Use budget-aware selection helper
+            const selectionResult = selectBundleWithinBudget(
+              itemPools,
+              allocatedBudgets,
+              bundleIntent.totalBudget,
+              resultCountUsed,
+              bundleItemsWithBudget.length,
+              rankedCandidatesByItem
+            );
+            
+            finalHandles = selectionResult.handles;
+            if (selectionResult.trustFallback) {
+              trustFallback = true;
             }
             
-            // Build final handles via round-robin across items
-            const finalHandlesRoundRobin: string[] = [];
-            const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
-            let itemIdx = 0;
-            let added = 0;
-            
-            // First pass: ensure at least 1 per item
-            for (let i = 0; i < bundleItemsWithBudget.length; i++) {
-              const handles = handlesByItem.get(i) || [];
-              if (handles.length > 0) {
-                finalHandlesRoundRobin.push(handles[0]);
-                added++;
-              }
-            }
-            
-            // Second pass: round-robin to fill remaining slots
-            const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
-            let roundRobinIdx = 0;
-            
-            while (added < resultCountUsed && roundRobinIdx < 100) { // Safety limit
-              const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-              const handles = handlesByItem.get(currentItemIdx) || [];
-              const alreadyAdded = finalHandlesRoundRobin.filter(h => handles.includes(h)).length;
-              
-              if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
-                const nextHandle = handles[alreadyAdded];
-                if (!finalHandlesRoundRobin.includes(nextHandle)) {
-                  finalHandlesRoundRobin.push(nextHandle);
-                  added++;
-                }
-              }
-              
-              roundRobinIdx++;
-              if (roundRobinIdx > 100) break; // Safety
-            }
-            
-            finalHandles = finalHandlesRoundRobin.slice(0, resultCountUsed);
-            
-            // Count final handles per item for logging
-            const finalCountsByItem = new Map<number, number>();
-            for (const handle of finalHandles) {
-              const candidate = sortedCandidates.find(c => c.handle === handle);
-              if (candidate) {
-                const itemIdx = (candidate as any)._bundleItemIndex;
-                if (typeof itemIdx === "number") {
-                  finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
-                }
-              }
-            }
-            
-            const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
-              const count = finalCountsByItem.get(idx) || 0;
-              const itemName = item.hardTerms[0];
-              return `${itemName}=${count}`;
-            }).join(" ");
-            console.log("[Bundle] finalCounts per item:", finalCountsText);
+            // Log budget selection details
+            const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
+              .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
+            console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
+            console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
+              "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
+              "budgetExceeded=", selectionResult.budgetExceeded);
             
             // Build improved reasoning
             const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
             const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
             
-            // Check if budget was exceeded
-            const candidateMap = new Map(sortedCandidates.map(c => [c.handle, c]));
-            const totalPrice = finalHandles.reduce((sum, handle) => {
-              const candidate = candidateMap.get(handle);
-              if (candidate && candidate.price) {
-                const price = parseFloat(String(candidate.price));
-                return sum + (Number.isFinite(price) ? price : 0);
-              }
-              return sum;
-            }, 0);
-            
             let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-            if (bundleIntent.totalBudget && totalPrice > bundleIntent.totalBudget) {
+            if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
               reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
             }
             
-            if (filledMissing.length > 0) {
-              const filledItemNames = filledMissing.map(handle => {
-                const candidate = sortedCandidates.find(c => c.handle === handle);
-                if (candidate) {
-                  const itemIdx = (candidate as any)._bundleItemIndex;
-                  if (typeof itemIdx === "number") {
-                    return bundleItemsWithBudget[itemIdx]?.hardTerms[0] || "item";
-                  }
-                }
-                return "item";
-              }).join(", ");
-              reasoningText += ` (Some items filled via fallback: ${filledItemNames})`;
-            }
-            
             reasoningParts.push(reasoningText);
-            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles, final after round-robin:", finalHandles.length);
+            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles, final after budget-aware selection:", finalHandles.length);
           } else {
             // Fallback to deterministic selection if AI fails
             console.log("[Bundle] AI failed, using deterministic fallback");
-            const bundleFinalHandles: string[] = [];
+            
+            // Build item pools from sortedCandidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
             for (const c of sortedCandidates) {
               const itemIdx = (c as any)._bundleItemIndex;
@@ -2141,134 +2232,42 @@ export async function proxySessionStartAction(
               }
             }
             
-            // Select cheapest items per pool that stay within allocated budget
-            // Build handlesByItem for round-robin distribution
-            const handlesByItem = new Map<number, string[]>();
-            let totalSelectedPrice = 0;
-            let needsTrustFallback = false;
-            
-            for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
-              const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
-              const pool = itemPools.get(itemIdx) || [];
-              
-              if (pool.length === 0) {
-                needsTrustFallback = true;
-                handlesByItem.set(itemIdx, []);
-                continue;
+            // Build allocated budgets map
+            const allocatedBudgets = new Map<number, number>();
+            bundleItemsWithBudget.forEach((item, idx) => {
+              if (item.budgetMax !== undefined && item.budgetMax !== null) {
+                allocatedBudgets.set(idx, item.budgetMax);
               }
-              
-              // Filter pool by budget if allocated
-              let candidatesInBudget = pool;
-              if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
-                const budgetMax = bundleItem.budgetMax;
-                candidatesInBudget = pool.filter(c => {
-                  const price = c.price ? parseFloat(String(c.price)) : NaN;
-                  return !Number.isFinite(price) || price <= budgetMax;
-                });
-                
-                // If no candidates in budget, use cheapest from pool and mark trustFallback
-                if (candidatesInBudget.length === 0) {
-                  candidatesInBudget = pool;
-                  needsTrustFallback = true;
-                }
-              }
-              
-              // Sort by price (cheapest first) to prefer budget-friendly options
-              candidatesInBudget.sort((a, b) => {
-                const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
-                const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
-                return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
-              });
-              
-              // Store all candidates for this item (for round-robin)
-              handlesByItem.set(itemIdx, candidatesInBudget.map(c => c.handle));
-            }
+            });
             
-            // Build final handles via round-robin
-            const bundleFinalHandlesRoundRobin: string[] = [];
-            const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+            // Use budget-aware selection helper (no rankedCandidatesByItem for deterministic)
+            const selectionResult = selectBundleWithinBudget(
+              itemPools,
+              allocatedBudgets,
+              bundleIntent.totalBudget,
+              resultCountUsed,
+              bundleItemsWithBudget.length
+            );
             
-            // First pass: ensure at least 1 per item
-            for (let i = 0; i < bundleItemsWithBudget.length; i++) {
-              const handles = handlesByItem.get(i) || [];
-              if (handles.length > 0) {
-                bundleFinalHandlesRoundRobin.push(handles[0]);
-                const candidate = sortedCandidates.find(c => c.handle === handles[0]);
-                if (candidate && candidate.price) {
-                  const price = parseFloat(String(candidate.price));
-                  if (Number.isFinite(price)) {
-                    totalSelectedPrice += price;
-                  }
-                }
-              }
-            }
-            
-            // Second pass: round-robin to fill remaining slots
-            const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
-            let roundRobinIdx = 0;
-            let added = bundleFinalHandlesRoundRobin.length;
-            
-            while (added < resultCountUsed && roundRobinIdx < 100) {
-              const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-              const handles = handlesByItem.get(currentItemIdx) || [];
-              const alreadyAdded = bundleFinalHandlesRoundRobin.filter(h => handles.includes(h)).length;
-              
-              if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
-                const nextHandle = handles[alreadyAdded];
-                if (!bundleFinalHandlesRoundRobin.includes(nextHandle)) {
-                  bundleFinalHandlesRoundRobin.push(nextHandle);
-                  added++;
-                  const candidate = sortedCandidates.find(c => c.handle === nextHandle);
-                  if (candidate && candidate.price) {
-                    const price = parseFloat(String(candidate.price));
-                    if (Number.isFinite(price)) {
-                      totalSelectedPrice += price;
-                    }
-                  }
-                }
-              }
-              
-              roundRobinIdx++;
-              if (roundRobinIdx > 100) break;
-            }
-            
-            // Check total budget if present
-            if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
-              needsTrustFallback = true;
-              console.log("[Bundle] deterministic fallback exceeds totalBudget:", totalSelectedPrice.toFixed(2), ">", bundleIntent.totalBudget.toFixed(2));
-            }
-            
-            if (needsTrustFallback) {
+            finalHandles = selectionResult.handles;
+            if (selectionResult.trustFallback) {
               trustFallback = true;
             }
             
-            finalHandles = bundleFinalHandlesRoundRobin.slice(0, resultCountUsed);
-            
-            // Count final handles per item for logging
-            const finalCountsByItem = new Map<number, number>();
-            for (const handle of finalHandles) {
-              const candidate = sortedCandidates.find(c => c.handle === handle);
-              if (candidate) {
-                const itemIdx = (candidate as any)._bundleItemIndex;
-                if (typeof itemIdx === "number") {
-                  finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
-                }
-              }
-            }
-            
-            const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
-              const count = finalCountsByItem.get(idx) || 0;
-              const itemName = item.hardTerms[0];
-              return `${itemName}=${count}`;
-            }).join(" ");
-            console.log("[Bundle] finalCounts per item:", finalCountsText);
+            // Log budget selection details
+            const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
+              .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
+            console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
+            console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
+              "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
+              "budgetExceeded=", selectionResult.budgetExceeded);
             
             const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
             const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
             
             // Build improved reasoning
             let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-            if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+            if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
               reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
             }
             
@@ -2276,7 +2275,7 @@ export async function proxySessionStartAction(
           }
         } catch (error) {
           console.error("[Bundle] AI ranking error:", error);
-          // Fallback to deterministic selection with round-robin
+          // Fallback to deterministic selection with budget-aware helper
           const itemPools = new Map<number, EnrichedCandidate[]>();
           for (const c of sortedCandidates) {
             const itemIdx = (c as any)._bundleItemIndex;
@@ -2288,133 +2287,42 @@ export async function proxySessionStartAction(
             }
           }
           
-          // Build handlesByItem for round-robin distribution
-          const handlesByItem = new Map<number, string[]>();
-          let totalSelectedPrice = 0;
-          let needsTrustFallback = false;
-          
-          for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
-            const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
-            const pool = itemPools.get(itemIdx) || [];
-            
-            if (pool.length === 0) {
-              needsTrustFallback = true;
-              handlesByItem.set(itemIdx, []);
-              continue;
+          // Build allocated budgets map
+          const allocatedBudgets = new Map<number, number>();
+          bundleItemsWithBudget.forEach((item, idx) => {
+            if (item.budgetMax !== undefined && item.budgetMax !== null) {
+              allocatedBudgets.set(idx, item.budgetMax);
             }
-            
-            // Filter pool by budget if allocated
-            let candidatesInBudget = pool;
-            if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
-              const budgetMax = bundleItem.budgetMax;
-              candidatesInBudget = pool.filter(c => {
-                const price = c.price ? parseFloat(String(c.price)) : NaN;
-                return !Number.isFinite(price) || price <= budgetMax;
-              });
-              
-              // If no candidates in budget, use cheapest from pool and mark trustFallback
-              if (candidatesInBudget.length === 0) {
-                candidatesInBudget = pool;
-                needsTrustFallback = true;
-              }
-            }
-            
-            // Sort by price (cheapest first) to prefer budget-friendly options
-            candidatesInBudget.sort((a, b) => {
-              const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
-              const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
-              return (Number.isFinite(priceA) ? priceA : Infinity) - (Number.isFinite(priceB) ? priceB : Infinity);
-            });
-            
-            // Store all candidates for this item (for round-robin)
-            handlesByItem.set(itemIdx, candidatesInBudget.map(c => c.handle));
-          }
+          });
           
-          // Build final handles via round-robin
-          const bundleFinalHandlesRoundRobin: string[] = [];
-          const maxPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
+          // Use budget-aware selection helper
+          const selectionResult = selectBundleWithinBudget(
+            itemPools,
+            allocatedBudgets,
+            bundleIntent.totalBudget,
+            resultCountUsed,
+            bundleItemsWithBudget.length
+          );
           
-          // First pass: ensure at least 1 per item
-          for (let i = 0; i < bundleItemsWithBudget.length; i++) {
-            const handles = handlesByItem.get(i) || [];
-            if (handles.length > 0) {
-              bundleFinalHandlesRoundRobin.push(handles[0]);
-              const candidate = sortedCandidates.find(c => c.handle === handles[0]);
-              if (candidate && candidate.price) {
-                const price = parseFloat(String(candidate.price));
-                if (Number.isFinite(price)) {
-                  totalSelectedPrice += price;
-                }
-              }
-            }
-          }
-          
-          // Second pass: round-robin to fill remaining slots
-          const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
-          let roundRobinIdx = 0;
-          let added = bundleFinalHandlesRoundRobin.length;
-          
-          while (added < resultCountUsed && roundRobinIdx < 100) {
-            const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-            const handles = handlesByItem.get(currentItemIdx) || [];
-            const alreadyAdded = bundleFinalHandlesRoundRobin.filter(h => handles.includes(h)).length;
-            
-            if (alreadyAdded < handles.length && alreadyAdded < maxPerItem) {
-              const nextHandle = handles[alreadyAdded];
-              if (!bundleFinalHandlesRoundRobin.includes(nextHandle)) {
-                bundleFinalHandlesRoundRobin.push(nextHandle);
-                added++;
-                const candidate = sortedCandidates.find(c => c.handle === nextHandle);
-                if (candidate && candidate.price) {
-                  const price = parseFloat(String(candidate.price));
-                  if (Number.isFinite(price)) {
-                    totalSelectedPrice += price;
-                  }
-                }
-              }
-            }
-            
-            roundRobinIdx++;
-            if (roundRobinIdx > 100) break;
-          }
-          
-          // Check total budget if present
-          if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
-            needsTrustFallback = true;
-            console.log("[Bundle] deterministic fallback exceeds totalBudget:", totalSelectedPrice.toFixed(2), ">", bundleIntent.totalBudget.toFixed(2));
-          }
-          
-          if (needsTrustFallback) {
+          finalHandles = selectionResult.handles;
+          if (selectionResult.trustFallback) {
             trustFallback = true;
           }
           
-          finalHandles = bundleFinalHandlesRoundRobin.slice(0, resultCountUsed);
-          
-          // Count final handles per item for logging
-          const finalCountsByItem = new Map<number, number>();
-          for (const handle of finalHandles) {
-            const candidate = sortedCandidates.find(c => c.handle === handle);
-            if (candidate) {
-              const itemIdx = (candidate as any)._bundleItemIndex;
-              if (typeof itemIdx === "number") {
-                finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
-              }
-            }
-          }
-          
-          const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
-            const count = finalCountsByItem.get(idx) || 0;
-            const itemName = item.hardTerms[0];
-            return `${itemName}=${count}`;
-          }).join(" ");
-          console.log("[Bundle] finalCounts per item:", finalCountsText);
+          // Log budget selection details
+          const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
+            .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
+          console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
+          console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
+            "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
+            "budgetExceeded=", selectionResult.budgetExceeded);
           
           const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
           const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
           
           // Build improved reasoning
           let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-          if (bundleIntent.totalBudget && totalSelectedPrice > bundleIntent.totalBudget) {
+          if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
             reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
           }
           
@@ -2865,88 +2773,6 @@ export async function proxySessionStartAction(
           return false;
         }
         
-        // Top-up from bundle-safe pool with category guards and round-robin distribution
-        const have = new Set(finalHandlesGuaranteed);
-        const rejectedTopUpHandles: string[] = [];
-        
-        // Count current handles per item
-        const handlesByItem = new Map<number, string[]>();
-        for (const handle of finalHandlesGuaranteed) {
-          const candidate = sortedCandidates.find(c => c.handle === handle);
-          if (candidate) {
-            const itemIdx = (candidate as any)._bundleItemIndex;
-            if (typeof itemIdx === "number") {
-              if (!handlesByItem.has(itemIdx)) {
-                handlesByItem.set(itemIdx, []);
-              }
-              handlesByItem.get(itemIdx)!.push(handle);
-            }
-          }
-        }
-        
-        // Calculate target distribution (roughly even)
-        const targetPerItem = Math.ceil(resultCountUsed / bundleItemsWithBudget.length);
-        const topUpSourceCounts = new Map<number, number>();
-        
-        // Round-robin top-up from bundle item pools
-        const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
-        let roundRobinIdx = 0;
-        
-        while (finalHandlesGuaranteed.length < resultCountUsed && roundRobinIdx < 200) {
-          const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-          const pool = bundleItemPools.get(currentItemIdx) || [];
-          const currentHandles = handlesByItem.get(currentItemIdx) || [];
-          
-          // Check if this item needs more handles
-          if (currentHandles.length < targetPerItem && pool.length > currentHandles.length) {
-            // Find next candidate from this item's pool that's not already used
-            for (const candidate of pool) {
-              if (!candidate?.handle) continue;
-              if (have.has(candidate.handle)) continue;
-              
-              // Category guard: verify candidate belongs to this item pool
-              const haystack = [
-                candidate.title || "",
-                candidate.productType || "",
-                (candidate.tags || []).join(" "),
-                candidate.vendor || "",
-                candidate.searchText || "",
-              ].join(" ");
-              
-              const itemHardTerms = bundleItemsWithBudget[currentItemIdx].hardTerms;
-              const belongsToItem = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-              
-              if (belongsToItem) {
-                finalHandlesGuaranteed.push(candidate.handle);
-                have.add(candidate.handle);
-                if (!handlesByItem.has(currentItemIdx)) {
-                  handlesByItem.set(currentItemIdx, []);
-                }
-                handlesByItem.get(currentItemIdx)!.push(candidate.handle);
-                topUpSourceCounts.set(currentItemIdx, (topUpSourceCounts.get(currentItemIdx) || 0) + 1);
-                break;
-              } else {
-                rejectedTopUpHandles.push(candidate.handle);
-              }
-            }
-          }
-          
-          roundRobinIdx++;
-          if (roundRobinIdx > 200) break;
-        }
-        
-        // Log top-up source counts
-        const topUpSourceText = bundleItemsWithBudget.map((item, idx) => {
-          const count = topUpSourceCounts.get(idx) || 0;
-          const itemName = item.hardTerms[0];
-          return `${itemName}=${count}`;
-        }).join(" ");
-        console.log("[Bundle] topUpSourceCounts:", topUpSourceText);
-        
-        if (rejectedTopUpHandles.length > 0) {
-          console.log("[Bundle] rejectedTopUpHandles:", rejectedTopUpHandles.slice(0, 10).join(", "), rejectedTopUpHandles.length > 10 ? `... (${rejectedTopUpHandles.length} total)` : "");
-        }
-        
         // Assert every final handle exists in at least one itemPool; if not, drop it
         const strictItemPoolHandles = new Set<string>();
         for (const pool of bundleItemPools.values()) {
@@ -2967,41 +2793,67 @@ export async function proxySessionStartAction(
         
         if (outOfPoolHandles.length > 0) {
           console.log("[Bundle] outOfPoolDropped=", outOfPoolHandles.length, "handles:", outOfPoolHandles.slice(0, 5).join(", "));
-          // Replace dropped handles using round-robin from itemPools
           finalHandlesGuaranteed = inPoolHandles;
-          const haveAfterDrop = new Set(finalHandlesGuaranteed);
-          
-          // Round-robin replacement from strict itemPools
-          roundRobinIdx = 0;
-          while (finalHandlesGuaranteed.length < resultCountUsed && roundRobinIdx < 200) {
-            const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-            const pool = bundleItemPools.get(currentItemIdx) || [];
-            
-            for (const candidate of pool) {
-              if (finalHandlesGuaranteed.length >= resultCountUsed) break;
-              if (!candidate?.handle) continue;
-              if (haveAfterDrop.has(candidate.handle)) continue;
-              
-              finalHandlesGuaranteed.push(candidate.handle);
-              haveAfterDrop.add(candidate.handle);
-              break;
-            }
-            
-            roundRobinIdx++;
-            if (roundRobinIdx > 200) break;
-          }
         }
         
-        // Count final handles per item for logging
+        // If we need top-up, use budget-aware helper
+        if (finalHandlesGuaranteed.length < resultCountUsed) {
+          // Build allocated budgets map
+          const allocatedBudgets = new Map<number, number>();
+          bundleItemsWithBudget.forEach((item, idx) => {
+            if (item.budgetMax !== undefined && item.budgetMax !== null) {
+              allocatedBudgets.set(idx, item.budgetMax);
+            }
+          });
+          
+          // Use budget-aware selection helper for top-up
+          const topUpResult = selectBundleWithinBudget(
+            bundleItemPools,
+            allocatedBudgets,
+            bundleIntent.totalBudget,
+            resultCountUsed,
+            bundleItemsWithBudget.length
+          );
+          
+          // Merge with existing handles (avoid duplicates)
+          const existingSet = new Set(finalHandlesGuaranteed);
+          for (const handle of topUpResult.handles) {
+            if (!existingSet.has(handle)) {
+              finalHandlesGuaranteed.push(handle);
+              existingSet.add(handle);
+              if (finalHandlesGuaranteed.length >= resultCountUsed) break;
+            }
+          }
+          
+          if (topUpResult.trustFallback) {
+            trustFallback = true;
+          }
+          
+          console.log("[Bundle Budget] top-up finalTotalPrice=", topUpResult.totalPrice.toFixed(2), 
+            "finalCount=", finalHandlesGuaranteed.length, "trustFallback=", topUpResult.trustFallback,
+            "budgetExceeded=", topUpResult.budgetExceeded);
+        }
+        
+        // Count final handles per item for logging (AFTER top-up)
         const finalCountsByItem = new Map<number, number>();
+        const noPoolHandles: string[] = [];
         for (const handle of finalHandlesGuaranteed) {
+          let found = false;
           for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
             const pool = bundleItemPools.get(itemIdx) || [];
             if (pool.some(c => c.handle === handle)) {
               finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+              found = true;
               break;
             }
           }
+          if (!found) {
+            noPoolHandles.push(handle);
+          }
+        }
+        
+        if (noPoolHandles.length > 0) {
+          console.log("[Bundle] handles with no pool:", noPoolHandles.slice(0, 5).join(", "));
         }
         
         const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
@@ -3010,21 +2862,6 @@ export async function proxySessionStartAction(
           return `${itemName}=${count}`;
         }).join(" ");
         console.log("[Bundle] finalCounts per item:", finalCountsText);
-        
-        // If trustFallback=true and still short, allow broader pool but still with category guards
-        if (trustFallback && finalHandlesGuaranteed.length < resultCountUsed) {
-          // Use allCandidatesForTopUp but filter by category guards
-          for (const candidate of allCandidatesForTopUp) {
-            if (finalHandlesGuaranteed.length >= resultCountUsed) break;
-            if (!candidate?.handle) continue;
-            if (have.has(candidate.handle)) continue;
-            
-            if (belongsToBundleItem(candidate)) {
-              have.add(candidate.handle);
-              finalHandlesGuaranteed.push(candidate.handle);
-            }
-          }
-        }
         
         console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", resultCountUsed, ")");
       } else {
