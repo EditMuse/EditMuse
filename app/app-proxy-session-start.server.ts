@@ -989,6 +989,12 @@ export async function proxySessionStartAction(
 
       console.log("[App Proxy] Fetched", products.length, "products");
 
+      // Debug log: Product/Variant counts
+      const totalProducts = products.length;
+      const totalVariants = products.reduce((sum, p) => sum + ((p as any).variants?.length || 0), 0);
+      const avgVariantsPerProduct = totalProducts > 0 ? totalVariants / totalProducts : 0;
+      console.log("[App Proxy] Product/Variant counts", { totalProducts, totalVariants, avgVariantsPerProduct });
+
       // Filter out ARCHIVED and DRAFT products
       const beforeStatusFilter = products.length;
       products = products.filter(p => {
@@ -1288,26 +1294,66 @@ export async function proxySessionStartAction(
       
       console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
       
+      // Helper function for word-boundary matching of hard terms
+      // Matches terms with word boundaries to prevent false positives (e.g., "suit" matches " suit " but not "suitable")
+      function matchesHardTermWithBoundary(searchText: string, hardTerm: string): boolean {
+        // Normalize the search text
+        const normalized = normalizeText(searchText);
+        const normalizedTerm = normalizeText(hardTerm);
+        
+        // Escape special regex characters in the term
+        const escapedTerm = normalizedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        
+        // Check if term contains spaces (multi-word phrase)
+        if (normalizedTerm.includes(" ")) {
+          // Multi-word: match as phrase with word boundaries
+          // Replace spaces with \s+ to allow flexible whitespace
+          const phrasePattern = escapedTerm.replace(/\s+/g, "\\s+");
+          const regex = new RegExp(`\\b${phrasePattern}\\b`, "i");
+          return regex.test(normalized);
+        } else {
+          // Single word: match with word boundaries (prevents "suit" matching "suitable" or "suitcase")
+          const regex = new RegExp(`\\b${escapedTerm}\\b`, "i");
+          return regex.test(normalized);
+        }
+      }
+      
+      // Special boost terms for fashion/apparel (detected from user intent)
+      // These provide additional matching signals when present in user queries
+      const boostTerms = new Set<string>();
+      const lowerIntent = userIntent.toLowerCase();
+      if (/\b(3\s*piece|three\s*piece)\b/i.test(lowerIntent)) {
+        boostTerms.add("3 piece");
+        boostTerms.add("three piece");
+      }
+      if (/\bwaistcoat\b/i.test(lowerIntent)) {
+        boostTerms.add("waistcoat");
+      }
+      
       // Gate 2: Hard terms (must match at least one hard term if hard terms exist)
+      // Use word-boundary matching on normalized text (title/productType/tags/descPlain), not substring
       let trustFallback = false;
       const strictGate: EnrichedCandidate[] = [];
       
-      if (hardTermTokens.length > 0) {
-        // Products must contain at least one hard term token in searchText
+      if (hardTerms.length > 0) {
+        // Build normalized search text from title/productType/tags/descPlain for word-boundary matching
         for (const candidate of gatedCandidates) {
-          const candidateTokens = new Set(tokenize(candidate.searchText));
-          const hasHardTerm = hardTermTokens.some(ht => candidateTokens.has(ht));
-          
-          // Also check for phrase matches in title/productType/tags
+          // Combine fields and normalize for word-boundary matching
           const searchFields = [
             candidate.title || "",
             candidate.productType || "",
             ...(candidate.tags || []),
-          ].join(" ").toLowerCase();
+            candidate.descPlain || "",
+          ].join(" ");
           
-          const hasPhraseMatch = hardTerms.some(phrase => searchFields.includes(phrase.toLowerCase()));
+          // Check hard terms with word-boundary matching (not substring/token matching)
+          // Multi-word terms are matched as phrases, single-word terms use word boundaries
+          const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(searchFields, phrase));
           
-          if (hasHardTerm || hasPhraseMatch) {
+          // Also check boost terms (if user intent suggests them)
+          const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(searchFields, term));
+          
+          if (hasHardTermMatch || hasBoostTerm) {
             strictGate.push(candidate);
           }
         }
@@ -1320,19 +1366,37 @@ export async function proxySessionStartAction(
           gatedCandidates = strictGate;
           console.log("[App Proxy] [Layer 2] Using strict gate");
         } else {
-          // Relax: broaden hard term matching (token overlap instead of exact phrase)
+          // Relax: broaden hard term matching (still using word-boundary, but allow partial word matches)
           console.log("[App Proxy] [Layer 2] Strict gate too small, broadening...");
           
-          // First try: token overlap with any hard term
+          // First try: word-boundary matching but allow any word from multi-word phrases
           const broadGate = gatedCandidates.filter(candidate => {
-            const candidateTokens = new Set(tokenize(candidate.searchText));
-            return hardTermTokens.some(ht => candidateTokens.has(ht));
+            const searchFields = [
+              candidate.title || "",
+              candidate.productType || "",
+              ...(candidate.tags || []),
+              candidate.descPlain || "",
+            ].join(" ");
+            
+            // For multi-word hard terms, check if any individual word matches with word boundaries
+            // For single-word terms, still use word-boundary matching
+            return hardTerms.some(phrase => {
+              const normalizedPhrase = normalizeText(phrase);
+              if (normalizedPhrase.includes(" ")) {
+                // Multi-word: check if any word from the phrase matches with word boundaries
+                const words = normalizedPhrase.split(/\s+/);
+                return words.some(word => matchesHardTermWithBoundary(searchFields, word));
+              } else {
+                // Single-word: use word-boundary matching
+                return matchesHardTermWithBoundary(searchFields, phrase);
+              }
+            });
           });
           
           if (broadGate.length >= MIN_CANDIDATES_FOR_AI) {
             gatedCandidates = broadGate;
             relaxNotes.push(`Broadened category matching to find ${broadGate.length} candidates.`);
-            console.log("[App Proxy] [Layer 2] Using broad gate (token overlap):", broadGate.length);
+            console.log("[App Proxy] [Layer 2] Using broad gate (word-boundary matching):", broadGate.length);
           } else {
             // Last resort: trust fallback (allow cross-catalog)
             trustFallback = true;
@@ -1373,16 +1437,24 @@ export async function proxySessionStartAction(
         // BM25 score
         let score = bm25Score(allQueryTokens, docTokens, docTokenFreq, docTokens.length, avgDocLen, idf);
         
-        // Boost for exact phrase match in title/productType/tags
+        // Boost for exact phrase match in title/productType/tags using word-boundary matching
         const searchFields = [
           c.title || "",
           c.productType || "",
           ...(c.tags || []),
+          c.descPlain || "", // Also check description
         ].join(" ").toLowerCase();
         
         for (const hardTerm of hardTerms) {
-          if (searchFields.includes(hardTerm.toLowerCase())) {
-            score += 2.0; // Boost for exact phrase
+          if (matchesHardTermWithBoundary(searchFields, hardTerm)) {
+            score += 2.0; // Boost for exact phrase match with word boundaries
+          }
+        }
+        
+        // Boost for special terms (3 piece, waistcoat, etc.)
+        for (const boostTerm of boostTerms) {
+          if (matchesHardTermWithBoundary(searchFields, boostTerm)) {
+            score += 1.5; // Boost for related fashion terms
           }
         }
         
@@ -1652,18 +1724,22 @@ export async function proxySessionStartAction(
             if (!materialMatch) passesFacets = false;
           }
           
-          // Check hard terms (if any)
+          // Check hard terms (if any) using word-boundary matching on normalized text
           if (hardTerms.length > 0 && passesFacets) {
-            const candidateTokens = new Set(tokenize(candidate.searchText));
-            const hasHardTerm = hardTermTokens.some(ht => candidateTokens.has(ht));
             const searchFields = [
               candidate.title || "",
               candidate.productType || "",
               ...(candidate.tags || []),
-            ].join(" ").toLowerCase();
-            const hasPhraseMatch = hardTerms.some(phrase => searchFields.includes(phrase.toLowerCase()));
+              candidate.descPlain || "",
+            ].join(" ");
             
-            if (!hasHardTerm && !hasPhraseMatch) {
+            // Use word-boundary matching for all hard terms (not token matching)
+            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(searchFields, phrase));
+            
+            // Also check boost terms
+            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(searchFields, term));
+            
+            if (!hasHardTermMatch && !hasBoostTerm) {
               passesFacets = false;
             }
           }
@@ -1727,7 +1803,7 @@ export async function proxySessionStartAction(
         }
         
         // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-        if (finalHandlesGuaranteed.length < resultCountUsed) {
+      if (finalHandlesGuaranteed.length < resultCountUsed) {
           const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
             const descPlain = cleanDescription((p as any).description || null);
             const desc1000 = descPlain.substring(0, 1000);
@@ -1790,7 +1866,7 @@ export async function proxySessionStartAction(
           : "No exact matches found; showing closest alternatives.";
         reasoningParts.unshift(fallbackNote);
       }
-      
+
       // Reasoning header (generic, all industries)
       const prefPairs = Object.entries(variantPreferences).filter(([,v]) => !!v);
       if (prefPairs.length) {

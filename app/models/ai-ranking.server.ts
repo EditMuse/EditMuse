@@ -82,6 +82,17 @@ const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
 
+// Models that support JSON mode (response_format: { type: "json_object" })
+const JSON_MODE_SUPPORTED_MODELS = new Set([
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-4-turbo",
+  "gpt-4-turbo-preview",
+  "gpt-3.5-turbo",
+  "o1-preview",
+  "o1-mini",
+]);
+
 /**
  * Strips HTML tags and cleans product description
  * Removes HTML entities, preserves text content
@@ -145,6 +156,126 @@ function enhanceUserIntent(userIntent: string): string {
     .replace(/\bthings\b/gi, "products");
   
   return enhanced;
+}
+
+/**
+ * Extracts the first balanced JSON object from text, stripping leading/trailing text
+ */
+function extractBalancedJSON(text: string): string | null {
+  if (!text || typeof text !== "string") return null;
+  
+  let trimmed = text.trim();
+  
+  // Remove markdown code blocks if present
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+  if (codeBlockMatch) {
+    trimmed = codeBlockMatch[1].trim();
+  }
+  
+  // Find the first opening brace
+  const firstBrace = trimmed.indexOf("{");
+  if (firstBrace === -1) return null;
+  
+  // Extract from first brace and find balanced closing brace
+  let braceCount = 0;
+  let inString = false;
+  let escapeNext = false;
+  
+  for (let i = firstBrace; i < trimmed.length; i++) {
+    const char = trimmed[i];
+    
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    
+    if (char === "\\") {
+      escapeNext = true;
+      continue;
+    }
+    
+    if (char === '"' && !escapeNext) {
+      inString = !inString;
+      continue;
+    }
+    
+    if (!inString) {
+      if (char === "{") {
+        braceCount++;
+      } else if (char === "}") {
+        braceCount--;
+        if (braceCount === 0) {
+          // Found balanced JSON object
+          return trimmed.substring(firstBrace, i + 1);
+        }
+      }
+    }
+  }
+  
+  return null; // Unbalanced braces
+}
+
+/**
+ * Validates that the parsed JSON matches the expected schema
+ */
+function validateRankingSchema(
+  parsed: any,
+  trustFallback: boolean,
+  candidateHandles: Set<string>
+): { valid: boolean; reason?: string } {
+  if (!parsed || typeof parsed !== "object") {
+    return { valid: false, reason: "Not an object" };
+  }
+  
+  if (typeof parsed.trustFallback !== "boolean") {
+    return { valid: false, reason: "Missing or invalid trustFallback field" };
+  }
+  
+  if (!Array.isArray(parsed.selected)) {
+    return { valid: false, reason: "Missing or invalid selected array" };
+  }
+  
+  // Validate each selected item
+  for (const item of parsed.selected) {
+    if (!item || typeof item !== "object") {
+      return { valid: false, reason: "Invalid selected item (not an object)" };
+    }
+    
+    if (typeof item.handle !== "string" || !item.handle.trim()) {
+      return { valid: false, reason: "Invalid handle in selected item" };
+    }
+    
+    if (!candidateHandles.has(item.handle.trim())) {
+      return { valid: false, reason: `Handle ${item.handle} not in candidates` };
+    }
+    
+    if (item.label !== "exact" && item.label !== "alternative") {
+      return { valid: false, reason: `Invalid label: ${item.label}` };
+    }
+    
+    if (typeof item.score !== "number" || item.score < 0 || item.score > 100) {
+      return { valid: false, reason: `Invalid score: ${item.score}` };
+    }
+    
+    if (!item.evidence || typeof item.evidence !== "object") {
+      return { valid: false, reason: "Missing or invalid evidence" };
+    }
+    
+    if (!Array.isArray(item.evidence.matchedHardTerms)) {
+      return { valid: false, reason: "Invalid matchedHardTerms array" };
+    }
+    
+    // If trustFallback=false, require at least one matchedHardTerm
+    if (!trustFallback && item.evidence.matchedHardTerms.length === 0) {
+      return { valid: false, reason: "No matchedHardTerms when trustFallback=false" };
+    }
+    
+    if (typeof item.reason !== "string") {
+      return { valid: false, reason: "Missing or invalid reason" };
+    }
+  }
+  
+  return { valid: true };
 }
 
 /**
@@ -393,7 +524,9 @@ export async function rankProductsWithAI(
   }
 
   const model = getOpenAIModel();
+  const supportsJsonMode = JSON_MODE_SUPPORTED_MODELS.has(model);
   console.log("[AI Ranking] Starting AI ranking with model:", model, "candidates:", candidates.length);
+  console.log("[AI Ranking] json_mode=", supportsJsonMode);
 
   // Enhance user intent for better AI understanding
   const enhancedIntent = enhanceUserIntent(userIntent);
@@ -435,37 +568,39 @@ export async function rankProductsWithAI(
   
   // Build product list for prompt (limit to 200)
   // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
-  const productList = candidates.slice(0, 200).map((p, idx) => {
-    // Cap tags to max 20
-    const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
+  // This function can be called with shortened=true to reduce payload for retries
+  function buildProductList(shortened: boolean = false): string {
+    const descLimit = shortened ? 400 : 500;
     
-    // Cap sizes/colors/materials to max 20 each
-    const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 20).join(", ") : "none";
-    const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 20).join(", ") : "none";
-    const materials = (p.materials && p.materials.length > 0) ? p.materials.slice(0, 20).join(", ") : "none";
-    
-    // Cap optionValues: max 3 keys, max 10 values per key
-    let optionValuesJson = "{}";
-    if (p.optionValues && typeof p.optionValues === "object") {
-      const cappedOptionValues: Record<string, string[]> = {};
-      const keys = Object.keys(p.optionValues).slice(0, 3);
-      for (const key of keys) {
-        const values = (p.optionValues[key] || []);
-        if (Array.isArray(values)) {
-          cappedOptionValues[key] = values.slice(0, 10);
+    return candidates.slice(0, 200).map((p, idx) => {
+      // Cap tags to max 20
+      const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
+      
+      // Cap sizes/colors/materials to max 20 each
+      const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 20).join(", ") : "none";
+      const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 20).join(", ") : "none";
+      const materials = (p.materials && p.materials.length > 0) ? p.materials.slice(0, 20).join(", ") : "none";
+      
+      // Cap optionValues: max 3 keys, max 10 values per key
+      let optionValuesJson = "{}";
+      if (p.optionValues && typeof p.optionValues === "object") {
+        const cappedOptionValues: Record<string, string[]> = {};
+        const keys = Object.keys(p.optionValues).slice(0, 3);
+        for (const key of keys) {
+          const values = (p.optionValues[key] || []);
+          if (Array.isArray(values)) {
+            cappedOptionValues[key] = values.slice(0, 10);
+          }
         }
+        optionValuesJson = JSON.stringify(cappedOptionValues);
       }
-      optionValuesJson = JSON.stringify(cappedOptionValues);
-    }
-    
-    // Use desc1000 if available, truncate to 500 chars (reduced from 1000)
-    const descriptionText = (p as any).desc1000 
-      ? ((p as any).desc1000.substring(0, 500))
-      : (cleanDescription(p.description) || "No description available").substring(0, 500);
-    
-    // Remove searchText entirely - not needed for AI prompt
-    
-    return `${idx + 1}. handle: ${p.handle}
+      
+      // Use desc1000 if available, truncate based on shortened flag
+      const descriptionText = (p as any).desc1000 
+        ? ((p as any).desc1000.substring(0, descLimit))
+        : (cleanDescription(p.description) || "No description available").substring(0, descLimit);
+      
+      return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
    productType: ${p.productType || "unknown"}
    vendor: ${p.vendor || "unknown"}
@@ -477,7 +612,11 @@ export async function rankProductsWithAI(
    materials: ${materials}
    optionValues: ${optionValuesJson}
    desc1000: ${descriptionText}`;
-  }).join("\n\n");
+    }).join("\n\n");
+  }
+  
+  // Build initial product list
+  let productList = buildProductList(false);
   
   // Log payload size
   const productListJsonChars = productList.length;
@@ -593,8 +732,13 @@ REQUIREMENTS:
     trustFallback,
   }, null, 2);
 
-  const userPrompt = `Shopper Intent:
-${enhancedIntent}
+  // Build user prompt (can be shortened for retries)
+  function buildUserPrompt(shortened: boolean = false): string {
+    const productListForPrompt = shortened ? buildProductList(true) : productList;
+    const intentForPrompt = shortened ? enhancedIntent.substring(0, 500) : enhancedIntent;
+    
+    return `Shopper Intent:
+${intentForPrompt}
 
 Hard Constraints:
 ${hardConstraintsJson}
@@ -607,7 +751,7 @@ ${prefsText && prefsText !== "Variant option preferences: none" ? `${prefsText}$
 ${keywordText || ""}
 
 Candidate Products (${candidates.length} total):
-${productList}
+${productListForPrompt}
 
 TASK:
 1. For each candidate, check if it satisfies the hard constraints:
@@ -629,17 +773,42 @@ TASK:
 4. Optionally include up to 20 rejected candidates with brief "why" explanations.
 
 Return ONLY the JSON object matching the schema - no markdown, no prose outside JSON.`;
+  }
+  
+  let userPrompt = buildUserPrompt(false);
 
   // Attempt AI ranking with retries
   let lastError: any = null;
+  let lastParseFailReason: string | undefined = undefined;
+  const candidateHandles = new Set(candidates.map(p => p.handle));
+  
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      if (attempt > 0) {
-        console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}`);
+      const isRetry = attempt > 0;
+      const useShortenedPrompt = isRetry && lastParseFailReason !== undefined;
+      
+      if (isRetry) {
+        console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}${useShortenedPrompt ? " (using shortened prompt)" : ""}`);
       }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+      // Build request body with JSON mode if supported
+      const requestBody: any = {
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: useShortenedPrompt ? buildUserPrompt(true) : userPrompt },
+        ],
+        temperature: 0.2,
+        max_tokens: 1500,
+      };
+      
+      // Add JSON mode if supported
+      if (supportsJsonMode) {
+        requestBody.response_format = { type: "json_object" };
+      }
 
       const response = await fetch(OPENAI_API_URL, {
         method: "POST",
@@ -648,16 +817,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           "Content-Type": "application/json",
         },
         signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          response_format: { type: "json_object" },
-          temperature: 0.2, // Lower temperature (0.2 vs 0.3) for more consistent and focused ranking
-          max_tokens: 1500, // Increased to allow more detailed reasoning
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       clearTimeout(timeoutId);
@@ -666,6 +826,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         const errorText = await response.text();
         console.error("[AI Ranking] OpenAI API error:", response.status, errorText);
         lastError = new Error(`OpenAI API error: ${response.status}`);
+        lastParseFailReason = `API error: ${response.status}`;
         continue; // Try again if retries remaining
       }
 
@@ -675,113 +836,89 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       if (!content) {
         console.error("[AI Ranking] No content in OpenAI response");
         lastError = new Error("No content in OpenAI response");
+        lastParseFailReason = "No content in response";
         continue; // Try again if retries remaining
       }
 
       console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
 
-      // Robust JSON extraction - trim whitespace and extract first {...} block
-      let jsonContent = content.trim();
+      // Robust JSON extraction - extract balanced JSON object
+      const jsonContent = extractBalancedJSON(content);
       
-      // If wrapped in markdown code blocks, extract JSON
-      const codeBlockMatch = jsonContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-      if (codeBlockMatch) {
-        jsonContent = codeBlockMatch[1].trim();
-      } else {
-        // Extract first {...} JSON block
-        const jsonMatch = jsonContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          jsonContent = jsonMatch[0];
-        }
+      if (!jsonContent) {
+        console.error("[AI Ranking] Failed to extract JSON from response");
+        lastError = new Error("Failed to extract JSON from response");
+        lastParseFailReason = "Could not extract balanced JSON object";
+        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+        continue; // Try again if retries remaining
       }
 
       // Parse JSON response
       let structuredResult: StructuredRankingResult;
-      let structuredOk = false;
-      let fallbackUsed = false;
+      let parseError: any = null;
       
       try {
         structuredResult = JSON.parse(jsonContent);
-        // Validate it's the new structured format
-        if (structuredResult.selected && Array.isArray(structuredResult.selected)) {
-          structuredOk = true;
-        } else {
-          // Not the new format, try old format
-          fallbackUsed = true;
-          throw new Error("Not structured format");
-        }
-      } catch (parseError) {
-        console.error("[AI Ranking] Failed to parse structured JSON response:", parseError);
-        console.error("[AI Ranking] Attempted to parse:", jsonContent.substring(0, 500));
-        // Fall back to old format parsing
-        fallbackUsed = true;
+      } catch (err) {
+        parseError = err;
+        lastError = err;
+        lastParseFailReason = `JSON.parse failed: ${err instanceof Error ? err.message : String(err)}`;
+        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+        continue; // Try again if retries remaining
+      }
+
+      // Validate against expected schema
+      const validation = validateRankingSchema(structuredResult, trustFallback, candidateHandles);
+      
+      if (!validation.valid) {
+        // Before retrying, try to parse as old format as a fallback
         try {
-          const oldFormat: RankingResult = JSON.parse(jsonContent);
+          const oldFormat: RankingResult = structuredResult as any;
           if (oldFormat.ranked_handles && Array.isArray(oldFormat.ranked_handles)) {
             console.log("[AI Ranking] Falling back to old format parsing");
-            const candidateHandles = new Set(candidates.map(p => p.handle));
             const validHandles = oldFormat.ranked_handles
               .filter((h): h is string => typeof h === "string" && h.trim().length > 0 && candidateHandles.has(h.trim()))
               .map(h => h.trim())
               .slice(0, resultCount);
             if (validHandles.length > 0) {
-              // Debug log for fallback
-              console.log("[AI Ranking] structuredOk=", false, "fallbackUsed=", true, "trustFallback=", hardConstraints?.trustFallback ?? null);
+              console.log("[AI Ranking] Successfully parsed old format, returning result");
               return {
                 rankedHandles: validHandles,
                 reasoning: oldFormat.reasoning || "AI-ranked products based on user intent",
               };
             }
           }
-        } catch (fallbackError) {
-          // Both failed, continue to retry
+        } catch (oldFormatError) {
+          // Old format parsing failed, continue to retry
         }
-        lastError = parseError;
+        
+        lastError = new Error(`Schema validation failed: ${validation.reason}`);
+        lastParseFailReason = `Schema validation failed: ${validation.reason}`;
+        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
         continue; // Try again if retries remaining
       }
       
-      // Debug log for structured format
-      console.log("[AI Ranking] structuredOk=", structuredOk, "fallbackUsed=", fallbackUsed, "trustFallback=", hardConstraints?.trustFallback ?? null);
-
-      // Validate response structure
-      if (!structuredResult.selected || !Array.isArray(structuredResult.selected)) {
-        console.error("[AI Ranking] Invalid response structure - missing selected array");
-        lastError = new Error("Invalid response structure - missing selected array");
-        continue; // Try again if retries remaining
-      }
-
-      // Validate handles exist in candidates
-      const candidateHandles = new Set(candidates.map(p => p.handle));
+      // Successfully parsed and validated
+      console.log("[AI Ranking] Successfully parsed and validated JSON response");
+      // Schema validation already passed, now do runtime validation of selected items
       const candidateMap = new Map(candidates.map(p => [p.handle, p]));
       
       console.log("[AI Ranking] AI returned", structuredResult.selected.length, "selected items");
       
-      // Validate and filter selected items
+      // Validate and filter selected items (runtime checks beyond schema)
       const validSelectedItems: SelectedItem[] = [];
       
       for (const item of structuredResult.selected) {
-        if (!item.handle || typeof item.handle !== "string") {
-          console.warn("[AI Ranking] Skipping item with invalid handle:", item);
-          continue;
-        }
-        
         const handle = item.handle.trim();
-        if (!candidateHandles.has(handle)) {
+        const candidate = candidateMap.get(handle);
+        
+        if (!candidate) {
           console.warn("[AI Ranking] Skipping item with handle not in candidates:", handle);
           continue;
         }
         
         // If trustFallback=false, validate constraints
         if (!trustFallback) {
-          const candidate = candidateMap.get(handle);
-          if (!candidate) continue;
-          
-          // Check if evidence has matchedHardTerms
-          if (!item.evidence || !item.evidence.matchedHardTerms || item.evidence.matchedHardTerms.length === 0) {
-            console.warn(`[AI Ranking] Skipping ${handle} - no matchedHardTerms when trustFallback=false`);
-            continue;
-          }
-          
           // Basic validation: check if hardTerm appears in candidate fields
           const candidateText = [
             candidate.title || "",
@@ -817,8 +954,9 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", structuredResult.selected.length, "selected items");
       
       if (validSelectedItems.length === 0) {
-        console.error("[AI Ranking] No valid selected items after validation");
-        lastError = new Error("No valid selected items after validation");
+        console.error("[AI Ranking] No valid selected items after runtime validation");
+        lastError = new Error("No valid selected items after runtime validation");
+        lastParseFailReason = "No valid items after runtime validation";
         continue; // Try again if retries remaining
       }
 
@@ -893,9 +1031,12 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       lastError = error;
       if (error.name === "AbortError") {
         console.error("[AI Ranking] Request timeout after", TIMEOUT_MS, "ms", attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
+        lastParseFailReason = `Request timeout after ${TIMEOUT_MS}ms`;
       } else {
         console.error("[AI Ranking] Error:", error.message || error, attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
+        lastParseFailReason = `Exception: ${error.message || String(error)}`;
       }
+      console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
       // Continue to next attempt if retries remaining
       if (attempt < MAX_RETRIES) {
         continue;
@@ -903,8 +1044,12 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     }
   }
 
-  // All attempts failed - return deterministic fallback
+  // All attempts failed - return deterministic fallback (structured result, not throwing)
+  const failReason = lastParseFailReason || (lastError instanceof Error ? lastError.message : String(lastError || "Unknown error"));
   console.log("[AI Ranking] All AI attempts failed, using deterministic fallback");
+  console.log("[AI Ranking] parse_fail_reason=", failReason);
+  
+  // Return structured fallback result instead of throwing
   return deterministicRanking(candidates, resultCount, variantPreferences);
 }
 
