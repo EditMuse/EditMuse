@@ -44,6 +44,8 @@ interface HardConstraints {
   };
   avoidTerms: string[];
   trustFallback: boolean;
+  isBundle?: boolean;
+  bundleItems?: Array<{ hardTerms: string[]; quantity: number; budgetMax?: number }>;
 }
 
 interface Evidence {
@@ -72,6 +74,16 @@ interface RejectedCandidate {
 interface StructuredRankingResult {
   trustFallback: boolean;
   selected: SelectedItem[];
+  rejected_candidates?: RejectedCandidate[];
+}
+
+interface BundleSelectedItem extends SelectedItem {
+  itemIndex: number;
+}
+
+interface StructuredBundleResult {
+  trustFallback: boolean;
+  selected_by_item: BundleSelectedItem[];
   rejected_candidates?: RejectedCandidate[];
 }
 
@@ -181,7 +193,7 @@ class JSONParseError extends Error {
  * Handles markdown fences, extracts JSON object, removes trailing commas, and parses
  * @throws {JSONParseError} if parsing fails
  */
-function parseStructuredRanking(content: string): StructuredRankingResult {
+function parseStructuredRanking(content: string): StructuredRankingResult | StructuredBundleResult {
   if (!content || typeof content !== "string") {
     throw new JSONParseError("Content is empty or not a string", content || "");
   }
@@ -604,6 +616,8 @@ export async function rankProductsWithAI(
   const hardFacetsRaw = hardConstraints?.hardFacets || {};
   const avoidTermsFromConstraints = hardConstraints?.avoidTerms || [];
   const trustFallback = hardConstraints?.trustFallback || false;
+  const isBundle = hardConstraints?.isBundle || false;
+  const bundleItems = hardConstraints?.bundleItems || [];
   
   // Convert hardFacets from single values to arrays if needed
   // Also merge avoidTerms (from params and constraints)
@@ -747,7 +761,68 @@ Rules:
 `
     : "";
 
-  const systemPrompt = `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
+  const systemPrompt = isBundle
+    ? `You are an expert product recommendation assistant for an e-commerce store. Your task is to build a BUNDLE of products across multiple categories from pre-filtered candidate lists.
+
+CRITICAL OUTPUT FORMAT:
+- Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
+- Output must be parseable JSON.parse() directly
+- Use the exact bundle schema provided below - no deviations
+
+BUNDLE REQUIREMENTS:
+- You will receive ${bundleItems.length} bundle items, each with its own candidate group
+- For each itemIndex, choose exactly 1 primary selection from that item's candidate group
+- After selecting 1 primary per item, add alternates to fill ${resultCount} total selections
+- Distribute alternates evenly across items (round-robin)
+- Each selection in selected_by_item MUST include itemIndex matching the candidate's group
+
+BUDGET CONSTRAINT:
+${bundleItems.some(item => item.budgetMax) ? `- Total budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)}
+- Prefer selections where sum(price) <= totalBudget
+- If impossible to stay within budget, set trustFallback=true and label alternatives` : "- No budget constraint specified"}
+
+HARD CONSTRAINT RULES:
+${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
+  a) At least one hardTerm match for its itemIndex in (title OR productType OR tags OR desc1000 snippet)
+  b) ALL hardFacets must match when provided (size, color, material)
+  c) Must NOT contain any avoidTerms in title/tags/desc1000 (unless avoidTerms is empty)
+  d) Evidence must not be empty - must specify which hardTerms matched and which fields were used
+  e) Handle MUST exist in that itemIndex's candidate group`}
+
+OUTPUT SCHEMA (MUST be exactly this structure):
+{
+  "trustFallback": ${trustFallback},
+  "selected_by_item": [
+    {
+      "itemIndex": 0,
+      "handle": "exact-handle-from-item-0-candidates",
+      "label": "exact" | "alternative",
+      "score": 85,
+      "evidence": {
+        "matchedHardTerms": ["suit"],
+        "matchedFacets": { "size": [], "color": ["navy"], "material": [] },
+        "fieldsUsed": ["title", "productType", "desc1000"]
+      },
+      "reason": "Navy suit matches category and color requirements."
+    }
+  ],
+  "selected": [],
+  "rejected_candidates": [
+    { "handle": "some-handle", "why": "Does not match hardTerm 'suit'" }
+  ]
+}
+
+REQUIREMENTS:
+- "selected_by_item" array MUST contain at least 1 selection per itemIndex (exactly 1 primary per item)
+- After primaries, add alternates to reach ${resultCount} total, distributing evenly across items
+- All handles must exist in their itemIndex's candidate group (copy exactly as shown)
+- No duplicate handles
+- evidence.matchedHardTerms must not be empty when trustFallback=false
+- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
+- Each reason must be 1 sentence maximum and written in natural, conversational language
+- Write reasons as if explaining to a customer why this product matches their needs
+- rejected_candidates array is optional but include up to 20 if helpful for debugging`
+    : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
 CRITICAL OUTPUT FORMAT:
 - Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
@@ -804,7 +879,8 @@ REQUIREMENTS:
 - No duplicate handles
 - evidence.matchedHardTerms must not be empty when trustFallback=false
 - evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
-- Each reason must be 1 sentence maximum
+- Each reason must be 1 sentence maximum and written in natural, conversational language
+- Write reasons as if explaining to a customer why this product matches their needs (e.g., "This navy suit perfectly matches your formal wear requirements" not "Product matches hardTerm 'suit' and color 'navy'")
 - rejected_candidates array is optional but include up to 20 if helpful for debugging`;
 
   // Build hard constraints object for prompt
@@ -817,6 +893,90 @@ REQUIREMENTS:
 
   // Build user prompt (can be shortened or compressed for retries)
   function buildUserPrompt(shortened: boolean = false, compressed: boolean = false): string {
+    if (isBundle && bundleItems.length >= 2) {
+      // BUNDLE MODE: Group candidates by itemIndex
+      const candidatesByItem = new Map<number, ProductCandidate[]>();
+      for (const c of candidates) {
+        const itemIdx = (c as any)._bundleItemIndex;
+        if (typeof itemIdx === "number") {
+          if (!candidatesByItem.has(itemIdx)) {
+            candidatesByItem.set(itemIdx, []);
+          }
+          candidatesByItem.get(itemIdx)!.push(c);
+        }
+      }
+      
+      // Build bundle items list
+      const bundleItemsList = bundleItems.map((item, idx) => {
+        const budgetText = item.budgetMax ? ` (allocated budget: $${item.budgetMax.toFixed(2)})` : "";
+        return `Item ${idx}: ${item.hardTerms.join(", ")} (quantity: ${item.quantity})${budgetText}`;
+      }).join("\n");
+      
+      const totalBudgetText = bundleItems.some(item => item.budgetMax)
+        ? `\nTotal Budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)}`
+        : "";
+      
+      // Build candidate groups by itemIndex
+      let candidateGroupsText = "";
+      for (let itemIdx = 0; itemIdx < bundleItems.length; itemIdx++) {
+        const itemCandidates = candidatesByItem.get(itemIdx) || [];
+        const itemHardTerms = bundleItems[itemIdx].hardTerms;
+        
+        candidateGroupsText += `\n\n=== Item ${itemIdx} Candidates (${itemHardTerms.join(", ")}) ===\n`;
+        candidateGroupsText += itemCandidates.slice(0, 30).map((p, idx) => {
+          const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
+          const descText = (p as any).desc1000 
+            ? ((p as any).desc1000.substring(0, 500))
+            : (cleanDescription(p.description) || "No description available").substring(0, 500);
+          
+          return `${idx + 1}. handle: ${p.handle}
+   title: ${p.title}
+   productType: ${p.productType || "unknown"}
+   vendor: ${p.vendor || "unknown"}
+   tags: ${tags}
+   available: ${p.available ? "yes" : "no"}
+   price: ${p.price || "unknown"}
+   desc1000: ${descText}`;
+        }).join("\n\n");
+      }
+      
+      return `Shopper Intent (BUNDLE):
+${enhancedIntent}
+
+Bundle Items:
+${bundleItemsList}${totalBudgetText}
+
+Hard Constraints:
+${hardConstraintsJson}
+
+${constraintsText ? `Variant Preferences:
+${constraintsText}` : ""}
+
+${prefsText && prefsText !== "Variant option preferences: none" ? `${prefsText}${rulesText}` : ""}
+
+${keywordText || ""}
+
+Candidates Grouped by Item:
+${candidateGroupsText}
+
+TASK:
+1. For each bundle item, choose exactly 1 primary selection from that item's candidate group
+2. After selecting 1 primary per item, add alternates to fill ${resultCount} total selections
+3. Distribute alternates evenly across items (round-robin)
+4. Enforce budget: prefer selections where sum(price) <= totalBudget; if impossible, set trustFallback=true and label alternatives
+
+For each selected item in selected_by_item:
+   - itemIndex: Must match the candidate's group (0, 1, 2, ...)
+   - Exact handle (copy from that itemIndex's candidate list)
+   - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
+   - Score: 0-100 based on match quality
+   - Evidence: Which hardTerms matched, which facets matched, which fields were used
+   - Reason: Write a natural, conversational 1-sentence explanation
+
+Return ONLY the JSON object matching the bundle schema - no markdown, no prose outside JSON.`;
+    }
+    
+    // SINGLE-ITEM MODE: Existing logic
     const productListForPrompt = compressed 
       ? buildProductList(false, true) 
       : (shortened ? buildProductList(true) : productList);
@@ -861,7 +1021,7 @@ ${matchingRequirements}
    - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
    - Score: 0-100 based on match quality
    - Evidence: Which hardTerms matched, which facets matched, which fields were used
-   - Reason: 1 sentence explaining the match
+   - Reason: Write a natural, conversational 1-sentence explanation as if speaking to the customer (e.g., "This navy suit is perfect for formal occasions" rather than "Matches suit category and navy color")
 
 4. Optionally include up to 20 rejected candidates with brief "why" explanations.
 
@@ -870,61 +1030,101 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   
   let userPrompt = buildUserPrompt(false);
 
-  // Build JSON schema for StructuredRankingResult if supported
-  function buildJsonSchema() {
-    return {
+  // Build JSON schema for StructuredRankingResult or StructuredBundleResult if supported
+  function buildJsonSchema(isBundle: boolean = false) {
+    const evidenceSchema = {
       type: "object",
       properties: {
-        trustFallback: { type: "boolean" },
-        selected: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              handle: { type: "string" },
-              label: { type: "string", enum: ["exact", "alternative"] },
-              score: { type: "number", minimum: 0, maximum: 100 },
-              evidence: {
-                type: "object",
-                properties: {
-                  matchedHardTerms: { type: "array", items: { type: "string" } },
-                  matchedFacets: {
-                    type: "object",
-                    properties: {
-                      size: { type: "array", items: { type: "string" } },
-                      color: { type: "array", items: { type: "string" } },
-                      material: { type: "array", items: { type: "string" } },
-                    },
-                    required: ["size", "color", "material"],
-                    additionalProperties: false,
-                  },
-                  fieldsUsed: { type: "array", items: { type: "string" } },
-                },
-                required: ["matchedHardTerms", "matchedFacets", "fieldsUsed"],
-                additionalProperties: false,
-              },
-              reason: { type: "string" },
-            },
-            required: ["handle", "label", "score", "evidence", "reason"],
-            additionalProperties: false,
+        matchedHardTerms: { type: "array", items: { type: "string" } },
+        matchedFacets: {
+          type: "object",
+          properties: {
+            size: { type: "array", items: { type: "string" } },
+            color: { type: "array", items: { type: "string" } },
+            material: { type: "array", items: { type: "string" } },
           },
+          required: ["size", "color", "material"],
+          additionalProperties: false,
         },
-        rejected_candidates: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              handle: { type: "string" },
-              why: { type: "string" },
-            },
-            required: ["handle", "why"],
-            additionalProperties: false,
-          },
-        },
+        fieldsUsed: { type: "array", items: { type: "string" } },
       },
-      required: ["trustFallback", "selected", "rejected_candidates"],
+      required: ["matchedHardTerms", "matchedFacets", "fieldsUsed"],
       additionalProperties: false,
     };
+    
+    const selectedItemSchema = {
+      type: "object",
+      properties: {
+        handle: { type: "string" },
+        label: { type: "string", enum: ["exact", "alternative"] },
+        score: { type: "number", minimum: 0, maximum: 100 },
+        evidence: evidenceSchema,
+        reason: { type: "string" },
+      },
+      required: ["handle", "label", "score", "evidence", "reason"],
+      additionalProperties: false,
+    };
+    
+    const rejectedCandidateSchema = {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          handle: { type: "string" },
+          why: { type: "string" },
+        },
+        required: ["handle", "why"],
+        additionalProperties: false,
+      },
+    };
+    
+    if (isBundle) {
+      // Bundle schema: requires selected_by_item, selected is optional fallback
+      return {
+        type: "object",
+        properties: {
+          trustFallback: { type: "boolean" },
+          selected_by_item: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                itemIndex: { type: "number" },
+                handle: { type: "string" },
+                label: { type: "string", enum: ["exact", "alternative"] },
+                score: { type: "number", minimum: 0, maximum: 100 },
+                evidence: evidenceSchema,
+                reason: { type: "string" },
+              },
+              required: ["itemIndex", "handle", "label", "score", "evidence", "reason"],
+              additionalProperties: false,
+            },
+          },
+          selected: {
+            type: "array",
+            items: selectedItemSchema,
+          },
+          rejected_candidates: rejectedCandidateSchema,
+        },
+        required: ["trustFallback", "selected_by_item", "selected", "rejected_candidates"],
+        additionalProperties: false,
+      };
+    } else {
+      // Single-item schema
+      return {
+        type: "object",
+        properties: {
+          trustFallback: { type: "boolean" },
+          selected: {
+            type: "array",
+            items: selectedItemSchema,
+          },
+          rejected_candidates: rejectedCandidateSchema,
+        },
+        required: ["trustFallback", "selected", "rejected_candidates"],
+        additionalProperties: false,
+      };
+    }
   }
 
   // Attempt AI ranking with retries
@@ -960,9 +1160,9 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         requestBody.response_format = {
           type: "json_schema",
           json_schema: {
-            name: "structured_ranking_result",
+            name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
             strict: true,
-            schema: buildJsonSchema(),
+            schema: buildJsonSchema(isBundle),
           },
         };
       } else if (supportsJsonMode) {
@@ -1002,7 +1202,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
 
       // Parse JSON response using improved parser
-      let structuredResult: StructuredRankingResult;
+      let structuredResult: StructuredRankingResult | StructuredBundleResult;
       
       try {
         structuredResult = parseStructuredRanking(content);
@@ -1022,8 +1222,104 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         }
       }
 
-      // Validate against expected schema
-      const validation = validateRankingSchema(structuredResult, trustFallback, candidateHandles);
+      // Validate bundle response if in bundle mode
+      if (isBundle && "selected_by_item" in structuredResult) {
+        const bundleResult = structuredResult as StructuredBundleResult;
+        
+        // Build item pools for validation
+        const candidatesByItem = new Map<number, Set<string>>();
+        for (const c of candidates) {
+          const itemIdx = (c as any)._bundleItemIndex;
+          if (typeof itemIdx === "number") {
+            if (!candidatesByItem.has(itemIdx)) {
+              candidatesByItem.set(itemIdx, new Set());
+            }
+            candidatesByItem.get(itemIdx)!.add(c.handle);
+          }
+        }
+        
+        // Validate bundle response
+        const itemIndices = new Set(bundleResult.selected_by_item.map(item => item.itemIndex));
+        const expectedIndices = new Set(bundleItems.map((_, idx) => idx));
+        const missingIndices = Array.from(expectedIndices).filter(idx => !itemIndices.has(idx));
+        
+        if (missingIndices.length > 0 && !bundleResult.trustFallback) {
+          lastError = new Error(`Missing selections for itemIndices: ${missingIndices.join(", ")}`);
+          lastParseFailReason = `Missing selections for itemIndices: ${missingIndices.join(", ")}`;
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          continue;
+        }
+        
+        // Validate handles belong to correct item pools
+        const invalidHandles: string[] = [];
+        for (const item of bundleResult.selected_by_item) {
+          const itemPool = candidatesByItem.get(item.itemIndex);
+          if (!itemPool || !itemPool.has(item.handle)) {
+            if (!bundleResult.trustFallback) {
+              invalidHandles.push(`${item.handle} (itemIndex ${item.itemIndex})`);
+            }
+          }
+        }
+        
+        if (invalidHandles.length > 0 && !bundleResult.trustFallback) {
+          lastError = new Error(`Handles not in correct item pools: ${invalidHandles.join(", ")}`);
+          lastParseFailReason = `Handles not in correct item pools: ${invalidHandles.join(", ")}`;
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          continue;
+        }
+        
+        // Successfully validated bundle response
+        console.log("[AI Bundle] structuredOk=true, itemCount=", bundleResult.selected_by_item.length, 
+          "returnedPerItem=", Array.from(itemIndices).map(idx => {
+            const count = bundleResult.selected_by_item.filter(item => item.itemIndex === idx).length;
+            return `item${idx}:${count}`;
+          }).join(","),
+          "trustFallback=", bundleResult.trustFallback);
+        
+        // Calculate total price for budget check
+        const candidateMap = new Map(candidates.map(p => [p.handle, p]));
+        const totalPrice = bundleResult.selected_by_item.reduce((sum, item) => {
+          const candidate = candidateMap.get(item.handle);
+          if (candidate && candidate.price) {
+            const price = parseFloat(String(candidate.price));
+            return sum + (Number.isFinite(price) ? price : 0);
+          }
+          return sum;
+        }, 0);
+        
+        const totalBudget = bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0);
+        const budgetOk = totalBudget === 0 || totalPrice <= totalBudget;
+        
+        console.log("[AI Bundle] budgetOk=", budgetOk, "totalPrice=", totalPrice.toFixed(2), "totalBudget=", totalBudget.toFixed(2));
+        
+        // Convert bundle result to ranked handles
+        const rankedHandles = bundleResult.selected_by_item
+          .sort((a, b) => {
+            // Sort by itemIndex first, then by score descending
+            if (a.itemIndex !== b.itemIndex) return a.itemIndex - b.itemIndex;
+            return b.score - a.score;
+          })
+          .map(item => item.handle)
+          .slice(0, resultCount);
+        
+        // Build reasoning from bundle items
+        const reasoningParts = bundleResult.selected_by_item
+          .filter((item, idx, arr) => arr.findIndex(i => i.itemIndex === item.itemIndex) === idx) // One per itemIndex
+          .map(item => item.reason)
+          .filter(Boolean);
+        
+        const reasoning = reasoningParts.length > 0
+          ? reasoningParts.join(" ")
+          : `Built a bundle with ${bundleResult.selected_by_item.length} items.`;
+        
+        return {
+          rankedHandles,
+          reasoning,
+        };
+      }
+
+      // Validate against expected schema (single-item mode)
+      const validation = validateRankingSchema(structuredResult as StructuredRankingResult, trustFallback, candidateHandles);
       
       if (!validation.valid) {
         // Before retrying, try to parse as old format as a fallback
@@ -1055,15 +1351,19 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       // Successfully parsed and validated
       console.log("[AI Ranking] Successfully parsed and validated JSON response");
-      // Schema validation already passed, now do runtime validation of selected items
-      const candidateMap = new Map(candidates.map(p => [p.handle, p]));
       
-      console.log("[AI Ranking] AI returned", structuredResult.selected.length, "selected items");
-      
-      // Validate and filter selected items (runtime checks beyond schema)
-      const validSelectedItems: SelectedItem[] = [];
-      
-      for (const item of structuredResult.selected) {
+      // Single-item mode: runtime validation of selected items
+      if (!isBundle || !("selected_by_item" in structuredResult)) {
+        // Schema validation already passed, now do runtime validation of selected items
+        const singleItemResult = structuredResult as StructuredRankingResult;
+        const candidateMap = new Map(candidates.map(p => [p.handle, p]));
+        
+        console.log("[AI Ranking] AI returned", singleItemResult.selected.length, "selected items");
+        
+        // Validate and filter selected items (runtime checks beyond schema)
+        const validSelectedItems: SelectedItem[] = [];
+        
+        for (const item of singleItemResult.selected) {
         const handle = item.handle.trim();
         const candidate = candidateMap.get(handle);
         
@@ -1104,85 +1404,97 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           }
         }
         
-        validSelectedItems.push(item);
-      }
-      
-      console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", structuredResult.selected.length, "selected items");
-      
-      if (validSelectedItems.length === 0) {
-        console.error("[AI Ranking] No valid selected items after runtime validation");
-        lastError = new Error("No valid selected items after runtime validation");
-        lastParseFailReason = "No valid items after runtime validation";
-        continue; // Try again if retries remaining
-      }
+          validSelectedItems.push(item);
+        }
+        
+        console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", singleItemResult.selected.length, "selected items");
+        
+        if (validSelectedItems.length === 0) {
+          console.error("[AI Ranking] No valid selected items after runtime validation");
+          lastError = new Error("No valid selected items after runtime validation");
+          lastParseFailReason = "No valid items after runtime validation";
+          continue; // Try again if retries remaining
+        }
 
-      // Extract handles and build reasoning
-      const rankedHandles = validSelectedItems
-        .slice(0, resultCount)
-        .map(item => item.handle.trim());
-      
-      // Build reasoning from evidence and reasons
-      let reasoning: string;
-      if (!trustFallback && hardTerms.length > 0) {
-        const matchedTerms = [...new Set(validSelectedItems.flatMap(item => item.evidence?.matchedHardTerms || []))];
-        const facetParts: string[] = [];
-        if (hardFacetsForPrompt.size) facetParts.push(`size: ${hardFacetsForPrompt.size.join(", ")}`);
-        if (hardFacetsForPrompt.color) facetParts.push(`color: ${hardFacetsForPrompt.color.join(", ")}`);
-        if (hardFacetsForPrompt.material) facetParts.push(`material: ${hardFacetsForPrompt.material.join(", ")}`);
-        const facetsText = facetParts.length > 0 ? ` + ${facetParts.join(", ")}` : "";
-        reasoning = `Matched: ${matchedTerms.join(", ")}${facetsText}.`;
-      } else if (trustFallback && hardTerms.length > 0) {
-        reasoning = `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`;
-      } else {
-        reasoning = "AI-ranked products based on user intent.";
-      }
-      
-      // Add item reasons (concatenate, keep short)
-      const itemReasons = validSelectedItems
-        .slice(0, resultCount)
-        .map(item => item.reason)
-        .filter(Boolean)
-        .slice(0, 5); // Limit to first 5 to keep reasoning concise
-      
-      if (itemReasons.length > 0) {
-        reasoning += " " + itemReasons.join(" ");
-      }
+        // Extract handles and build reasoning
+        const rankedHandles = validSelectedItems
+          .slice(0, resultCount)
+          .map(item => item.handle.trim());
+        
+        // Build human-like reasoning from AI's item reasons (prioritize AI feedback)
+        const itemReasons = validSelectedItems
+          .slice(0, resultCount)
+          .map(item => item.reason)
+          .filter(Boolean);
+        
+        let reasoning: string;
+        
+        // Prioritize AI's human-like reasons if available
+        if (itemReasons.length > 0) {
+          // Use AI's reasons as primary feedback (more human-like)
+          reasoning = itemReasons.join(" ");
+          
+          // Add brief context if helpful (but keep it natural)
+          if (!trustFallback && hardTerms.length > 0 && itemReasons.length >= resultCount) {
+            // All items have reasons, so the AI feedback is comprehensive
+            // No need to add generic summary
+          } else if (trustFallback && hardTerms.length > 0) {
+            // Add context about alternatives if trustFallback
+            reasoning = `Showing closest matches to "${hardTerms.join(", ")}". ${reasoning}`;
+          }
+        } else {
+          // Fallback to summary if AI didn't provide reasons (shouldn't happen with structured output)
+          if (!trustFallback && hardTerms.length > 0) {
+              const matchedTerms = [...new Set(validSelectedItems.flatMap(item => item.evidence?.matchedHardTerms || []))];
+            const facetParts: string[] = [];
+            if (hardFacetsForPrompt.size) facetParts.push(`size: ${hardFacetsForPrompt.size.join(", ")}`);
+            if (hardFacetsForPrompt.color) facetParts.push(`color: ${hardFacetsForPrompt.color.join(", ")}`);
+            if (hardFacetsForPrompt.material) facetParts.push(`material: ${hardFacetsForPrompt.material.join(", ")}`);
+            const facetsText = facetParts.length > 0 ? ` with ${facetParts.join(", ")}` : "";
+            reasoning = `Selected products matching ${matchedTerms.join(", ")}${facetsText}.`;
+          } else if (trustFallback && hardTerms.length > 0) {
+            reasoning = `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`;
+          } else {
+            reasoning = "Selected products based on your preferences.";
+          }
+        }
 
-      console.log("[AI Ranking] Successfully ranked", rankedHandles.length, "products");
-      
-      // Cache the result for future requests (best-effort, don't block)
-      if (shopId) {
-        const cacheKey = generateCacheKey(
-          userIntent,
-          candidates,
-          resultCount,
-          variantConstraints,
-          variantPreferences,
-          includeTerms,
-          avoidTerms
-        );
-        // Store in cache asynchronously (don't await, don't block return)
-        setCachedRanking(
-          cacheKey,
-          shopId,
-          userIntent,
-          candidates,
+        console.log("[AI Ranking] Successfully ranked", rankedHandles.length, "products");
+        
+        // Cache the result for future requests (best-effort, don't block)
+        if (shopId) {
+          const cacheKey = generateCacheKey(
+            userIntent,
+            candidates,
+            resultCount,
+            variantConstraints,
+            variantPreferences,
+            includeTerms,
+            avoidTerms
+          );
+          // Store in cache asynchronously (don't await, don't block return)
+          setCachedRanking(
+            cacheKey,
+            shopId,
+            userIntent,
+            candidates,
+            rankedHandles,
+            reasoning,
+            resultCount
+          ).catch(err => {
+            console.error("[AI Ranking] Error caching result (non-blocking):", err);
+          });
+        }
+        
+        // NOTE: Billing is handled once per session after final results are computed.
+        // rankProductsWithAI should not create UsageEvents or set chargedAt/creditsBurned.
+        // This allows multi-pass AI ranking (top-up passes) without duplicate charges.
+        
+        return {
           rankedHandles,
           reasoning,
-          resultCount
-        ).catch(err => {
-          console.error("[AI Ranking] Error caching result (non-blocking):", err);
-        });
+        };
       }
-      
-      // NOTE: Billing is handled once per session after final results are computed.
-      // rankProductsWithAI should not create UsageEvents or set chargedAt/creditsBurned.
-      // This allows multi-pass AI ranking (top-up passes) without duplicate charges.
-      
-      return {
-        rankedHandles,
-        reasoning,
-      };
     } catch (error: any) {
       lastError = error;
       if (error.name === "AbortError") {

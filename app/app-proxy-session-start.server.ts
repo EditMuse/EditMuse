@@ -273,6 +273,145 @@ function parseIntentGeneric(
   };
 }
 
+/**
+ * Parse bundle intent: detect multi-item queries (e.g., "3 piece suit, shirt and trousers")
+ * Industry-agnostic bundle detection
+ */
+function parseBundleIntentGeneric(userIntent: string): {
+  isBundle: boolean;
+  items: Array<{ hardTerms: string[]; quantity: number }>;
+  totalBudget?: number;
+} {
+  const lowerText = userIntent.toLowerCase();
+  
+  // Category lexicon (reuse from parseIntentGeneric)
+  const categoryPhrases = [
+    // Apparel
+    "suit", "dress", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "hoodie", "t-shirt", "tshirt",
+    "shorts", "skirt", "blouse", "polo", "tank", "blazer", "cardigan", "vest", "jumpsuit", "romper", "trousers",
+    // Home/Garden
+    "sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug",
+    "lamp", "vase", "mirror", "shelf", "cabinet", "drawer", "plant", "lawn mower", "mower", "shed",
+    "fence", "garden tool", "watering can", "pot", "planter", "outdoor furniture", "coffee table",
+    // Beauty/Fitness
+    "serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner",
+    "perfume", "cologne", "shampoo", "conditioner", "treadmill", "dumbbell", "yoga mat", "resistance band",
+    "exercise bike", "rowing machine", "elliptical",
+    // Electronics
+    "phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch",
+    // General
+    "book", "bag", "backpack", "wallet", "jewelry", "necklace", "ring", "earring", "bracelet",
+    "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper",
+  ];
+  
+  // Category synonyms (reuse from parseIntentGeneric)
+  const categorySynonyms: Record<string, string[]> = {
+    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit"],
+    "dress": ["dress", "gown", "frock", "ladies dress"],
+    "shirt": ["shirt", "button-up", "button down", "dress shirt"],
+    "sofa": ["sofa", "couch", "settee", "chesterfield"],
+    "treadmill": ["treadmill", "running machine", "running treadmill"],
+    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
+    "mattress": ["mattress", "bed mattress", "sleep mattress"],
+    "perfume": ["perfume", "fragrance", "cologne", "eau de parfum"],
+    "laptop": ["laptop", "notebook", "laptop computer"],
+    "headphone": ["headphone", "headphones", "earphones", "earbuds"],
+  };
+  
+  // Soft words that are NOT categories (ignore these)
+  const softWords = new Set(["complete", "outfit", "set", "kit", "bundle", "package", "collection"]);
+  
+  // Find all category mentions in the intent
+  const foundCategories: Array<{ term: string; position: number }> = [];
+  
+  for (const phrase of categoryPhrases) {
+    const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "gi");
+    let match;
+    while ((match = regex.exec(lowerText)) !== null) {
+      // Check if it's not part of a soft word
+      const before = lowerText.substring(Math.max(0, match.index - 10), match.index);
+      const after = lowerText.substring(match.index + match[0].length, Math.min(lowerText.length, match.index + match[0].length + 10));
+      const context = (before + " " + after).toLowerCase();
+      
+      // Skip if it's part of a soft word phrase
+      let isSoftWord = false;
+      for (const soft of softWords) {
+        if (context.includes(soft)) {
+          isSoftWord = true;
+          break;
+        }
+      }
+      
+      if (!isSoftWord) {
+        foundCategories.push({ term: phrase, position: match.index });
+      }
+    }
+  }
+  
+  // Check for bundle indicators: commas, "and", "+"
+  const bundleIndicators = [
+    /,\s*and\s+/i,
+    /,\s+/,
+    /\s+and\s+/i,
+    /\s+\+\s+/,
+  ];
+  
+  let hasBundleIndicator = false;
+  for (const pattern of bundleIndicators) {
+    if (pattern.test(userIntent)) {
+      hasBundleIndicator = true;
+      break;
+    }
+  }
+  
+  // Bundle detected if: ≥2 distinct categories AND bundle indicators present
+  const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
+  const isBundle = uniqueCategories.length >= 2 && hasBundleIndicator;
+  
+  if (!isBundle) {
+    return { isBundle: false, items: [] };
+  }
+  
+  // Extract items with quantities
+  const items: Array<{ hardTerms: string[]; quantity: number }> = [];
+  const seenTerms = new Set<string>();
+  
+  for (const { term } of foundCategories) {
+    if (seenTerms.has(term.toLowerCase())) continue;
+    seenTerms.add(term.toLowerCase());
+    
+    // Check for quantity prefix (e.g., "3 piece suit")
+    const quantityMatch = lowerText.match(new RegExp(`(\\d+)\\s*(?:piece|pc|pcs)?\\s*${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"));
+    const quantity = quantityMatch ? parseInt(quantityMatch[1], 10) : 1;
+    
+    // Expand with synonyms
+    const hardTerms = [term];
+    const synonyms = categorySynonyms[term.toLowerCase()];
+    if (synonyms) {
+      hardTerms.push(...synonyms.filter(s => s.toLowerCase() !== term.toLowerCase()));
+    }
+    
+    items.push({ hardTerms, quantity });
+  }
+  
+  // Extract total budget if mentioned
+  let totalBudget: number | undefined = undefined;
+  const budgetPatterns = [
+    /(?:total|budget|spend|under|up to|max|maximum)\s*(?:of\s*)?\$?(\d+)/i,
+    /\$(\d+)\s*(?:total|budget|for all|for everything)/i,
+  ];
+  
+  for (const pattern of budgetPatterns) {
+    const match = userIntent.match(pattern);
+    if (match) {
+      totalBudget = parseFloat(match[1]);
+      break;
+    }
+  }
+  
+  return { isBundle: true, items, totalBudget };
+}
+
 function mergeConstraints(a: VariantConstraints, b: VariantConstraints): VariantConstraints {
   // a has priority over b
   return {
@@ -1246,6 +1385,49 @@ export async function proxySessionStartAction(
       const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
       const { hardTerms, softTerms, avoidTerms, hardFacets } = intentParse;
       
+      // Parse bundle intent
+      const bundleIntent = parseBundleIntentGeneric(userIntent);
+      console.log("[Bundle] detected:", bundleIntent.isBundle, "items:", bundleIntent.items.length, "totalBudget:", bundleIntent.totalBudget);
+      
+      // Allocate budget per item if total budget provided
+      type BundleItemWithBudget = { hardTerms: string[]; quantity: number; budgetMin?: number; budgetMax?: number };
+      function allocateBudgetPerItem(
+        items: Array<{ hardTerms: string[]; quantity: number }>,
+        totalBudget: number
+      ): BundleItemWithBudget[] {
+        if (items.length === 0) return [];
+        
+        const allocated: Array<{ hardTerms: string[]; quantity: number; budgetMin?: number; budgetMax?: number }> = [];
+        
+        if (items.length === 1) {
+          // Single item gets full budget
+          allocated.push({ ...items[0], budgetMax: totalBudget });
+        } else if (items.length === 2) {
+          // First item 70%, second 30%
+          allocated.push({ ...items[0], budgetMax: totalBudget * 0.7 });
+          allocated.push({ ...items[1], budgetMax: totalBudget * 0.3 });
+        } else {
+          // 3+ items: first 60%, rest split evenly
+          const remainingPercent = 0.4 / (items.length - 1);
+          allocated.push({ ...items[0], budgetMax: totalBudget * 0.6 });
+          for (let i = 1; i < items.length; i++) {
+            allocated.push({ ...items[i], budgetMax: totalBudget * remainingPercent });
+          }
+        }
+        
+        return allocated;
+      }
+      
+      const bundleItemsWithBudget: BundleItemWithBudget[] = bundleIntent.isBundle && bundleIntent.totalBudget
+        ? allocateBudgetPerItem(bundleIntent.items, bundleIntent.totalBudget)
+        : bundleIntent.items.map(item => ({ ...item }));
+      
+      if (bundleIntent.isBundle) {
+        console.log("[Bundle] allocated budgets:", bundleItemsWithBudget.map((item, idx) => 
+          `item${idx}: ${item.hardTerms[0]} max=$${item.budgetMax?.toFixed(2) || "unlimited"}`
+        ));
+      }
+      
       console.log("[App Proxy] [Layer 2] Hard terms:", hardTerms);
       console.log("[App Proxy] [Layer 2] Soft terms:", softTerms);
       console.log("[App Proxy] [Layer 2] Avoid terms:", avoidTerms);
@@ -1567,13 +1749,117 @@ export async function proxySessionStartAction(
       }
 
       // LAYER 3: AI Rerank (intent-safe)
-      // Use pre-ranked topCandidates (already BM25 scored and gated)
-      console.log("[App Proxy] [Layer 3] Preparing candidates for AI ranking");
+      // Branch: Bundle handling vs single-item handling
+      let sortedCandidates: EnrichedCandidate[];
+      let isBundleMode = false;
       
-      // Use pre-ranked top candidates (already sorted by BM25 + boosts)
-      const sortedCandidates = topCandidates;
-      
-      console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "pre-ranked candidates to AI");
+      if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        // BUNDLE PATH: Handle multi-item queries
+        isBundleMode = true;
+        console.log("[Bundle] [Layer 3] Processing bundle with", bundleIntent.items.length, "items");
+        
+        // Gate candidates per item
+        const itemGatedPools: Array<{ itemIndex: number; candidates: EnrichedCandidate[]; hardTerms: string[] }> = [];
+        
+        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+          const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
+          const itemHardTerms = bundleItem.hardTerms;
+          
+          // Gate candidates for this item using existing gating logic
+          const itemGated: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+            // Apply facet gating
+            if (hardFacets.size && c.sizes.length > 0) {
+              const sizeMatch = c.sizes.some((s: string) => 
+                normalizeText(s) === normalizeText(hardFacets.size) ||
+                normalizeText(s).includes(normalizeText(hardFacets.size)) ||
+                normalizeText(hardFacets.size).includes(normalizeText(s))
+              );
+              if (!sizeMatch) return false;
+            }
+            if (hardFacets.color && c.colors.length > 0) {
+              const colorMatch = c.colors.some((col: string) => 
+                normalizeText(col) === normalizeText(hardFacets.color) ||
+                normalizeText(col).includes(normalizeText(hardFacets.color)) ||
+                normalizeText(hardFacets.color).includes(normalizeText(col))
+              );
+              if (!colorMatch) return false;
+            }
+            if (hardFacets.material && c.materials.length > 0) {
+              const materialMatch = c.materials.some((m: string) => 
+                normalizeText(m) === normalizeText(hardFacets.material) ||
+                normalizeText(m).includes(normalizeText(hardFacets.material)) ||
+                normalizeText(hardFacets.material).includes(normalizeText(m))
+              );
+              if (!materialMatch) return false;
+            }
+            
+            // Apply hard term matching for this item
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (!hasItemMatch) return false;
+            
+            // Apply budget constraint if present
+            if (bundleItem.budgetMax) {
+              const price = c.price ? parseFloat(String(c.price)) : NaN;
+              if (Number.isFinite(price) && price > bundleItem.budgetMax) return false;
+            }
+            
+            return true;
+          });
+          
+          // Pre-rank with BM25 for this item
+          const itemTokens = itemHardTerms.flatMap(t => tokenize(t));
+          const itemIdf = calculateIDF(itemGated.map(c => ({ tokens: tokenize(c.searchText) })));
+          const itemAvgLen = itemGated.reduce((sum, c) => sum + tokenize(c.searchText).length, 0) / itemGated.length || 1;
+          
+          const itemRanked = itemGated.map(c => {
+            const docTokens = tokenize(c.searchText);
+            const docTokenFreq = new Map<string, number>();
+            for (const token of docTokens) {
+              docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+            }
+            const score = bm25Score(itemTokens, docTokens, docTokenFreq, docTokens.length, itemAvgLen, itemIdf);
+            return { candidate: c, score };
+          });
+          
+          itemRanked.sort((a, b) => b.score - a.score);
+          const topK = Math.min(30, itemRanked.length);
+          const topCandidatesForItem = itemRanked.slice(0, topK).map(r => r.candidate);
+          
+          itemGatedPools.push({
+            itemIndex: itemIdx,
+            candidates: topCandidatesForItem,
+            hardTerms: itemHardTerms,
+          });
+          
+          console.log("[Bundle] item", itemIdx, `(${itemHardTerms[0]})`, "gated:", topCandidatesForItem.length, "candidates");
+        }
+        
+        // Combine all item candidates for AI (with itemIndex metadata)
+        const allBundleCandidates = itemGatedPools.flatMap(pool => 
+          pool.candidates.map(c => ({ ...c, _bundleItemIndex: pool.itemIndex, _bundleHardTerms: pool.hardTerms }))
+        ) as any[];
+        
+        console.log("[Bundle] total candidates for AI:", allBundleCandidates.length);
+        
+        // Use pre-ranked top candidates (already sorted by BM25 + boosts)
+        sortedCandidates = allBundleCandidates;
+        
+        console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "bundle candidates to AI");
+      } else {
+        // SINGLE-ITEM PATH: Existing logic (unchanged)
+        // Use pre-ranked top candidates (already sorted by BM25 + boosts)
+        sortedCandidates = topCandidates;
+        
+        console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "pre-ranked candidates to AI");
+      }
 
       // AI pass #1 + Top-up passes (no extra charge)
       const targetCount = Math.min(resultCountUsed, sortedCandidates.length);
@@ -1591,15 +1877,114 @@ export async function proxySessionStartAction(
       let used = new Set<string>();
       let offset = 0;
 
-      const window1 = buildWindow(offset, used);
-      
-      // Convert hardFacets to array format for AI prompt
-      const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
-      if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
-      if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
-      if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
-      
-      const ai1 = await rankProductsWithAI(
+      // Bundle handling: use AI bundle ranking
+      if (isBundleMode && bundleIntent.items.length >= 2) {
+        console.log("[Bundle] Using AI bundle ranking");
+        const window1 = buildWindow(offset, used);
+        
+        // Convert hardFacets to array format for AI prompt
+        const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
+        if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
+        if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
+        if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
+        
+        try {
+          const aiBundle = await rankProductsWithAI(
+            userIntent,
+            window1,
+            targetCount,
+            shop.id,
+            sessionToken,
+            variantConstraints2,
+            variantPreferences,
+            includeTerms,
+            avoidTerms,
+            {
+              hardTerms,
+              hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+              avoidTerms,
+              trustFallback,
+              isBundle: true,
+              bundleItems: bundleItemsWithBudget.map(item => ({
+                hardTerms: item.hardTerms,
+                quantity: item.quantity,
+                budgetMax: item.budgetMax,
+              })),
+            }
+          );
+          
+          if (aiBundle.rankedHandles?.length) {
+            finalHandles = aiBundle.rankedHandles;
+            reasoningParts.push(aiBundle.reasoning);
+            console.log("[Bundle] AI returned", finalHandles.length, "handles");
+          } else {
+            // Fallback to deterministic selection if AI fails
+            console.log("[Bundle] AI failed, using deterministic fallback");
+            const bundleFinalHandles: string[] = [];
+            const itemPools = new Map<number, EnrichedCandidate[]>();
+            for (const c of sortedCandidates) {
+              const itemIdx = (c as any)._bundleItemIndex;
+              if (typeof itemIdx === "number") {
+                if (!itemPools.has(itemIdx)) {
+                  itemPools.set(itemIdx, []);
+                }
+                itemPools.get(itemIdx)!.push(c);
+              }
+            }
+            
+            for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+              const pool = itemPools.get(itemIdx) || [];
+              if (pool.length > 0) {
+                bundleFinalHandles.push(pool[0].handle);
+              }
+            }
+            
+            const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+            const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+            finalHandles = bundleFinalHandles.slice(0, resultCountUsed);
+            reasoningParts.push(`Built a bundle: ${itemNames}${budgetText}.`);
+          }
+        } catch (error) {
+          console.error("[Bundle] AI ranking error:", error);
+          // Fallback to deterministic selection
+          const bundleFinalHandles: string[] = [];
+          const itemPools = new Map<number, EnrichedCandidate[]>();
+          for (const c of sortedCandidates) {
+            const itemIdx = (c as any)._bundleItemIndex;
+            if (typeof itemIdx === "number") {
+              if (!itemPools.has(itemIdx)) {
+                itemPools.set(itemIdx, []);
+              }
+              itemPools.get(itemIdx)!.push(c);
+            }
+          }
+          
+          for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+            const pool = itemPools.get(itemIdx) || [];
+            if (pool.length > 0) {
+              bundleFinalHandles.push(pool[0].handle);
+            }
+          }
+          
+          const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+          const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+          finalHandles = bundleFinalHandles.slice(0, resultCountUsed);
+          reasoningParts.push(`Built a bundle: ${itemNames}${budgetText}.`);
+        }
+        
+        console.log("[Bundle] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
+        console.log("[Bundle] trustFallback=", trustFallback);
+      } else {
+        // SINGLE-ITEM PATH: Existing AI ranking logic
+        const window1 = buildWindow(offset, used);
+        
+        // Convert hardFacets to array format for AI prompt
+        const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
+        if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
+        if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
+        if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
+        
+        const ai1 = await rankProductsWithAI(
         userIntent,
         window1,
         targetCount,
@@ -1614,6 +1999,14 @@ export async function proxySessionStartAction(
           hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
           avoidTerms,
           trustFallback,
+          ...(isBundleMode ? {
+            isBundle: true,
+            bundleItems: bundleItemsWithBudget.map(item => ({
+              hardTerms: item.hardTerms,
+              quantity: item.quantity,
+              budgetMax: item.budgetMax,
+            })),
+          } : {}),
         }
       );
 
@@ -1700,6 +2093,7 @@ export async function proxySessionStartAction(
 
         pass++;
       }
+      } // End of single-item path else block
 
       // LAYER 3: Post-validation (validate final handles against hard constraints)
       console.log("[App Proxy] [Layer 3] Validating final handles");
@@ -1783,8 +2177,53 @@ export async function proxySessionStartAction(
       }
       
       // Validate final handles (use enriched candidates)
-      const validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+      let validatedHandles: string[];
+      if (isBundleMode && !trustFallback) {
+        // Bundle validation: ensure each handle belongs to correct item's pool
+        const itemPools = new Map<number, Set<string>>();
+        for (const c of sortedCandidates) {
+          const itemIdx = (c as any)._bundleItemIndex;
+          if (typeof itemIdx === "number") {
+            if (!itemPools.has(itemIdx)) {
+              itemPools.set(itemIdx, new Set());
+            }
+            itemPools.get(itemIdx)!.add(c.handle);
+          }
+        }
+        
+        validatedHandles = finalHandles.filter(handle => {
+          // Check if handle belongs to any item pool
+          for (const pool of itemPools.values()) {
+            if (pool.has(handle)) return true;
+          }
+          return false;
+        });
+        console.log("[Bundle] validated", validatedHandles.length, "handles (all from item pools)");
+      } else {
+        validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+      }
       console.log("[App Proxy] [Layer 3] Validated handles:", validatedHandles.length, "out of", finalHandles.length);
+      
+      // Bundle budget validation
+      if (isBundleMode && bundleIntent.totalBudget) {
+        const candidateMap = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        const totalPrice = validatedHandles.reduce((sum, handle) => {
+          const candidate = candidateMap.get(handle);
+          if (candidate && candidate.price) {
+            const price = parseFloat(String(candidate.price));
+            return sum + (Number.isFinite(price) ? price : 0);
+          }
+          return sum;
+        }, 0);
+        
+        if (totalPrice > bundleIntent.totalBudget) {
+          trustFallback = true;
+          relaxNotes.push(`Bundle total ($${totalPrice.toFixed(2)}) exceeds budget ($${bundleIntent.totalBudget}); showing closest matches.`);
+          console.log("[Bundle] budget exceeded:", totalPrice, ">", bundleIntent.totalBudget, "trustFallback=", trustFallback);
+        } else {
+          console.log("[Bundle] budget check passed:", totalPrice, "<=", bundleIntent.totalBudget);
+        }
+      }
       
       // Top-up ONLY from gated pool (intent-safe)
       function uniq<T>(arr: T[]) {
