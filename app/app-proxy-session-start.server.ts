@@ -1294,6 +1294,11 @@ export async function proxySessionStartAction(
       
       console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
       
+      // Denylist for common false positives (word that contains the term but isn't the term)
+      const DENYLIST: Record<string, string[]> = {
+        "suit": ["suitcase", "suitable", "suited", "suiting"],
+      };
+      
       // Helper function for word-boundary matching of hard terms
       // Matches terms with word boundaries to prevent false positives (e.g., "suit" matches " suit " but not "suitable")
       function matchesHardTermWithBoundary(searchText: string, hardTerm: string): boolean {
@@ -1306,15 +1311,34 @@ export async function proxySessionStartAction(
         
         // Check if term contains spaces (multi-word phrase)
         if (normalizedTerm.includes(" ")) {
-          // Multi-word: match as phrase with word boundaries
+          // Multi-word: require phrase match with word boundaries (normalized whitespace)
           // Replace spaces with \s+ to allow flexible whitespace
           const phrasePattern = escapedTerm.replace(/\s+/g, "\\s+");
           const regex = new RegExp(`\\b${phrasePattern}\\b`, "i");
           return regex.test(normalized);
         } else {
-          // Single word: match with word boundaries (prevents "suit" matching "suitable" or "suitcase")
+          // Single word: match with word boundaries (e.g., \bsuit\b)
           const regex = new RegExp(`\\b${escapedTerm}\\b`, "i");
-          return regex.test(normalized);
+          const hasMatch = regex.test(normalized);
+          
+          if (!hasMatch) {
+            return false;
+          }
+          
+          // Check denylist: if term has denylist entries and match is only substring-based, reject
+          const denylistTerms = DENYLIST[normalizedTerm];
+          if (denylistTerms && denylistTerms.length > 0) {
+            // Check if any denylist term appears in the normalized text
+            for (const denied of denylistTerms) {
+              const deniedRegex = new RegExp(`\\b${denied.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+              if (deniedRegex.test(normalized)) {
+                // Denylist term found - this is a false positive, reject the match
+                return false;
+              }
+            }
+          }
+          
+          return true;
         }
       }
       
@@ -1336,22 +1360,23 @@ export async function proxySessionStartAction(
       const strictGate: EnrichedCandidate[] = [];
       
       if (hardTerms.length > 0) {
-        // Build normalized search text from title/productType/tags/descPlain for word-boundary matching
+        // Build normalized haystack: title + productType + tags.join(" ") + vendor + searchText
         for (const candidate of gatedCandidates) {
-          // Combine fields and normalize for word-boundary matching
-          const searchFields = [
+          // Combine fields into single normalized haystack for word-boundary matching
+          const haystack = [
             candidate.title || "",
             candidate.productType || "",
-            ...(candidate.tags || []),
-            candidate.descPlain || "",
+            (candidate.tags || []).join(" "),
+            candidate.vendor || "",
+            candidate.searchText || "",
           ].join(" ");
           
           // Check hard terms with word-boundary matching (not substring/token matching)
           // Multi-word terms are matched as phrases, single-word terms use word boundaries
-          const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(searchFields, phrase));
+          const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(haystack, phrase));
           
           // Also check boost terms (if user intent suggests them)
-          const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(searchFields, term));
+          const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
           
           if (hasHardTermMatch || hasBoostTerm) {
             strictGate.push(candidate);
@@ -1371,11 +1396,13 @@ export async function proxySessionStartAction(
           
           // First try: word-boundary matching but allow any word from multi-word phrases
           const broadGate = gatedCandidates.filter(candidate => {
-            const searchFields = [
+            // Build normalized haystack: title + productType + tags.join(" ") + vendor + searchText
+            const haystack = [
               candidate.title || "",
               candidate.productType || "",
-              ...(candidate.tags || []),
-              candidate.descPlain || "",
+              (candidate.tags || []).join(" "),
+              candidate.vendor || "",
+              candidate.searchText || "",
             ].join(" ");
             
             // For multi-word hard terms, check if any individual word matches with word boundaries
@@ -1385,10 +1412,10 @@ export async function proxySessionStartAction(
               if (normalizedPhrase.includes(" ")) {
                 // Multi-word: check if any word from the phrase matches with word boundaries
                 const words = normalizedPhrase.split(/\s+/);
-                return words.some(word => matchesHardTermWithBoundary(searchFields, word));
+                return words.some(word => matchesHardTermWithBoundary(haystack, word));
               } else {
                 // Single-word: use word-boundary matching
-                return matchesHardTermWithBoundary(searchFields, phrase);
+                return matchesHardTermWithBoundary(haystack, phrase);
               }
             });
           });
@@ -1437,23 +1464,24 @@ export async function proxySessionStartAction(
         // BM25 score
         let score = bm25Score(allQueryTokens, docTokens, docTokenFreq, docTokens.length, avgDocLen, idf);
         
-        // Boost for exact phrase match in title/productType/tags using word-boundary matching
-        const searchFields = [
+        // Boost for exact phrase match using normalized haystack: title + productType + tags.join(" ") + vendor + searchText
+        const haystack = [
           c.title || "",
           c.productType || "",
-          ...(c.tags || []),
-          c.descPlain || "", // Also check description
-        ].join(" ").toLowerCase();
+          (c.tags || []).join(" "),
+          c.vendor || "",
+          c.searchText || "",
+        ].join(" ");
         
         for (const hardTerm of hardTerms) {
-          if (matchesHardTermWithBoundary(searchFields, hardTerm)) {
+          if (matchesHardTermWithBoundary(haystack, hardTerm)) {
             score += 2.0; // Boost for exact phrase match with word boundaries
           }
         }
         
         // Boost for special terms (3 piece, waistcoat, etc.)
         for (const boostTerm of boostTerms) {
-          if (matchesHardTermWithBoundary(searchFields, boostTerm)) {
+          if (matchesHardTermWithBoundary(haystack, boostTerm)) {
             score += 1.5; // Boost for related fashion terms
           }
         }
@@ -1724,20 +1752,22 @@ export async function proxySessionStartAction(
             if (!materialMatch) passesFacets = false;
           }
           
-          // Check hard terms (if any) using word-boundary matching on normalized text
+          // Check hard terms (if any) using word-boundary matching on normalized haystack
           if (hardTerms.length > 0 && passesFacets) {
-            const searchFields = [
+            // Build normalized haystack: title + productType + tags.join(" ") + vendor + searchText
+            const haystack = [
               candidate.title || "",
               candidate.productType || "",
-              ...(candidate.tags || []),
-              candidate.descPlain || "",
+              (candidate.tags || []).join(" "),
+              candidate.vendor || "",
+              candidate.searchText || "",
             ].join(" ");
             
             // Use word-boundary matching for all hard terms (not token matching)
-            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(searchFields, phrase));
+            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(haystack, phrase));
             
             // Also check boost terms
-            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(searchFields, term));
+            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
             
             if (!hasHardTermMatch && !hasBoostTerm) {
               passesFacets = false;

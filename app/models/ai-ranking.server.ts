@@ -78,7 +78,7 @@ interface StructuredRankingResult {
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "45000"); // Configurable timeout, default 45 seconds
-const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total
+const MAX_RETRIES = 2; // Max 2 retries, so at most 3 attempts total (initial attempt + 2 retries)
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
 
@@ -91,6 +91,14 @@ const JSON_MODE_SUPPORTED_MODELS = new Set([
   "gpt-3.5-turbo",
   "o1-preview",
   "o1-mini",
+]);
+
+// Models that support JSON schema (response_format: { type: "json_schema", json_schema: {...} })
+const JSON_SCHEMA_SUPPORTED_MODELS = new Set([
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-4-turbo",
+  "gpt-4-turbo-preview",
 ]);
 
 /**
@@ -156,6 +164,63 @@ function enhanceUserIntent(userIntent: string): string {
     .replace(/\bthings\b/gi, "products");
   
   return enhanced;
+}
+
+/**
+ * Typed error for JSON parsing failures
+ */
+class JSONParseError extends Error {
+  constructor(message: string, public readonly originalContent: string) {
+    super(message);
+    this.name = "JSONParseError";
+  }
+}
+
+/**
+ * Parses structured ranking JSON from OpenAI response content
+ * Handles markdown fences, extracts JSON object, removes trailing commas, and parses
+ * @throws {JSONParseError} if parsing fails
+ */
+function parseStructuredRanking(content: string): StructuredRankingResult {
+  if (!content || typeof content !== "string") {
+    throw new JSONParseError("Content is empty or not a string", content || "");
+  }
+  
+  let cleaned = content.trim();
+  
+  // 1) Strip markdown fences
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (codeBlockMatch) {
+    cleaned = codeBlockMatch[1].trim();
+  }
+  
+  // 2) Find first '{' and last '}' and extract that slice
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new JSONParseError("Could not find valid JSON object boundaries", content);
+  }
+  
+  let jsonSlice = cleaned.substring(firstBrace, lastBrace + 1);
+  
+  // 3) Remove trailing commas before ']' or '}'
+  // This regex matches a comma followed by optional whitespace and then ']' or '}'
+  // Apply multiple times to handle nested cases (e.g., "], }")
+  let prevLength = 0;
+  while (jsonSlice.length !== prevLength) {
+    prevLength = jsonSlice.length;
+    jsonSlice = jsonSlice.replace(/,(\s*[}\]])/g, "$1");
+  }
+  
+  // 4) Attempt JSON.parse
+  try {
+    const parsed = JSON.parse(jsonSlice);
+    return parsed as StructuredRankingResult;
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    throw new JSONParseError(`JSON.parse failed: ${errorMessage}`, content);
+  }
 }
 
 /**
@@ -525,8 +590,10 @@ export async function rankProductsWithAI(
 
   const model = getOpenAIModel();
   const supportsJsonMode = JSON_MODE_SUPPORTED_MODELS.has(model);
+  const supportsJsonSchema = JSON_SCHEMA_SUPPORTED_MODELS.has(model);
   console.log("[AI Ranking] Starting AI ranking with model:", model, "candidates:", candidates.length);
   console.log("[AI Ranking] json_mode=", supportsJsonMode);
+  console.log("[AI Ranking] json_schema=", supportsJsonSchema);
 
   // Enhance user intent for better AI understanding
   const enhancedIntent = enhanceUserIntent(userIntent);
@@ -569,7 +636,23 @@ export async function rankProductsWithAI(
   // Build product list for prompt (limit to 200)
   // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
   // This function can be called with shortened=true to reduce payload for retries
-  function buildProductList(shortened: boolean = false): string {
+  function buildProductList(shortened: boolean = false, compressed: boolean = false): string {
+    if (compressed) {
+      // Compressed mode: only handle, title, productType, tags, available, price, searchText (truncated to 200 chars)
+      return candidates.slice(0, 200).map((p, idx) => {
+        const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
+        const searchText = (p as any).searchText ? ((p as any).searchText.substring(0, 200)) : "";
+        
+        return `${idx + 1}. handle: ${p.handle}
+   title: ${p.title}
+   productType: ${p.productType || "unknown"}
+   tags: ${tags}
+   available: ${p.available ? "yes" : "no"}
+   price: ${p.price || "unknown"}
+   searchText: ${searchText}`;
+      }).join("\n\n");
+    }
+    
     const descLimit = shortened ? 400 : 500;
     
     return candidates.slice(0, 200).map((p, idx) => {
@@ -732,10 +815,23 @@ REQUIREMENTS:
     trustFallback,
   }, null, 2);
 
-  // Build user prompt (can be shortened for retries)
-  function buildUserPrompt(shortened: boolean = false): string {
-    const productListForPrompt = shortened ? buildProductList(true) : productList;
+  // Build user prompt (can be shortened or compressed for retries)
+  function buildUserPrompt(shortened: boolean = false, compressed: boolean = false): string {
+    const productListForPrompt = compressed 
+      ? buildProductList(false, true) 
+      : (shortened ? buildProductList(true) : productList);
     const intentForPrompt = shortened ? enhancedIntent.substring(0, 500) : enhancedIntent;
+    
+    // Update matching requirements for compressed mode
+    const matchingRequirements = compressed
+      ? `1. For each candidate, check if it satisfies the hard constraints:
+   - At least one hardTerm in title/productType/tags/searchText
+   - All hardFacets match (if provided in candidate data)
+   - No avoidTerms in title/tags/searchText`
+      : `1. For each candidate, check if it satisfies the hard constraints:
+   - At least one hardTerm in title/productType/tags/desc1000
+   - All hardFacets match (size/color/material in candidate arrays)
+   - No avoidTerms in title/tags/desc1000`;
     
     return `Shopper Intent:
 ${intentForPrompt}
@@ -743,10 +839,10 @@ ${intentForPrompt}
 Hard Constraints:
 ${hardConstraintsJson}
 
-${constraintsText ? `Variant Preferences:
+${constraintsText && !compressed ? `Variant Preferences:
 ${constraintsText}` : ""}
 
-${prefsText && prefsText !== "Variant option preferences: none" ? `${prefsText}${rulesText}` : ""}
+${prefsText && prefsText !== "Variant option preferences: none" && !compressed ? `${prefsText}${rulesText}` : ""}
 
 ${keywordText || ""}
 
@@ -754,10 +850,7 @@ Candidate Products (${candidates.length} total):
 ${productListForPrompt}
 
 TASK:
-1. For each candidate, check if it satisfies the hard constraints:
-   - At least one hardTerm in title/productType/tags/desc1000
-   - All hardFacets match (size/color/material in candidate arrays)
-   - No avoidTerms in title/tags/desc1000
+${matchingRequirements}
 
 2. Select exactly ${resultCount} products:
    ${trustFallback ? "- If ${resultCount} exact matches exist, return all as 'exact'" : "- ALL must be 'exact' matches (satisfy all hard constraints)"}
@@ -777,6 +870,62 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   
   let userPrompt = buildUserPrompt(false);
 
+  // Build JSON schema for StructuredRankingResult if supported
+  function buildJsonSchema() {
+    return {
+      type: "object",
+      properties: {
+        trustFallback: { type: "boolean" },
+        selected: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              handle: { type: "string" },
+              label: { type: "string", enum: ["exact", "alternative"] },
+              score: { type: "number", minimum: 0, maximum: 100 },
+              evidence: {
+                type: "object",
+                properties: {
+                  matchedHardTerms: { type: "array", items: { type: "string" } },
+                  matchedFacets: {
+                    type: "object",
+                    properties: {
+                      size: { type: "array", items: { type: "string" } },
+                      color: { type: "array", items: { type: "string" } },
+                      material: { type: "array", items: { type: "string" } },
+                    },
+                    additionalProperties: false,
+                  },
+                  fieldsUsed: { type: "array", items: { type: "string" } },
+                },
+                required: ["matchedHardTerms", "fieldsUsed"],
+                additionalProperties: false,
+              },
+              reason: { type: "string" },
+            },
+            required: ["handle", "label", "score", "evidence", "reason"],
+            additionalProperties: false,
+          },
+        },
+        rejected_candidates: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              handle: { type: "string" },
+              why: { type: "string" },
+            },
+            required: ["handle", "why"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["trustFallback", "selected"],
+      additionalProperties: false,
+    };
+  }
+
   // Attempt AI ranking with retries
   let lastError: any = null;
   let lastParseFailReason: string | undefined = undefined;
@@ -785,28 +934,37 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const isRetry = attempt > 0;
-      const useShortenedPrompt = isRetry && lastParseFailReason !== undefined;
+      const useCompressedPrompt = isRetry && lastParseFailReason !== undefined;
       
       if (isRetry) {
-        console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}${useShortenedPrompt ? " (using shortened prompt)" : ""}`);
+        console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}${useCompressedPrompt ? " (using compressed prompt)" : ""}`);
       }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-      // Build request body with JSON mode if supported
+      // Build request body with JSON mode/schema if supported
       const requestBody: any = {
         model,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: useShortenedPrompt ? buildUserPrompt(true) : userPrompt },
+          { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
         ],
-        temperature: 0.2,
+        temperature: 0, // Set to 0 for more deterministic output
         max_tokens: 1500,
       };
       
-      // Add JSON mode if supported
-      if (supportsJsonMode) {
+      // Add JSON schema if supported, otherwise JSON object mode
+      if (supportsJsonSchema) {
+        requestBody.response_format = {
+          type: "json_schema",
+          json_schema: {
+            name: "structured_ranking_result",
+            strict: true,
+            schema: buildJsonSchema(),
+          },
+        };
+      } else if (supportsJsonMode) {
         requestBody.response_format = { type: "json_object" };
       }
 
@@ -842,29 +1000,25 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
 
       console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
 
-      // Robust JSON extraction - extract balanced JSON object
-      const jsonContent = extractBalancedJSON(content);
-      
-      if (!jsonContent) {
-        console.error("[AI Ranking] Failed to extract JSON from response");
-        lastError = new Error("Failed to extract JSON from response");
-        lastParseFailReason = "Could not extract balanced JSON object";
-        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-        continue; // Try again if retries remaining
-      }
-
-      // Parse JSON response
+      // Parse JSON response using improved parser
       let structuredResult: StructuredRankingResult;
-      let parseError: any = null;
       
       try {
-        structuredResult = JSON.parse(jsonContent);
+        structuredResult = parseStructuredRanking(content);
       } catch (err) {
-        parseError = err;
-        lastError = err;
-        lastParseFailReason = `JSON.parse failed: ${err instanceof Error ? err.message : String(err)}`;
-        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-        continue; // Try again if retries remaining
+        if (err instanceof JSONParseError) {
+          lastError = err;
+          lastParseFailReason = err.message;
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          // This typed error triggers compressed retry
+          continue; // Try again if retries remaining
+        } else {
+          // Unexpected error type
+          lastError = err;
+          lastParseFailReason = `Unexpected parsing error: ${err instanceof Error ? err.message : String(err)}`;
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          continue; // Try again if retries remaining
+        }
       }
 
       // Validate against expected schema
@@ -920,11 +1074,12 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         // If trustFallback=false, validate constraints
         if (!trustFallback) {
           // Basic validation: check if hardTerm appears in candidate fields
+          // Use searchText if available (compressed mode), otherwise use desc1000
           const candidateText = [
             candidate.title || "",
             candidate.productType || "",
             ...(candidate.tags || []),
-            (candidate as any).desc1000 || cleanDescription(candidate.description) || "",
+            (candidate as any).searchText || (candidate as any).desc1000 || cleanDescription(candidate.description) || "",
           ].join(" ").toLowerCase();
           
           const hasHardTermMatch = item.evidence.matchedHardTerms.some((term: string) =>
