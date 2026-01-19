@@ -492,55 +492,15 @@ export async function fetchShopifyProductsGraphQL({
   let query: string;
   let variables: any;
 
+  const TARGET_COUNT = limit;
+  const PAGE_SIZE = 250; // Shopify max per page
+  let allProducts: any[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+
   if (collectionIds && collectionIds.length > 0) {
-    // Query products from specific collections
+    // Query products from specific collections with cursor pagination
     // Note: GraphQL Admin API uses collection IDs in format "gid://shopify/Collection/123"
-    query = `
-      query getProductsFromCollections($first: Int!, $collectionIds: [ID!]!) {
-        nodes(ids: $collectionIds) {
-          ... on Collection {
-            id
-            products(first: $first) {
-              edges {
-                node {
-                  handle
-                  title
-                  featuredImage {
-                    url
-                  }
-                  priceRange {
-                    minVariantPrice {
-                      amount
-                      currencyCode
-                    }
-                  }
-                  onlineStoreUrl
-                  tags
-                  totalInventory
-                  productType
-                  vendor
-                  description
-                  status
-                  options {
-                    name
-                    values
-                  }
-                  variants(first: 1) {
-                    edges {
-                      node {
-                        inventoryPolicy
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    `;
-    
-    // Convert collection IDs to GraphQL IDs if needed
     const graphqlCollectionIds = collectionIds.map(id => {
       if (id.startsWith("gid://")) {
         return id;
@@ -548,117 +508,232 @@ export async function fetchShopifyProductsGraphQL({
       return `gid://shopify/Collection/${id}`;
     });
     
-    variables = { 
-      first: Math.min(limit, 250), // Shopify limit per collection
-      collectionIds: graphqlCollectionIds 
-    };
-  } else {
-    // Query all products
-    query = `
-      query getProducts($first: Int!) {
-        products(first: $first, sortKey: CREATED_AT, reverse: true) {
-          edges {
-            node {
-              handle
-              title
-              featuredImage {
-                url
-              }
-              priceRange {
-                minVariantPrice {
-                  amount
-                  currencyCode
+    // Paginate through each collection
+    for (const collectionId of graphqlCollectionIds) {
+      hasNextPage = true;
+      cursor = null;
+      
+      while (hasNextPage && allProducts.length < TARGET_COUNT) {
+        const pageSize = Math.min(PAGE_SIZE, TARGET_COUNT - allProducts.length);
+        
+        query = `
+          query getProductsFromCollection($id: ID!, $first: Int!, $after: String) {
+            node(id: $id) {
+              ... on Collection {
+                id
+                products(first: $first, after: $after) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  edges {
+                    node {
+                      handle
+                      title
+                      featuredImage {
+                        url
+                      }
+                      priceRange {
+                        minVariantPrice {
+                          amount
+                          currencyCode
+                        }
+                      }
+                      onlineStoreUrl
+                      tags
+                      totalInventory
+                      productType
+                      vendor
+                      description
+                      status
+                      options {
+                        name
+                        values
+                      }
+                      variants(first: 1) {
+                        edges {
+                          node {
+                            inventoryPolicy
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
               }
-              onlineStoreUrl
-              tags
-              totalInventory
-              productType
-              vendor
-              description
-              status
-              options {
-                name
-                values
-              }
-              variants(first: 1) {
-                edges {
-                  node {
-                    inventoryPolicy
+            }
+          }
+        `;
+        
+        variables = { 
+          id: collectionId,
+          first: pageSize,
+          after: cursor
+        };
+        
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "X-Shopify-Access-Token": accessToken,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            query,
+            variables,
+          }),
+          redirect: "manual",
+        });
+
+        // Check for redirect to password page
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get("location");
+          if (location && location.includes("/password")) {
+            throw new Error(
+              `Request redirected to password page. This usually means:\n` +
+              `1. The access token is invalid or expired\n` +
+              `2. The shopDomain "${shopDomain}" is incorrect\n` +
+              `3. The app needs to be reinstalled. Admin API should not require storefront password.`
+            );
+          }
+        }
+
+        if (!response.ok) {
+          const errorBody = await response.text().catch(() => "");
+          throw new Error(
+            `Shopify GraphQL API error: ${response.status} ${response.statusText}\n` +
+            `URL: ${url}\n` +
+            `Response: ${errorBody.substring(0, 500)}`
+          );
+        }
+
+        const data = await response.json();
+
+        if (data.errors) {
+          throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+        }
+
+        const collection = data.data?.node;
+        if (collection?.products?.edges) {
+          const pageProducts = collection.products.edges.map((edge: any) => edge.node);
+          // Deduplicate by handle
+          for (const product of pageProducts) {
+            if (!allProducts.find(p => p.handle === product.handle)) {
+              allProducts.push(product);
+            }
+          }
+          
+          const pageInfo = collection.products.pageInfo;
+          hasNextPage = pageInfo?.hasNextPage || false;
+          cursor = pageInfo?.endCursor || null;
+        } else {
+          hasNextPage = false;
+        }
+      }
+    }
+  } else {
+    // Query all products with cursor pagination
+    while (hasNextPage && allProducts.length < TARGET_COUNT) {
+      const pageSize = Math.min(PAGE_SIZE, TARGET_COUNT - allProducts.length);
+      
+      query = `
+        query getProducts($first: Int!, $after: String) {
+          products(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                handle
+                title
+                featuredImage {
+                  url
+                }
+                priceRange {
+                  minVariantPrice {
+                    amount
+                    currencyCode
+                  }
+                }
+                onlineStoreUrl
+                tags
+                totalInventory
+                productType
+                vendor
+                description
+                status
+                options {
+                  name
+                  values
+                }
+                variants(first: 1) {
+                  edges {
+                    node {
+                      inventoryPolicy
+                    }
                   }
                 }
               }
             }
           }
         }
+      `;
+      
+      variables = { 
+        first: pageSize,
+        after: cursor
+      };
+      
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "X-Shopify-Access-Token": accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query,
+          variables,
+        }),
+        redirect: "manual",
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        throw new Error(
+          `Shopify GraphQL API error: ${response.status} ${response.statusText}\n` +
+          `URL: ${url}\n` +
+          `Response: ${errorBody.substring(0, 500)}`
+        );
       }
-    `;
-    variables = { first: limit };
+
+      const data = await response.json();
+
+      if (data.errors) {
+        throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+      }
+
+      const productsData = data.data?.products;
+      if (productsData?.edges) {
+        const pageProducts = productsData.edges.map((edge: any) => edge.node);
+        allProducts.push(...pageProducts);
+        
+        const pageInfo = productsData.pageInfo;
+        hasNextPage = pageInfo?.hasNextPage || false;
+        cursor = pageInfo?.endCursor || null;
+      } else {
+        hasNextPage = false;
+      }
+    }
   }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": accessToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query,
-      variables,
-    }),
-    redirect: "manual", // Don't follow redirects automatically
+  // Products are now collected in allProducts array from pagination loop above
+  const products = allProducts.slice(0, TARGET_COUNT);
+  
+  console.log("[Shopify Fetch] GraphQL paginated", {
+    totalFetched: products.length,
+    targetCount: TARGET_COUNT,
+    hadMorePages: hasNextPage && products.length >= TARGET_COUNT,
   });
-
-  // Check for redirect to password page (common with password-protected stores)
-  if (response.status >= 300 && response.status < 400) {
-    const location = response.headers.get("location");
-    if (location && location.includes("/password")) {
-      throw new Error(
-        `Request redirected to password page. This usually means:\n` +
-        `1. The access token is invalid or expired\n` +
-        `2. The shopDomain "${shopDomain}" is incorrect\n` +
-        `3. The app needs to be reinstalled. Admin API should not require storefront password.`
-      );
-    }
-  }
-
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => "");
-    throw new Error(
-      `Shopify GraphQL API error: ${response.status} ${response.statusText}\n` +
-      `URL: ${url}\n` +
-      `Response: ${errorBody.substring(0, 500)}`
-    );
-  }
-
-  const data = await response.json();
-
-  if (data.errors) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
-  }
-
-  let products: any[] = [];
-
-  if (collectionIds && collectionIds.length > 0) {
-    // Merge products from all collections
-    const allProducts = new Map<string, any>();
-    
-    const collections = data.data?.nodes || [];
-    for (const collection of collections) {
-      if (collection?.products?.edges) {
-        for (const edge of collection.products.edges) {
-          const node = edge.node;
-          if (!allProducts.has(node.handle)) {
-            allProducts.set(node.handle, node);
-          }
-        }
-      }
-    }
-    
-    products = Array.from(allProducts.values());
-  } else {
-    products = data.data?.products?.edges?.map((edge: any) => edge.node) || [];
-  }
 
   const mapped = products.map((node: any) => {
     const priceData = node.priceRange?.minVariantPrice;

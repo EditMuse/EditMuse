@@ -280,7 +280,7 @@ function parseIntentGeneric(
 function parseBundleIntentGeneric(userIntent: string): {
   isBundle: boolean;
   items: Array<{ hardTerms: string[]; quantity: number }>;
-  totalBudget?: number;
+  totalBudget: number | null;
 } {
   const lowerText = userIntent.toLowerCase();
   
@@ -367,9 +367,9 @@ function parseBundleIntentGeneric(userIntent: string): {
   // Bundle detected if: ≥2 distinct categories AND bundle indicators present
   const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
   const isBundle = uniqueCategories.length >= 2 && hasBundleIndicator;
-  
+
   if (!isBundle) {
-    return { isBundle: false, items: [] };
+    return { isBundle: false, items: [], totalBudget: null };
   }
   
   // Extract items with quantities
@@ -395,18 +395,44 @@ function parseBundleIntentGeneric(userIntent: string): {
   }
   
   // Extract total budget if mentioned
-  let totalBudget: number | undefined = undefined;
+  // Support phrases like:
+  // - "total budget is $500"
+  // - "my total budget is 500"
+  // - "budget is $500"
+  // - "under $500", "max $500", "up to $500"
+  // Support $, £, €, and plain numbers
+  let totalBudget: number | null = null;
+  const normalizedIntent = userIntent.toLowerCase();
+  
   const budgetPatterns = [
-    /(?:total|budget|spend|under|up to|max|maximum)\s*(?:of\s*)?\$?(\d+)/i,
-    /\$(\d+)\s*(?:total|budget|for all|for everything)/i,
+    // "total budget is $500" or "my total budget is 500"
+    /(?:my\s+)?total\s+budget\s+is\s*[£$€]?(\d+(?:\.\d+)?)/i,
+    // "budget is $500"
+    /budget\s+is\s*[£$€]?(\d+(?:\.\d+)?)/i,
+    // "under $500", "max $500", "up to $500"
+    /(?:under|max|maximum|up\s+to)\s*[£$€]?(\d+(?:\.\d+)?)/i,
+    // "$500 total" or "$500 budget" or "$500 for all"
+    /[£$€](\d+(?:\.\d+)?)\s*(?:total|budget|for\s+all|for\s+everything)/i,
+    // "total of $500" or "budget of $500"
+    /(?:total|budget)\s+of\s*[£$€]?(\d+(?:\.\d+)?)/i,
+    // Generic: "spend $500" or "spending $500"
+    /spend(?:ing)?\s*[£$€]?(\d+(?:\.\d+)?)/i,
   ];
   
   for (const pattern of budgetPatterns) {
-    const match = userIntent.match(pattern);
-    if (match) {
-      totalBudget = parseFloat(match[1]);
-      break;
+    const match = normalizedIntent.match(pattern);
+    if (match && match[1]) {
+      const parsed = parseFloat(match[1]);
+      if (!isNaN(parsed) && isFinite(parsed) && parsed > 0) {
+        totalBudget = parsed;
+        console.log("[Bundle] Parsed budget:", totalBudget, "from pattern:", pattern.toString());
+        break;
+      }
     }
+  }
+  
+  if (totalBudget === null) {
+    console.log("[Bundle] No budget found in intent:", userIntent.substring(0, 100));
   }
   
   return { isBundle: true, items, totalBudget };
@@ -2521,16 +2547,30 @@ export async function proxySessionStartAction(
         // BUNDLE-SAFE TOP-UP: Only from bundle item pools
         console.log("[Bundle] Top-up needed: have", finalHandles.length, "need", resultCountUsed);
         
-        // Rebuild item pools from sortedCandidates (they have _bundleItemIndex metadata)
+        // Build itemPools STRICTLY: only candidates that match that item's hard term(s) using word-boundary matching
         const bundleItemPools = new Map<number, EnrichedCandidate[]>();
-        for (const c of sortedCandidates) {
-          const itemIdx = (c as any)._bundleItemIndex;
-          if (typeof itemIdx === "number") {
-            if (!bundleItemPools.has(itemIdx)) {
-              bundleItemPools.set(itemIdx, []);
+        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+          const bundleItem = bundleItemsWithBudget[itemIdx];
+          const itemHardTerms = bundleItem.hardTerms;
+          
+          // Filter sortedCandidates to only those that match this item's hard terms
+          const itemPool: EnrichedCandidate[] = [];
+          for (const c of sortedCandidates) {
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              itemPool.push(c);
             }
-            bundleItemPools.get(itemIdx)!.push(c);
           }
+          
+          bundleItemPools.set(itemIdx, itemPool);
         }
         
         // Count current handles per item
@@ -2774,16 +2814,31 @@ export async function proxySessionStartAction(
 
       // Bundle-safe top-up: only from bundle item pools
       if (isBundleMode && bundleIntent.items.length >= 2) {
-        // Rebuild bundle item pools from sortedCandidates
+        // Build itemPools STRICTLY: only candidates that match that item's hard term(s) using word-boundary matching
         const bundleItemPools = new Map<number, EnrichedCandidate[]>();
-        for (const c of sortedCandidates) {
-          const itemIdx = (c as any)._bundleItemIndex;
-          if (typeof itemIdx === "number") {
-            if (!bundleItemPools.has(itemIdx)) {
-              bundleItemPools.set(itemIdx, []);
+        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+          const bundleItem = bundleItemsWithBudget[itemIdx];
+          const itemHardTerms = bundleItem.hardTerms;
+          
+          // Filter sortedCandidates to only those that match this item's hard terms
+          const itemPool: EnrichedCandidate[] = [];
+          for (const c of sortedCandidates) {
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              itemPool.push(c);
             }
-            bundleItemPools.get(itemIdx)!.push(c);
           }
+          
+          bundleItemPools.set(itemIdx, itemPool);
+          console.log("[Bundle] Strict itemPool", itemIdx, `(${itemHardTerms[0]})`, "size:", itemPool.length);
         }
         
         // Union of all bundle item pools (bundle-safe source)
@@ -2891,6 +2946,70 @@ export async function proxySessionStartAction(
         if (rejectedTopUpHandles.length > 0) {
           console.log("[Bundle] rejectedTopUpHandles:", rejectedTopUpHandles.slice(0, 10).join(", "), rejectedTopUpHandles.length > 10 ? `... (${rejectedTopUpHandles.length} total)` : "");
         }
+        
+        // Assert every final handle exists in at least one itemPool; if not, drop it
+        const strictItemPoolHandles = new Set<string>();
+        for (const pool of bundleItemPools.values()) {
+          for (const c of pool) {
+            strictItemPoolHandles.add(c.handle);
+          }
+        }
+        
+        const outOfPoolHandles: string[] = [];
+        const inPoolHandles: string[] = [];
+        for (const handle of finalHandlesGuaranteed) {
+          if (strictItemPoolHandles.has(handle)) {
+            inPoolHandles.push(handle);
+          } else {
+            outOfPoolHandles.push(handle);
+          }
+        }
+        
+        if (outOfPoolHandles.length > 0) {
+          console.log("[Bundle] outOfPoolDropped=", outOfPoolHandles.length, "handles:", outOfPoolHandles.slice(0, 5).join(", "));
+          // Replace dropped handles using round-robin from itemPools
+          finalHandlesGuaranteed = inPoolHandles;
+          const haveAfterDrop = new Set(finalHandlesGuaranteed);
+          
+          // Round-robin replacement from strict itemPools
+          roundRobinIdx = 0;
+          while (finalHandlesGuaranteed.length < resultCountUsed && roundRobinIdx < 200) {
+            const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+            const pool = bundleItemPools.get(currentItemIdx) || [];
+            
+            for (const candidate of pool) {
+              if (finalHandlesGuaranteed.length >= resultCountUsed) break;
+              if (!candidate?.handle) continue;
+              if (haveAfterDrop.has(candidate.handle)) continue;
+              
+              finalHandlesGuaranteed.push(candidate.handle);
+              haveAfterDrop.add(candidate.handle);
+              break;
+            }
+            
+            roundRobinIdx++;
+            if (roundRobinIdx > 200) break;
+          }
+        }
+        
+        // Count final handles per item for logging
+        const finalCountsByItem = new Map<number, number>();
+        for (const handle of finalHandlesGuaranteed) {
+          for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+            const pool = bundleItemPools.get(itemIdx) || [];
+            if (pool.some(c => c.handle === handle)) {
+              finalCountsByItem.set(itemIdx, (finalCountsByItem.get(itemIdx) || 0) + 1);
+              break;
+            }
+          }
+        }
+        
+        const finalCountsText = bundleItemsWithBudget.map((item, idx) => {
+          const count = finalCountsByItem.get(idx) || 0;
+          const itemName = item.hardTerms[0];
+          return `${itemName}=${count}`;
+        }).join(" ");
+        console.log("[Bundle] finalCounts per item:", finalCountsText);
         
         // If trustFallback=true and still short, allow broader pool but still with category guards
         if (trustFallback && finalHandlesGuaranteed.length < resultCountUsed) {
