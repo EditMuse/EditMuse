@@ -2296,11 +2296,23 @@
         });
 
         if (!response.ok) {
-          var errorData = await response.json().catch(() => ({}));
-          throw new Error(errorData.error || 'Failed to fetch questions');
+          // Safely parse error response - don't assume it's JSON
+          var result = await this.safeParseJson(response);
+          var errorMessage = 'Failed to fetch questions';
+          if (result.parsed && result.parsed.error) {
+            errorMessage = result.parsed.error;
+          } else if (result.text && !result.text.startsWith('{') && !result.text.startsWith('[')) {
+            // Plain text error message
+            errorMessage = result.text;
+          }
+          throw new Error(errorMessage);
         }
 
-        var data = await response.json();
+        var result = await this.safeParseJson(response);
+        if (!result.parsed) {
+          throw new Error('Invalid response from server (not JSON)');
+        }
+        var data = result.parsed;
         debugLog('[EditMuse] Questions response:', data);
 
         if (data.ok && data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
@@ -2677,6 +2689,31 @@
     // ============================================
 
     /**
+     * Safely parse JSON from response - returns {text, parsed} where parsed is null if not JSON
+     */
+    async safeParseJson(response) {
+      try {
+        var text = await response.text();
+        if (!text || !text.trim()) {
+          return { text: text || '', parsed: null };
+        }
+        var trimmed = text.trim();
+        // Only attempt JSON parse if it looks like JSON
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          try {
+            return { text: trimmed, parsed: JSON.parse(trimmed) };
+          } catch (e) {
+            // Not valid JSON - return text but no parsed
+            return { text: trimmed, parsed: null };
+          }
+        }
+        return { text: trimmed, parsed: null };
+      } catch (e) {
+        return { text: '', parsed: null };
+      }
+    }
+
+    /**
      * Start session with timeout - returns sid if received, throws TimeoutError if timeout
      */
     async startSessionWithTimeout(payload, timeoutMs) {
@@ -2697,11 +2734,24 @@
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-          var errorData = await response.json().catch(function() { return {}; });
-          throw new Error(errorData.error || 'Failed to submit');
+          // Safely parse error response - don't assume it's JSON
+          var result = await this.safeParseJson(response);
+          var errorMessage = 'Failed to submit';
+          if (result.parsed && result.parsed.error) {
+            errorMessage = result.parsed.error;
+          } else if (result.text && !result.text.startsWith('{') && !result.text.startsWith('[')) {
+            // Plain text error message
+            errorMessage = result.text;
+          }
+          throw new Error(errorMessage);
         }
 
-        var data = await response.json();
+        var result = await this.safeParseJson(response);
+        if (!result.parsed) {
+          throw new Error('Invalid response from server (not JSON)');
+        }
+        var data = result.parsed;
+        
         if (data.ok && data.sessionId) {
           return data.sessionId;
         } else if (data.sid) {
@@ -2712,7 +2762,7 @@
         }
       } catch (error) {
         clearTimeout(timeoutId);
-        if (error.name === 'AbortError' || error.message.includes('aborted')) {
+        if (error.name === 'AbortError' || (error.message && error.message.includes('aborted'))) {
           var timeoutError = new Error('Request timed out');
           timeoutError.name = 'TimeoutError';
           throw timeoutError;
@@ -2734,11 +2784,24 @@
         });
 
         if (!response.ok) {
-          var errorData = await response.json().catch(function() { return {}; });
-          throw new Error(errorData.error || 'Failed to resume session');
+          // Safely parse error response - don't assume it's JSON
+          var result = await this.safeParseJson(response);
+          var errorMessage = 'Failed to resume session';
+          if (result.parsed && result.parsed.error) {
+            errorMessage = result.parsed.error;
+          } else if (result.text && !result.text.startsWith('{') && !result.text.startsWith('[')) {
+            // Plain text error message
+            errorMessage = result.text;
+          }
+          throw new Error(errorMessage);
         }
 
-        var data = await response.json();
+        var result = await this.safeParseJson(response);
+        if (!result.parsed) {
+          throw new Error('Invalid response from server (not JSON)');
+        }
+        var data = result.parsed;
+        
         if (data.ok && data.sessionId) {
           return data.sessionId;
         } else if (data.sid) {
@@ -2814,13 +2877,26 @@
             signal: self.pollingController.signal
           })
           .then(function(response) {
-            if (!response.ok) {
-              var errorData = response.json().catch(function() { return {}; });
-              return errorData.then(function(data) {
-                throw new Error(data.error || 'Failed to fetch session');
-              });
-            }
-            return response.json();
+            // Use safeParseJson helper to safely read and parse response
+            return self.safeParseJson(response).then(function(result) {
+              if (!response.ok) {
+                // Error response
+                var errorMessage = 'Failed to fetch session';
+                if (result.parsed && result.parsed.error) {
+                  errorMessage = result.parsed.error;
+                } else if (result.text && !result.text.startsWith('{') && !result.text.startsWith('[')) {
+                  // Plain text error message
+                  errorMessage = result.text;
+                }
+                throw new Error(errorMessage);
+              }
+              
+              // Success response - must be valid JSON
+              if (!result.parsed) {
+                throw new Error('Invalid response from server (not JSON)');
+              }
+              return result.parsed;
+            });
           })
           .then(function(data) {
             var status = data.status;
