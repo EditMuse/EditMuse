@@ -1937,7 +1937,8 @@ async function processSessionInBackground({
                   if (price > allocatedBudget) return false;
                 }
                 if (totalBudget !== null) {
-                  if (totalPrice + price > totalBudget) return false;
+                  const projectedTotal = totalPrice + price;
+                  if (projectedTotal > totalBudget) return false;
                 }
                 return true;
               })
@@ -1945,11 +1946,33 @@ async function processSessionInBackground({
             
             if (candidates.length > 0) {
               const selected = candidates[0];
+              const candidatePrice = getPrice(selected);
+              const projectedTotal = totalPrice + candidatePrice;
+              
+              // Budget guard: skip if adding would exceed budget
+              if (totalBudget !== null && projectedTotal > totalBudget) {
+                console.log("[Bundle TopUp] budget_guard", {
+                  currentTotal: totalPrice,
+                  candidatePrice,
+                  projectedTotal,
+                  budget: totalBudget,
+                  added: false
+                });
+                continue; // Skip this candidate, try next
+              }
+              
               handles.push(selected.handle);
               used.add(selected.handle);
-              totalPrice += getPrice(selected);
+              totalPrice += candidatePrice;
               pass1Added++;
               added = true;
+              console.log("[Bundle TopUp] budget_guard", {
+                currentTotal: totalPrice - candidatePrice,
+                candidatePrice,
+                projectedTotal: totalPrice,
+                budget: totalBudget,
+                added: true
+              });
               break; // One per round-robin cycle
             }
           }
@@ -1973,7 +1996,8 @@ async function processSessionInBackground({
               .filter(c => {
                 const price = getPrice(c);
                 if (totalBudget !== null) {
-                  if (totalPrice + price > totalBudget) return false;
+                  const projectedTotal = totalPrice + price;
+                  if (projectedTotal > totalBudget) return false;
                 }
                 return true;
               })
@@ -1981,11 +2005,33 @@ async function processSessionInBackground({
             
             if (candidates.length > 0) {
               const selected = candidates[0];
+              const candidatePrice = getPrice(selected);
+              const projectedTotal = totalPrice + candidatePrice;
+              
+              // Budget guard: skip if adding would exceed budget
+              if (totalBudget !== null && projectedTotal > totalBudget) {
+                console.log("[Bundle TopUp] budget_guard", {
+                  currentTotal: totalPrice,
+                  candidatePrice,
+                  projectedTotal,
+                  budget: totalBudget,
+                  added: false
+                });
+                continue; // Skip this candidate, try next
+              }
+              
               handles.push(selected.handle);
               used.add(selected.handle);
-              totalPrice += getPrice(selected);
+              totalPrice += candidatePrice;
               pass2Added++;
               added = true;
+              console.log("[Bundle TopUp] budget_guard", {
+                currentTotal: totalPrice - candidatePrice,
+                candidatePrice,
+                projectedTotal: totalPrice,
+                budget: totalBudget,
+                added: true
+              });
               break;
             }
           }
@@ -1993,12 +2039,10 @@ async function processSessionInBackground({
           if (!added) break;
         }
         
-        // PASS 3: Relaxed substitutes (allow substitutes, but try to stay within budget)
-        // Only proceed if we still need more items AND haven't exceeded budget too much
-        // If budget is already exceeded by >50%, stop adding more items
-        const budgetExceededThreshold = totalBudget !== null ? totalBudget * 1.5 : Infinity;
+        // PASS 3: Relaxed substitutes (allow substitutes, but never exceed budget)
+        // Only proceed if we still need more items AND haven't exceeded budget
         const shouldContinuePass3 = handles.length < requestedCount && 
-          (totalBudget === null || totalPrice <= budgetExceededThreshold);
+          (totalBudget === null || totalPrice < totalBudget);
         
         if (shouldContinuePass3) {
           // Build substitute pools
@@ -2035,7 +2079,7 @@ async function processSessionInBackground({
             return availableInPool < 5;
           });
           
-          while (handles.length < requestedCount && (totalBudget === null || totalPrice <= budgetExceededThreshold)) {
+          while (handles.length < requestedCount) {
           let added = false;
           const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
           
@@ -2089,42 +2133,59 @@ async function processSessionInBackground({
             const withinBudget = candidates.filter(c => {
               const price = getPrice(c);
               if (totalBudget !== null) {
-                return totalPrice + price <= totalBudget;
+                const projectedTotal = totalPrice + price;
+                return projectedTotal <= totalBudget;
               }
               return true;
             });
             
-            // Prefer within-budget candidates, but if none exist, use cheapest to minimize excess
+            // Only select candidates that fit within budget (never exceed intentionally)
             let selected: EnrichedCandidate | null = null;
             if (withinBudget.length > 0) {
               selected = withinBudget[0]; // Already sorted by price (cheapest first)
-            } else if (candidates.length > 0) {
-              // No within-budget candidates - use cheapest to minimize budget excess
-              selected = candidates[0]; // Already sorted by price
-              if (totalBudget !== null) {
-                budgetExceeded = true;
-                trustFallback = true;
-              }
             }
+            // Do NOT select candidates that would exceed budget - skip instead
             
             if (selected) {
-              const price = getPrice(selected);
-              if (totalBudget !== null && totalPrice + price > totalBudget) {
-                budgetExceeded = true;
-                trustFallback = true;
+              const candidatePrice = getPrice(selected);
+              const projectedTotal = totalPrice + candidatePrice;
+              
+              // Budget guard: skip if adding would exceed budget
+              if (totalBudget !== null && projectedTotal > totalBudget) {
+                console.log("[Bundle TopUp] budget_guard", {
+                  currentTotal: totalPrice,
+                  candidatePrice,
+                  projectedTotal,
+                  budget: totalBudget,
+                  added: false
+                });
+                continue; // Skip this candidate, try next item
               }
               
               handles.push(selected.handle);
               used.add(selected.handle);
-              totalPrice += price;
+              totalPrice += candidatePrice;
               pass3Added++;
               added = true;
+              console.log("[Bundle TopUp] budget_guard", {
+                currentTotal: totalPrice - candidatePrice,
+                candidatePrice,
+                projectedTotal: totalPrice,
+                budget: totalBudget,
+                added: true
+              });
               break;
             }
           }
           
             if (!added) break;
           }
+        }
+        
+        // budgetExceeded should only be true if even the initial required set cannot fit budget
+        // During top-up, we never intentionally exceed budget, so only check if initial set exceeded
+        if (totalBudget !== null && totalPrice > totalBudget) {
+          budgetExceeded = true;
         }
         
         return { handles, trustFallback, budgetExceeded, totalPrice, pass1Added, pass2Added, pass3Added };

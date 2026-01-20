@@ -91,6 +91,7 @@ interface StructuredBundleResult {
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "20000"); // Configurable timeout, default 20 seconds
+const TIMEOUT_MS_BUNDLE = Number(process.env.OPENAI_TIMEOUT_MS_BUNDLE ?? "12000"); // Stricter timeout for bundle mode, default 12 seconds
 const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total (initial attempt + 1 retry)
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
@@ -1279,8 +1280,15 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let lastParseFailReason: string | undefined = undefined;
   const candidateHandles = new Set(candidates.map(p => p.handle));
   
+  // Determine timeout based on mode (bundle uses stricter timeout)
+  const timeoutMs = isBundle ? TIMEOUT_MS_BUNDLE : TIMEOUT_MS;
+  
   // Log time budget for AI ranking
-  console.log("[AI Ranking] time_budget", { timeoutMs: TIMEOUT_MS, maxRetries: MAX_RETRIES });
+  if (isBundle) {
+    console.log("[AI Ranking] time_budget_bundle", { timeoutMsBundle: TIMEOUT_MS_BUNDLE, maxRetries: MAX_RETRIES });
+  } else {
+    console.log("[AI Ranking] time_budget", { timeoutMs: TIMEOUT_MS, maxRetries: MAX_RETRIES });
+  }
   
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -1295,7 +1303,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       // Build request body with JSON mode/schema if supported
       const requestBody: any = {
@@ -1348,8 +1356,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
 
       const data = await response.json();
       
-      // With strict structured outputs, the content is guaranteed to be valid JSON
-      // Check for refusal (model refused to generate structured output)
+      // With strict structured outputs, check for refusal (model refused to generate structured output)
       if (data.choices?.[0]?.message?.refusal) {
         console.error("[AI Ranking] Model refused to generate structured output:", data.choices[0].message.refusal);
         lastError = new Error("Model refused to generate structured output");
@@ -1357,34 +1364,39 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      const content = data.choices?.[0]?.message?.content;
-
-      if (!content) {
-        console.error("[AI Ranking] No content in OpenAI response");
-        lastError = new Error("No content in OpenAI response");
-        lastParseFailReason = "No content in response";
-        continue; // Try again if retries remaining
-      }
-
-      // With strict structured outputs, content is guaranteed to be valid JSON
-      // Parse directly without complex error handling
-      let structuredResult: StructuredRankingResult | StructuredBundleResult;
+      // When using response_format json_schema strict, read the parsed object from the SDK response only
+      // Do NOT JSON.parse raw content - only use pre-parsed output from the response
+      let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      try {
-        // Strict mode guarantees valid JSON, so simple parse is sufficient
-        structuredResult = JSON.parse(content) as StructuredRankingResult | StructuredBundleResult;
-        console.log("[AI Ranking] Successfully parsed structured output (strict mode)");
-      } catch (err) {
-        // This should rarely happen with strict mode, but keep retry logic as fallback
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        console.error("[AI Ranking] JSON parse failed even with strict mode:", errorMessage);
-        console.log("[AI Ranking] Raw content (first 500 chars):", content.substring(0, 500));
-        lastError = err;
-        lastParseFailReason = `JSON.parse failed: ${errorMessage}`;
+      // Try to get parsed output from response (check common locations)
+      const message = data.choices?.[0]?.message;
+      if (message) {
+        // Check for parsed field (OpenAI SDK may provide this when using structured outputs)
+        if (message.parsed && typeof message.parsed === "object") {
+          structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
+        }
+        // Also check if content is already an object (parsed) rather than a string
+        else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
+          structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
+        }
+        // Also check if the response itself has a parsed field at the top level
+        else if (data.parsed && typeof data.parsed === "object") {
+          structuredResult = data.parsed as StructuredRankingResult | StructuredBundleResult;
+        }
+      }
+
+      // If parsed output is missing, treat it as an AI failure and use deterministic fallback
+      // Do NOT attempt JSON.parse on raw content - strict mode requires pre-parsed output
+      if (!structuredResult) {
+        console.log("[AI Ranking] structured_outputs missing parsed output - falling back");
+        lastError = new Error("Structured outputs missing parsed output");
+        lastParseFailReason = "Missing parsed output in structured response";
         console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-        // This triggers compressed retry
+        // This triggers compressed retry or fallback (no JSON.parse fallback)
         continue; // Try again if retries remaining
       }
+
+      console.log("[AI Ranking] Successfully parsed structured output (strict mode)");
 
       // Strict schema ensures only required fields are present
       // No need to set defaults for removed fields (rejected_candidates, selected in bundle)
@@ -1699,8 +1711,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     } catch (error: any) {
       lastError = error;
       if (error.name === "AbortError") {
-        console.error("[AI Ranking] Request timeout after", TIMEOUT_MS, "ms", attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
-        lastParseFailReason = `Request timeout after ${TIMEOUT_MS}ms`;
+        console.error("[AI Ranking] Request timeout after", timeoutMs, "ms", attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
+        lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
       } else {
         console.error("[AI Ranking] Error:", error.message || error, attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
         lastParseFailReason = `Exception: ${error.message || String(error)}`;
