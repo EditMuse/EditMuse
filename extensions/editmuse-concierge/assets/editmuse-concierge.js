@@ -2786,13 +2786,14 @@
           
           // Check max poll time
           if (elapsed >= maxPollTime) {
-            // Max time reached - don't reject, just stop polling and keep "Still working..."
+            // Max time reached - resolve (don't reject) so handleSubmit doesn't treat as error
             console.debug("[Concierge] poll max reached; staying in stillWorking", { sid });
             self.state.status = 'stillWorking';
             self.state.stillWorking = true;
             self.state.pollMaxReached = true;
             self.render();
-            // Note: We intentionally don't reject - UI will show "Still working..." with option to continue
+            // Resolve (not reject) so handleSubmit continues normally without error state
+            resolve();
             return;
           }
 
@@ -3099,6 +3100,12 @@
           if (sid) {
             // Step 4: Poll until complete
             await this.pollSession(sid);
+            // After polling completes (or times out), check if we're still in stillWorking state
+            // If pollMaxReached is true, we've already set the UI correctly - don't change state
+            if (this.state.pollMaxReached) {
+              // Polling reached max time - state is already set to stillWorking, just return
+              return;
+            }
           } else {
             // No sid yet - keep polling with resume attempts
             await this.pollSessionWithResume(requestBody);
@@ -3127,16 +3134,26 @@
         }
       } catch (outerError) {
         // Fallback error handler for any unexpected errors
-        this.state.status = 'error';
-        this.state.error = outerError.message || 'An unexpected error occurred';
-        this.state.loading = false;
-        this.state.stillWorking = false;
-        this.stopConciergeLoadingAnimation();
-        this.render();
-        
-        // Release lock on error
-        window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-        window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+        // Don't set error state for timeout/abort errors - keep stillWorking
+        if (outerError.name === 'TimeoutError' || outerError.name === 'AbortError' || 
+            outerError.message?.includes('aborted') || outerError.message?.includes('timeout')) {
+          // Timeout/abort - keep in stillWorking state
+          this.state.status = 'stillWorking';
+          this.state.stillWorking = true;
+          this.render();
+        } else {
+          // Real error - set error state
+          this.state.status = 'error';
+          this.state.error = outerError.message || 'An unexpected error occurred';
+          this.state.loading = false;
+          this.state.stillWorking = false;
+          this.stopConciergeLoadingAnimation();
+          this.render();
+          
+          // Release lock on error
+          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+        }
         console.debug('Error in handleSubmit:', outerError);
       }
     }

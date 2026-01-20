@@ -89,7 +89,7 @@ interface StructuredBundleResult {
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
-const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "45000"); // Configurable timeout, default 45 seconds
+const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "60000"); // Configurable timeout, default 60 seconds
 const MAX_RETRIES = 2; // Max 2 retries, so at most 3 attempts total (initial attempt + 2 retries)
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
