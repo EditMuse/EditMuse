@@ -103,6 +103,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const raw = session.result.productHandles;
     const savedHandles = Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string") : [];
     const deliveredCount = savedHandles.length;
+    
+    // Get requestedCount from session resultCount (target result count for this session)
+    const requestedCount = session.resultCount || 0;
 
     const now = new Date();
     const deliveredAt = (sessionWithBilling as any).deliveredAt;
@@ -289,10 +292,19 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         console.log("[App Proxy] WARNING: Saved result exists but no products were fetched by handle.");
       }
 
+      // Log delivery counts for transparency
+      console.log("[Session Poll] delivery_counts", {
+        sid: sessionId,
+        requestedCount,
+        deliveredCount,
+      });
+
       return Response.json({
         ok: true,
         sid: sessionId,
         status: "COMPLETE",
+        requestedCount,
+        deliveredCount,
         products: ordered,
         reasoning: session.result.reasoning || null,
         warning: ordered.length === 0 ? "Saved results could not be loaded (products missing/unpublished)" : null,
@@ -300,10 +312,19 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       });
     } else {
       // Result exists but no handles - return empty
+      // Log delivery counts for transparency
+      console.log("[Session Poll] delivery_counts", {
+        sid: sessionId,
+        requestedCount,
+        deliveredCount,
+      });
+
       return Response.json({
         ok: true,
         sid: sessionId,
         status: "COMPLETE",
+        requestedCount,
+        deliveredCount,
         products: [],
         reasoning: session.result.reasoning || null,
         mode: "saved",

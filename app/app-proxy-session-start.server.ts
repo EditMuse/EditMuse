@@ -305,12 +305,112 @@ function parseIntentGeneric(
 }
 
 /**
+ * Parse numeric price ceiling from user intent text (industry-agnostic)
+ * Extracts a single numeric ceiling (maxPriceCeiling) from natural language phrases
+ * Supports currency symbols (£ $ €) and optional commas
+ * Returns null if no valid ceiling is found
+ */
+function parsePriceCeiling(text: string): number | null {
+  if (!text || typeof text !== "string") {
+    return null;
+  }
+
+  const normalizedText = text.toLowerCase();
+  
+  // Ordered list of regex patterns (first match wins)
+  // Supports: currency symbols (£ $ €), optional commas, integer/decimal numbers
+  const priceCeilingPatterns = [
+    // "budget is $600"
+    { pattern: /budget\s+is\s*([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "budget is" },
+    // "maximum budget is $600" or "max budget is $600"
+    { pattern: /(?:maximum|max)\s+budget\s+is\s*([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "max budget is" },
+    // "max budget $600" (without "is")
+    { pattern: /(?:maximum|max)\s+budget\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "max budget" },
+    // "up to $600"
+    { pattern: /up\s+to\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "up to" },
+    // "under $600" / "below $600" / "less than $600"
+    { pattern: /(?:under|below|less\s+than)\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "under/below/less than" },
+    // "anything under 80" / "anything below 80"
+    { pattern: /anything\s+(?:under|below)\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "anything under/below" },
+    // "total budget is $600" or "my total budget is $600"
+    { pattern: /(?:my\s+)?total\s+budget\s+is\s*([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "total budget is" },
+    // "$600 budget" or "$600 total" or "$600 for all"
+    { pattern: /([£$€])\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s+(?:budget|total|for\s+all|for\s+everything)/i, name: "currency amount budget" },
+    // "total of $600" or "budget of $600"
+    { pattern: /(?:total|budget)\s+of\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "total/budget of" },
+    // "spend $600" or "spending $600"
+    { pattern: /spend(?:ing)?\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i, name: "spend/spending" },
+  ];
+  
+  for (const { pattern, name } of priceCeilingPatterns) {
+    const match = normalizedText.match(pattern);
+    if (match) {
+      // Extract currency symbol (if present) and numeric value
+      // Most patterns have: group 1 = optional currency, group 2 = value
+      // "currency amount budget" pattern has: group 1 = required currency, group 2 = value
+      let currencyDetected = "";
+      let valueStr = "";
+      
+      if (match.length >= 3 && match[2]) {
+        // Pattern has value in group 2
+        // Check if group 1 is a currency symbol
+        if (match[1] && /[£$€]/.test(match[1])) {
+          currencyDetected = match[1];
+          valueStr = match[2];
+        } else {
+          // Group 1 is optional currency (might be empty) or not a currency
+          currencyDetected = match[1] && /[£$€]/.test(match[1]) ? match[1] : "";
+          valueStr = match[2];
+        }
+      } else if (match[1]) {
+        // Only one capture group - could be currency or value
+        if (/[£$€]/.test(match[1])) {
+          currencyDetected = match[1];
+          // Value might be in the full match, need to extract
+          const fullMatch = match[0];
+          const afterCurrency = fullMatch.replace(new RegExp(`[£$€]\\s*`), "");
+          const numberMatch = afterCurrency.match(/(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/);
+          valueStr = numberMatch ? numberMatch[1] : "";
+        } else {
+          // Group 1 is the value
+          valueStr = match[1];
+        }
+      }
+      
+      // Remove commas and parse safely
+      const cleanedValue = valueStr.replace(/,/g, "");
+      const parsed = parseFloat(cleanedValue);
+      
+      if (!isNaN(parsed) && isFinite(parsed) && parsed > 0) {
+        console.log("[Constraints] Parsed price ceiling", {
+          value: parsed,
+          pattern: name,
+          currencyDetected: currencyDetected || "none"
+        });
+        return parsed;
+      }
+    }
+  }
+  
+  return null;
+}
+
+/**
  * Parse bundle intent: detect multi-item queries (e.g., "3 piece suit, shirt and trousers")
- * Industry-agnostic bundle detection
+ * Industry-agnostic bundle detection with per-item constraint extraction
  */
 function parseBundleIntentGeneric(userIntent: string): {
   isBundle: boolean;
-  items: Array<{ hardTerms: string[]; quantity: number }>;
+  items: Array<{ 
+    hardTerms: string[]; 
+    quantity: number;
+    constraints?: {
+      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      priceCeiling?: number | null;
+      includeTerms?: string[];
+      excludeTerms?: string[];
+    };
+  }>;
   totalBudget: number | null;
 } {
   const lowerText = userIntent.toLowerCase();
@@ -410,12 +510,22 @@ function parseBundleIntentGeneric(userIntent: string): {
     }
   }
   
-  // Check for bundle indicators: commas, "and", "+"
+  // Check for bundle indicators: commas, "and", "+", lists, repeated mentions
   const bundleIndicators = [
-    /,\s*and\s+/i,
-    /,\s+/,
-    /\s+and\s+/i,
-    /\s+\+\s+/,
+    /,\s*and\s+/i,           // "suit, and shirt"
+    /,\s+/,                  // "suit, shirt"
+    /\s+and\s+/i,            // "suit and shirt"
+    /\s+\+\s+/,              // "suit + shirt"
+    /\s+plus\s+/i,           // "suit plus shirt"
+    /\s+with\s+/i,           // "suit with shirt"
+    /\s+&\s+/,               // "suit & shirt"
+  ];
+  
+  // Also check for list patterns (numbered lists, bullet points, etc.)
+  const listPatterns = [
+    /\d+\.\s+\w+/,           // "1. suit 2. shirt"
+    /-\s+\w+/,               // "- suit - shirt"
+    /\*\s+\w+/,              // "* suit * shirt"
   ];
   
   let hasBundleIndicator = false;
@@ -426,19 +536,44 @@ function parseBundleIntentGeneric(userIntent: string): {
     }
   }
   
-  // Bundle detected if: ≥2 distinct categories AND bundle indicators present
+  // Check for list patterns
+  if (!hasBundleIndicator) {
+    for (const pattern of listPatterns) {
+      if (pattern.test(userIntent)) {
+        hasBundleIndicator = true;
+        break;
+      }
+    }
+  }
+  
+  // Bundle detected if: ≥2 distinct categories AND (bundle indicators present OR repeated category mentions)
   const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
-  const isBundle = uniqueCategories.length >= 2 && hasBundleIndicator;
+  const categoryCounts = new Map<string, number>();
+  for (const { term } of foundCategories) {
+    categoryCounts.set(term.toLowerCase(), (categoryCounts.get(term.toLowerCase()) || 0) + 1);
+  }
+  const hasRepeatedMentions = Array.from(categoryCounts.values()).some(count => count >= 2);
+  
+  const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
 
   if (!isBundle) {
     return { isBundle: false, items: [], totalBudget: null };
   }
   
-  // Extract items with quantities
-  const items: Array<{ hardTerms: string[]; quantity: number }> = [];
+  // Extract items with quantities and per-item constraints
+  const items: Array<{ 
+    hardTerms: string[]; 
+    quantity: number;
+    constraints?: {
+      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      priceCeiling?: number | null;
+      includeTerms?: string[];
+      excludeTerms?: string[];
+    };
+  }> = [];
   const seenTerms = new Set<string>();
   
-  for (const { term } of foundCategories) {
+  for (const { term, position } of foundCategories) {
     if (seenTerms.has(term.toLowerCase())) continue;
     seenTerms.add(term.toLowerCase());
     
@@ -453,48 +588,144 @@ function parseBundleIntentGeneric(userIntent: string): {
       hardTerms.push(...synonyms.filter(s => s.toLowerCase() !== term.toLowerCase()));
     }
     
-    items.push({ hardTerms, quantity });
-  }
-  
-  // Extract total budget if mentioned
-  // Support phrases like:
-  // - "total budget is $500"
-  // - "my total budget is 500"
-  // - "budget is $500"
-  // - "under $500", "max $500", "up to $500"
-  // Support $, £, €, and plain numbers
-  let totalBudget: number | null = null;
-  const normalizedIntent = userIntent.toLowerCase();
-  
-  const budgetPatterns = [
-    // "total budget is $500" or "my total budget is 500"
-    /(?:my\s+)?total\s+budget\s+is\s*[£$€]?(\d+(?:\.\d+)?)/i,
-    // "budget is $500"
-    /budget\s+is\s*[£$€]?(\d+(?:\.\d+)?)/i,
-    // "under $500", "max $500", "up to $500"
-    /(?:under|max|maximum|up\s+to)\s*[£$€]?(\d+(?:\.\d+)?)/i,
-    // "$500 total" or "$500 budget" or "$500 for all"
-    /[£$€](\d+(?:\.\d+)?)\s*(?:total|budget|for\s+all|for\s+everything)/i,
-    // "total of $500" or "budget of $500"
-    /(?:total|budget)\s+of\s*[£$€]?(\d+(?:\.\d+)?)/i,
-    // Generic: "spend $500" or "spending $500"
-    /spend(?:ing)?\s*[£$€]?(\d+(?:\.\d+)?)/i,
-  ];
-  
-  for (const pattern of budgetPatterns) {
-    const match = normalizedIntent.match(pattern);
-    if (match && match[1]) {
-      const parsed = parseFloat(match[1]);
-      if (!isNaN(parsed) && isFinite(parsed) && parsed > 0) {
-        totalBudget = parsed;
-        console.log("[Bundle] Parsed budget:", totalBudget, "from pattern:", pattern.toString());
+    // Extract per-item constraints scoped to this item
+    // Look for constraints near this item's position in the text
+    const itemContextStart = Math.max(0, position - 100);
+    const itemContextEnd = Math.min(userIntent.length, position + term.length + 100);
+    const itemContext = userIntent.substring(itemContextStart, itemContextEnd);
+    const itemContextLower = itemContext.toLowerCase();
+    
+    // Extract option constraints (size, color, material) scoped to this item
+    // Patterns: "suit in size 42", "suit color blue", "suit material cotton"
+    const itemConstraints: {
+      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      priceCeiling?: number | null;
+      includeTerms?: string[];
+      excludeTerms?: string[];
+    } = {};
+    
+    // Extract size constraint scoped to this item
+    const sizePatterns = [
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?size\\s+(\\w+|\\d+)`, "i"),
+      new RegExp(`size\\s+(\\w+|\\d+)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+    ];
+    let itemSize: string | null = null;
+    for (const pattern of sizePatterns) {
+      const match = itemContextLower.match(pattern);
+      if (match && match[1]) {
+        const sizeValue = match[1].trim();
+        // Map common size values
+        const sizeMap: Record<string, string> = {
+          "xxs": "XXS", "xs": "XS", "small": "Small", "s": "S",
+          "medium": "Medium", "m": "M", "large": "Large", "l": "L",
+          "xl": "XL", "xxl": "XXL",
+        };
+        itemSize = sizeMap[sizeValue.toLowerCase()] || `Size ${sizeValue}`;
         break;
       }
     }
+    
+    // Extract color constraint scoped to this item
+    const colorPatterns = [
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:color|colour)\\s+(\\w+)`, "i"),
+      new RegExp(`(?:color|colour)\\s+(\\w+)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+    ];
+    const colors = ["black", "white", "grey", "gray", "navy", "blue", "green", "red", "pink", "purple",
+      "beige", "cream", "brown", "tan", "orange", "yellow", "gold", "silver", "khaki"];
+    let itemColor: string | null = null;
+    for (const pattern of colorPatterns) {
+      const match = itemContextLower.match(pattern);
+      if (match && match[1]) {
+        const colorValue = match[1].toLowerCase();
+        if (colors.includes(colorValue)) {
+          itemColor = colorValue[0].toUpperCase() + colorValue.slice(1);
+          break;
+        }
+      }
+    }
+    
+    // Extract material constraint scoped to this item
+    const materialPatterns = [
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:material|fabric)\\s+(\\w+(?:\\s+\\w+)?)`, "i"),
+      new RegExp(`(?:material|fabric)\\s+(\\w+(?:\\s+\\w+)?)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+    ];
+    const materials = ["cotton", "linen", "silk", "wool", "leather", "denim", "polyester", "viscose", "nylon"];
+    let itemMaterial: string | null = null;
+    for (const pattern of materialPatterns) {
+      const match = itemContextLower.match(pattern);
+      if (match && match[1]) {
+        const materialValue = match[1].toLowerCase();
+        if (materials.some(m => materialValue.includes(m))) {
+          itemMaterial = materialValue.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
+          break;
+        }
+      }
+    }
+    
+    // Extract price ceiling scoped to this item (e.g., "suit under $100")
+    const itemPriceCeiling = parsePriceCeiling(itemContext);
+    
+    // Build option constraints if any found
+    if (itemSize || itemColor || itemMaterial) {
+      itemConstraints.optionConstraints = {
+        size: itemSize || null,
+        color: itemColor || null,
+        material: itemMaterial || null,
+      };
+    }
+    
+    // Add price ceiling if found
+    if (itemPriceCeiling !== null) {
+      itemConstraints.priceCeiling = itemPriceCeiling;
+    }
+    
+    // Only add constraints object if it has any constraints
+    const itemWithConstraints: {
+      hardTerms: string[];
+      quantity: number;
+      constraints?: typeof itemConstraints;
+    } = { hardTerms, quantity };
+    
+    if (Object.keys(itemConstraints).length > 0) {
+      itemWithConstraints.constraints = itemConstraints;
+    }
+    
+    items.push(itemWithConstraints);
   }
   
-  if (totalBudget === null) {
-    console.log("[Bundle] No budget found in intent:", userIntent.substring(0, 100));
+  // Extract total budget if mentioned using improved numeric constraint parsing
+  const totalBudget = parsePriceCeiling(userIntent);
+  
+  // Log bundle detection
+  console.log("[Bundle] detected", {
+    itemCount: items.length,
+    totalBudgetOrCeiling: totalBudget !== null ? totalBudget : "none"
+  });
+  
+  // Log per-item constraints
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.constraints) {
+      const constraintsPreview: any = {};
+      if (item.constraints.optionConstraints) {
+        constraintsPreview.optionConstraints = item.constraints.optionConstraints;
+      }
+      if (item.constraints.priceCeiling !== undefined && item.constraints.priceCeiling !== null) {
+        constraintsPreview.priceCeiling = item.constraints.priceCeiling;
+      }
+      if (item.constraints.includeTerms && item.constraints.includeTerms.length > 0) {
+        constraintsPreview.includeTerms = item.constraints.includeTerms;
+      }
+      if (item.constraints.excludeTerms && item.constraints.excludeTerms.length > 0) {
+        constraintsPreview.excludeTerms = item.constraints.excludeTerms;
+      }
+      
+      console.log("[Bundle] itemConstraints", {
+        itemIndex: i,
+        label: item.hardTerms[0] || "unknown",
+        constraintsPreview
+      });
+    }
   }
   
   return { isBundle: true, items, totalBudget };
@@ -1256,22 +1487,29 @@ async function processSessionInBackground({
   if (Array.isArray(answers)) {
     // Look for budget/price range answers - check if any answer matches common budget patterns
     for (const answer of answers) {
-      const answerStr = String(answer).toLowerCase().trim();
+      const answerStr = String(answer);
       
-      // Parse budget range patterns like "under-50", "50-100", "100-200", "200-500", "500-plus"
-      // Also handle formats like "under $50", "$50 - $100", etc.
+      // First, try to extract price ceiling using improved parsing
+      const priceCeiling = parsePriceCeiling(answerStr);
+      if (priceCeiling !== null) {
+        priceMax = priceCeiling;
+        continue; // Found ceiling, move to next answer
+      }
       
-      // Handle "under-50" or "under 50" format
-      if (answerStr.startsWith("under")) {
-        const match = answerStr.match(/under[-\s]*\$?(\d+)/);
+      // Fallback to legacy range parsing for backward compatibility
+      const answerLower = answerStr.toLowerCase().trim();
+      
+      // Handle "under-50" or "under 50" format (legacy)
+      if (answerLower.startsWith("under")) {
+        const match = answerLower.match(/under[-\s]*\$?(\d+)/);
         if (match) {
           priceMax = parseFloat(match[1]) - 0.01; // Under $50 means < $50, so max is 49.99
           console.log("[App Proxy] Detected budget: under", match[1], "-> max:", priceMax);
         }
       } 
       // Handle "500-plus" or "500+" format
-      else if (answerStr.includes("-plus") || answerStr.match(/\d+[\s]*\+/)) {
-        const match = answerStr.match(/(\d+)[-\s]*plus|(\d+)[\s]*\+/i);
+      else if (answerLower.includes("-plus") || answerLower.match(/\d+[\s]*\+/)) {
+        const match = answerLower.match(/(\d+)[-\s]*plus|(\d+)[\s]*\+/i);
         const amount = match ? parseFloat(match[1] || match[2]) : null;
         if (amount) {
           priceMin = amount;
@@ -1279,8 +1517,8 @@ async function processSessionInBackground({
         }
       } 
       // Handle range like "50-100" or "$50 - $100"
-      else if (answerStr.match(/\d+[-\s]+\d+/)) {
-        const match = answerStr.match(/\$?(\d+)[-\s]+\$?(\d+)/);
+      else if (answerLower.match(/\d+[-\s]+\d+/)) {
+        const match = answerLower.match(/\$?(\d+)[-\s]+\$?(\d+)/);
         if (match) {
           priceMin = parseFloat(match[1]);
           priceMax = parseFloat(match[2]);
@@ -1288,8 +1526,8 @@ async function processSessionInBackground({
         }
       }
       // Handle "plus" or "+" with amount before it (e.g., "$500+", "500 and above")
-      else if (answerStr.includes("plus") || answerStr.includes("+") || answerStr.includes("and above")) {
-        const match = answerStr.match(/\$?(\d+)[-\s]*plus|\$?(\d+)[-\s]*\+|\$?(\d+)[-\s]*and\s*above/i);
+      else if (answerLower.includes("plus") || answerLower.includes("+") || answerLower.includes("and above")) {
+        const match = answerLower.match(/\$?(\d+)[-\s]*plus|\$?(\d+)[-\s]*\+|\$?(\d+)[-\s]*and\s*above/i);
         const amount = match ? parseFloat(match[1] || match[2] || match[3]) : null;
         if (amount) {
           priceMin = amount;
@@ -1664,7 +1902,8 @@ async function processSessionInBackground({
       
       // Parse bundle intent
       const bundleIntent = parseBundleIntentGeneric(userIntent);
-      console.log("[Bundle] detected:", bundleIntent.isBundle, "items:", bundleIntent.items.length, "totalBudget:", bundleIntent.totalBudget);
+      // Bundle detection already logged in parseBundleIntentGeneric
+      // Additional log for reference: bundleIntent.isBundle, items.length, totalBudget
       
       // Calculate dynamic AI window - REDUCED for speed
       // Single-item: max 40 candidates (was 60-120)
@@ -1682,7 +1921,18 @@ async function processSessionInBackground({
       const willUseAI = bundleIntent.isBundle === true || hardTerms.length > 0;
       
       // Allocate budget per item if total budget provided
-      type BundleItemWithBudget = { hardTerms: string[]; quantity: number; budgetMin?: number; budgetMax?: number };
+      type BundleItemWithBudget = { 
+        hardTerms: string[]; 
+        quantity: number; 
+        budgetMin?: number; 
+        budgetMax?: number;
+        constraints?: {
+          optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+          priceCeiling?: number | null;
+          includeTerms?: string[];
+          excludeTerms?: string[];
+        };
+      };
       
       /**
        * Strict budget-aware bundle selection helper
@@ -2237,8 +2487,14 @@ async function processSessionInBackground({
       }
       
       const bundleItemsWithBudget: BundleItemWithBudget[] = bundleIntent.isBundle && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number"
-        ? allocateBudgetPerItem(bundleIntent.items, bundleIntent.totalBudget)
-        : bundleIntent.items.map(item => ({ ...item }));
+        ? allocateBudgetPerItem(bundleIntent.items, bundleIntent.totalBudget).map((item, idx) => ({
+            ...item,
+            constraints: bundleIntent.items[idx]?.constraints
+          }))
+        : bundleIntent.items.map(item => ({ 
+            ...item,
+            constraints: item.constraints
+          }));
       
       if (bundleIntent.isBundle) {
         // Log when no budget is provided
@@ -2607,31 +2863,39 @@ async function processSessionInBackground({
           const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
           const itemHardTerms = bundleItem.hardTerms;
           
-          // Gate candidates for this item using existing gating logic
-          // First pass: facet + hard term matching (no budget filter)
+          // Gate candidates for this item using item-specific constraints
+          // First pass: item-specific facet + hard term matching (no budget filter)
+          const itemConstraints = bundleItem.constraints;
+          const itemOptionConstraints = itemConstraints?.optionConstraints;
+          
           const itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
-            // Apply facet gating
-            if (hardFacets.size && c.sizes.length > 0) {
+            // Apply item-specific option constraints (size, color, material) if present
+            // Otherwise fall back to global hardFacets
+            const sizeConstraint = itemOptionConstraints?.size || hardFacets.size;
+            const colorConstraint = itemOptionConstraints?.color || hardFacets.color;
+            const materialConstraint = itemOptionConstraints?.material || hardFacets.material;
+            
+            if (sizeConstraint && c.sizes.length > 0) {
               const sizeMatch = c.sizes.some((s: string) => 
-                normalizeText(s) === normalizeText(hardFacets.size) ||
-                normalizeText(s).includes(normalizeText(hardFacets.size)) ||
-                normalizeText(hardFacets.size).includes(normalizeText(s))
+                normalizeText(s) === normalizeText(sizeConstraint) ||
+                normalizeText(s).includes(normalizeText(sizeConstraint)) ||
+                normalizeText(sizeConstraint).includes(normalizeText(s))
               );
               if (!sizeMatch) return false;
             }
-            if (hardFacets.color && c.colors.length > 0) {
+            if (colorConstraint && c.colors.length > 0) {
               const colorMatch = c.colors.some((col: string) => 
-                normalizeText(col) === normalizeText(hardFacets.color) ||
-                normalizeText(col).includes(normalizeText(hardFacets.color)) ||
-                normalizeText(hardFacets.color).includes(normalizeText(col))
+                normalizeText(col) === normalizeText(colorConstraint) ||
+                normalizeText(col).includes(normalizeText(colorConstraint)) ||
+                normalizeText(colorConstraint).includes(normalizeText(col))
               );
               if (!colorMatch) return false;
             }
-            if (hardFacets.material && c.materials.length > 0) {
+            if (materialConstraint && c.materials.length > 0) {
               const materialMatch = c.materials.some((m: string) => 
-                normalizeText(m) === normalizeText(hardFacets.material) ||
-                normalizeText(m).includes(normalizeText(hardFacets.material)) ||
-                normalizeText(hardFacets.material).includes(normalizeText(m))
+                normalizeText(m) === normalizeText(materialConstraint) ||
+                normalizeText(m).includes(normalizeText(materialConstraint)) ||
+                normalizeText(materialConstraint).includes(normalizeText(m))
               );
               if (!materialMatch) return false;
             }
@@ -2648,13 +2912,34 @@ async function processSessionInBackground({
             const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
             if (!hasItemMatch) return false;
             
+            // Apply item-specific include/exclude terms if present
+            if (itemConstraints?.includeTerms && itemConstraints.includeTerms.length > 0) {
+              const hasIncludeTerm = itemConstraints.includeTerms.some(term => 
+                matchesHardTermWithBoundary(haystack, term)
+              );
+              if (!hasIncludeTerm) return false;
+            }
+            
+            if (itemConstraints?.excludeTerms && itemConstraints.excludeTerms.length > 0) {
+              const hasExcludeTerm = itemConstraints.excludeTerms.some(term => 
+                matchesHardTermWithBoundary(haystack, term)
+              );
+              if (hasExcludeTerm) return false; // Exclude if matches exclude term
+            }
+            
             return true;
           });
           
-          // Second pass: apply budget filter if allocated
+          // Second pass: apply budget filter (item-specific price ceiling or allocated budget)
           let itemGated: EnrichedCandidate[] = itemGatedUnfiltered;
-          if (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null) {
-            const budgetMax = bundleItem.budgetMax;
+          
+          // Prefer item-specific price ceiling over allocated budget
+          const itemPriceCeiling = itemConstraints?.priceCeiling;
+          const budgetMax = itemPriceCeiling !== undefined && itemPriceCeiling !== null 
+            ? itemPriceCeiling 
+            : (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null ? bundleItem.budgetMax : null);
+          
+          if (budgetMax !== null) {
             const itemGatedFiltered = itemGatedUnfiltered.filter(c => {
               const price = c.price ? parseFloat(String(c.price)) : NaN;
               return !Number.isFinite(price) || price <= budgetMax;
@@ -2880,15 +3165,12 @@ async function processSessionInBackground({
           aiMs += Math.round(performance.now() - aiStartBundle);
           
           // Check if AI succeeded: valid parsed structured output with handles
-          // If rankProductsWithAI returns handles, it means either:
-          // 1. AI succeeded and returned valid structured output, OR
-          // 2. AI failed and fell back to deterministic (which also returns handles)
-          // We consider it AI success if we got handles and didn't catch an exception
-          // (The actual distinction would require checking logs, but this is the best we can do from the return value)
-          if (aiBundle.rankedHandles?.length) {
-            // Assume AI succeeded if we got handles (even if it's actually deterministic fallback,
-            // the function didn't throw, so we treat it as a successful call)
-            bundleAiSucceeded = true;
+          if (aiBundle.selectedHandles?.length) {
+            // Use explicit source metadata to determine if AI succeeded
+            bundleAiSucceeded = aiBundle.source === "ai";
+            if (aiBundle.source === "fallback") {
+              console.log("[AI Ranking] source=fallback parse_fail_reason=", aiBundle.parseFailReason || "unknown");
+            }
             // Build item pools from sortedCandidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
             for (const c of sortedCandidates) {
@@ -2903,7 +3185,7 @@ async function processSessionInBackground({
             
             // Build ranked candidates by itemIndex from AI handles
             const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
-            for (const handle of aiBundle.rankedHandles) {
+            for (const handle of aiBundle.selectedHandles) {
               const candidate = sortedCandidates.find(c => c.handle === handle);
               if (candidate) {
                 const itemIdx = (candidate as any)._bundleItemIndex;
@@ -2984,7 +3266,7 @@ async function processSessionInBackground({
             
             reasoningParts.push(reasoningText);
             // Log AI success
-            console.log("[Bundle] AI selected", finalHandles.length, "handles (from", aiBundle.rankedHandles.length, "AI-ranked handles) across", bundleItemsWithBudget.length, "items");
+            console.log("[Bundle] AI selected", finalHandles.length, "handles (from", aiBundle.selectedHandles.length, "AI-ranked handles) across", bundleItemsWithBudget.length, "items");
           } else {
             // Fallback to deterministic selection if AI fails (no handles returned)
             bundleAiSucceeded = false;
@@ -3091,22 +3373,22 @@ async function processSessionInBackground({
           // Log budget selection details
           const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
             .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
-            console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
+          console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
             console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
               " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
               " finalCount=" + finalHandles.length + 
               " trustFallback=" + selectionResult.trustFallback +
               " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
-            
-            const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+          
+          const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
             const budgetText = (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") ? ` under $${bundleIntent.totalBudget}` : "";
-            
-            // Build improved reasoning
-            let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+          
+          // Build improved reasoning
+          let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
             if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
                 (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
-              reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
-            }
+            reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+          }
           
           reasoningParts.push(reasoningText);
         }
@@ -3170,77 +3452,86 @@ async function processSessionInBackground({
       const aiStartSingle = performance.now();
       try {
         aiCallCount++; // Track AI call
-        const ai1 = await rankProductsWithAI(
-          userIntent,
-          window1,
-          targetCount,
-          shop.id,
-          sessionToken,
-          variantConstraints2,
-          variantPreferences,
-          includeTerms,
+      const ai1 = await rankProductsWithAI(
+        userIntent,
+        window1,
+        targetCount,
+        shop.id,
+        sessionToken,
+        variantConstraints2,
+        variantPreferences,
+        includeTerms,
+        avoidTerms,
+        {
+          hardTerms,
+          hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
           avoidTerms,
-          {
-            hardTerms,
-            hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
-            avoidTerms,
-            trustFallback,
-            ...(isBundleMode ? {
-              isBundle: true,
-              bundleItems: bundleItemsWithBudget.map(item => ({
-                hardTerms: item.hardTerms,
-                quantity: item.quantity,
-                budgetMax: item.budgetMax,
-              })),
-            } : {}),
-          }
-        );
+          trustFallback,
+          ...(isBundleMode ? {
+            isBundle: true,
+            bundleItems: bundleItemsWithBudget.map(item => ({
+              hardTerms: item.hardTerms,
+              quantity: item.quantity,
+              budgetMax: item.budgetMax,
+            })),
+          } : {}),
+        }
+      );
         // Measure aiMs immediately after AI call completes
         aiMs += Math.round(performance.now() - aiStartSingle);
 
-        if (ai1.rankedHandles?.length) {
-          // Filter cached handles against current product availability
-          // This ensures out-of-stock products from cache are excluded
-          const validHandles = ai1.rankedHandles.filter((handle: string) => {
-            const candidate = sortedCandidates.find(c => c.handle === handle);
-            if (!candidate) {
-              console.log("[App Proxy] Cached handle not found in current candidates:", handle);
-              return false; // Product no longer exists or was filtered out
-            }
-            // If inStockOnly is enabled, filter out unavailable products
-            if (experience.inStockOnly && !candidate.available) {
-              console.log("[App Proxy] Cached handle is out of stock, excluding:", handle);
-              return false;
-            }
-            return true;
-          });
-          
-          for (const h of validHandles) used.add(h);
-          finalHandles = [...validHandles];
-          reasoningParts.push(ai1.reasoning);
-          
-          // Log if any cached handles were filtered out
-          if (validHandles.length < ai1.rankedHandles.length) {
-            const filteredCount = ai1.rankedHandles.length - validHandles.length;
-            console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
-          }
+      if (ai1.selectedHandles?.length) {
+        // Log source metadata
+        if (ai1.source === "ai") {
+          console.log("[AI Ranking] source=ai trustFallback=", ai1.trustFallback);
         } else {
-          // if AI fails completely, we will fallback at the end
-          // But if no-hard-terms and gatedPool>0, use deterministic now
-          if (hardTerms.length === 0 && gatedCandidates.length > 0) {
-            console.log("[App Proxy] No-hard-terms: AI returned empty, using deterministic ranking from gated pool");
-            finalHandles = fallbackRanking(window1, targetCount);
-            reasoningParts.push("Products selected using relevance ranking.");
-          } else {
-            reasoningParts.push("Products selected using default ranking.");
-          }
+          console.log("[AI Ranking] source=fallback parse_fail_reason=", ai1.parseFailReason || "unknown");
         }
         
-        // No-hard-terms validation: if selected empty AND gatedPool>0 AFTER AI call, fall back to deterministic
-        if (hardTerms.length === 0 && finalHandles.length === 0 && gatedCandidates.length > 0) {
-          console.log("[App Proxy] No-hard-terms: AI returned empty but gatedPool>0, falling back to deterministic ranking");
-          finalHandles = fallbackRanking(gatedCandidates.slice(0, aiWindow), targetCount);
+        // Filter cached handles against current product availability
+        // This ensures out-of-stock products from cache are excluded
+        const validHandles = ai1.selectedHandles.filter((handle: string) => {
+          const candidate = sortedCandidates.find(c => c.handle === handle);
+          if (!candidate) {
+            console.log("[App Proxy] Cached handle not found in current candidates:", handle);
+            return false; // Product no longer exists or was filtered out
+          }
+          // If inStockOnly is enabled, filter out unavailable products
+          if (experience.inStockOnly && !candidate.available) {
+            console.log("[App Proxy] Cached handle is out of stock, excluding:", handle);
+            return false;
+          }
+          return true;
+        });
+        
+        for (const h of validHandles) used.add(h);
+        finalHandles = [...validHandles];
+        if (ai1.reasoning) {
+          reasoningParts.push(ai1.reasoning);
+        }
+        
+        // Log if any cached handles were filtered out
+        if (validHandles.length < ai1.selectedHandles.length) {
+          const filteredCount = ai1.selectedHandles.length - validHandles.length;
+          console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
+        }
+      } else {
+        // if AI fails completely, we will fallback at the end
+        // But if no-hard-terms and gatedPool>0, use deterministic now
+        if (hardTerms.length === 0 && gatedCandidates.length > 0) {
+          console.log("[App Proxy] No-hard-terms: AI returned empty, using deterministic ranking from gated pool");
+          finalHandles = fallbackRanking(window1, targetCount);
           reasoningParts.push("Products selected using relevance ranking.");
+        } else {
+        reasoningParts.push("Products selected using default ranking.");
+        }
+      }
+      
+      // No-hard-terms validation: if selected empty AND gatedPool>0 AFTER AI call, fall back to deterministic
+      if (hardTerms.length === 0 && finalHandles.length === 0 && gatedCandidates.length > 0) {
+        console.log("[App Proxy] No-hard-terms: AI returned empty but gatedPool>0, falling back to deterministic ranking");
+        finalHandles = fallbackRanking(gatedCandidates.slice(0, aiWindow), targetCount);
+        reasoningParts.push("Products selected using relevance ranking.");
         }
       } catch (error) {
         console.error("[App Proxy] AI ranking error:", error);
@@ -3279,11 +3570,11 @@ async function processSessionInBackground({
         }
         
         if (toAdd.length > 0) {
-          reasoningParts.push("Expanded search to find additional close matches.");
+            reasoningParts.push("Expanded search to find additional close matches.");
         } else {
           // No more valid candidates available
           break;
-        }
+          }
       }
       } else if (isBundleMode && finalHandles.length < finalResultCount) {
         // BUNDLE-SAFE TOP-UP: Only from bundle item pools
@@ -3925,6 +4216,32 @@ async function processSessionInBackground({
       const deliveredCount = handlesToSave.length;
       const requestedCount = finalResultCount;
       const billedCount = handlesToSave.length;
+      
+      // Final invariant check: if maxPriceCeiling exists, verify finalTotalPrice doesn't exceed it
+      let constraintExceeded = false;
+      const maxPriceCeiling = priceMax; // priceMax is the numeric ceiling extracted from user input
+      if (typeof maxPriceCeiling === "number" && maxPriceCeiling > 0 && handlesToSave.length > 0) {
+        // Calculate final total price from handles being saved
+        const candidateMapForCheck = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        const finalTotalPrice = handlesToSave.reduce((sum, handle) => {
+          const candidate = candidateMapForCheck.get(handle);
+          if (candidate && candidate.price) {
+            const price = parseFloat(String(candidate.price));
+            return sum + (Number.isFinite(price) ? price : 0);
+          }
+          return sum;
+        }, 0);
+        
+        if (finalTotalPrice > maxPriceCeiling) {
+          trustFallback = true;
+          constraintExceeded = true;
+          console.log("[Constraints] ceiling_invariant_violation", {
+            finalTotalPrice,
+            maxPriceCeiling,
+            deliveredCount
+          });
+        }
+      }
       
       console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "handlesPreview=", handlesToSave.slice(0, 5));
       

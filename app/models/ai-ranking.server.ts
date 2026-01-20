@@ -457,8 +457,15 @@ export function getOpenAIModel(): string {
 function deterministicRanking(
   candidates: ProductCandidate[],
   resultCount: number,
-  variantPreferences?: Record<string, string>
-): { rankedHandles: string[]; reasoning: string } {
+  variantPreferences?: Record<string, string>,
+  parseFailReason?: string | null
+): { 
+  selectedHandles: string[];
+  reasoning?: string | null;
+  trustFallback: boolean;
+  source: "ai" | "fallback";
+  parseFailReason?: string | null;
+} {
   // Helper to compute preference score if variantPreferences are provided
   function getCandidateOptionValues(candidate: ProductCandidate, prefKey: string): string[] {
     const ov = candidate?.optionValues ?? {};
@@ -530,11 +537,14 @@ function deterministicRanking(
     return a.handle.localeCompare(b.handle);
   });
 
-  const rankedHandles = sorted.slice(0, resultCount).map(p => p.handle);
+  const selectedHandles = sorted.slice(0, resultCount).map(p => p.handle);
   
   return {
-    rankedHandles,
+    selectedHandles,
     reasoning: "AI ranking unavailable; selected products based on availability, preferences, and product information quality.",
+    trustFallback: true,
+    source: "fallback",
+    parseFailReason: parseFailReason || null,
   };
 }
 
@@ -578,7 +588,13 @@ function generateCacheKey(
 async function getCachedRanking(
   cacheKey: string,
   shopId?: string
-): Promise<{ rankedHandles: string[]; reasoning: string } | null> {
+): Promise<{ 
+  selectedHandles: string[];
+  reasoning?: string | null;
+  trustFallback: boolean;
+  source: "ai" | "fallback";
+  parseFailReason?: string | null;
+} | null> {
   // Cache disabled - always return null to force fresh AI ranking
   console.log("[AI Ranking] Cache disabled - will call OpenAI");
   return null;
@@ -593,8 +609,8 @@ async function setCachedRanking(
   shopId: string,
   userIntent: string,
   candidates: ProductCandidate[],
-  rankedHandles: string[],
-  reasoning: string,
+  selectedHandles: string[],
+  reasoning: string | null,
   resultCount: number
 ): Promise<void> {
   // Cache disabled - do nothing
@@ -628,21 +644,27 @@ export async function rankProductsWithAI(
   includeTerms?: string[],
   avoidTerms?: string[],
   hardConstraints?: HardConstraints
-): Promise<{ rankedHandles: string[]; reasoning: string }> {
+): Promise<{ 
+  selectedHandles: string[];
+  reasoning?: string | null;
+  trustFallback: boolean;
+  source: "ai" | "fallback";
+  parseFailReason?: string | null;
+}> {
   if (candidates.length === 0) {
-    console.log("[AI Ranking] No candidates to rank - using deterministic fallback");
-    return deterministicRanking(candidates, resultCount, variantPreferences);
+    console.log("[AI Ranking] source=fallback parse_fail_reason=No candidates to rank");
+    return deterministicRanking(candidates, resultCount, variantPreferences, "No candidates to rank");
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    console.log("[AI Ranking] OPENAI_API_KEY not set - using deterministic fallback");
-    return deterministicRanking(candidates, resultCount, variantPreferences);
+    console.log("[AI Ranking] source=fallback parse_fail_reason=OPENAI_API_KEY not set");
+    return deterministicRanking(candidates, resultCount, variantPreferences, "OPENAI_API_KEY not set");
   }
 
   if (!isAIRankingEnabled()) {
-    console.log("[AI Ranking] Feature disabled via FEATURE_AI_RANKING - using deterministic fallback");
-    return deterministicRanking(candidates, resultCount, variantPreferences);
+    console.log("[AI Ranking] source=fallback parse_fail_reason=Feature disabled via FEATURE_AI_RANKING");
+    return deterministicRanking(candidates, resultCount, variantPreferences, "Feature disabled via FEATURE_AI_RANKING");
   }
   
   // Check cache first
@@ -1354,6 +1376,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
+      const responseStatus = response.status; // Store status before consuming response body
       const data = await response.json();
       
       // With strict structured outputs, check for refusal (model refused to generate structured output)
@@ -1368,27 +1391,60 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // Do NOT JSON.parse raw content - only use pre-parsed output from the response
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      // Try to get parsed output from response (check common locations)
+      // Extract parsed output from Responses API structure (json_schema strict mode)
+      // Check multiple locations where the SDK might place the parsed output
+      
+      // 1. Check for SDK's parsed accessor (preferred location)
       const message = data.choices?.[0]?.message;
       if (message) {
         // Check for parsed field (OpenAI SDK may provide this when using structured outputs)
         if (message.parsed && typeof message.parsed === "object") {
           structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
         }
-        // Also check if content is already an object (parsed) rather than a string
+        // Check if content is already an object (parsed) rather than a string
         else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
           structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
         }
-        // Also check if the response itself has a parsed field at the top level
-        else if (data.parsed && typeof data.parsed === "object") {
-          structuredResult = data.parsed as StructuredRankingResult | StructuredBundleResult;
+      }
+      
+      // 2. Check response.output[] array (Responses API structure)
+      if (!structuredResult && Array.isArray(data.output)) {
+        for (const outputItem of data.output) {
+          // Check for parsed output in output item
+          if (outputItem.parsed && typeof outputItem.parsed === "object") {
+            structuredResult = outputItem.parsed as StructuredRankingResult | StructuredBundleResult;
+            break;
+          }
+          // Check if output item itself is the structured result
+          if (outputItem && typeof outputItem === "object" && !Array.isArray(outputItem) && 
+              ("selected" in outputItem || "selected_by_item" in outputItem)) {
+            structuredResult = outputItem as StructuredRankingResult | StructuredBundleResult;
+            break;
+          }
         }
       }
+      
+      // 3. Check top-level parsed field
+      if (!structuredResult && data.parsed && typeof data.parsed === "object") {
+        structuredResult = data.parsed as StructuredRankingResult | StructuredBundleResult;
+      }
 
-      // If parsed output is missing, treat it as an AI failure and use deterministic fallback
+      // If parsed output is missing, log diagnostic and treat as AI failure
       // Do NOT attempt JSON.parse on raw content - strict mode requires pre-parsed output
       if (!structuredResult) {
-        console.log("[AI Ranking] structured_outputs missing parsed output - falling back");
+        // Collect diagnostic information
+        const hasOutput = Array.isArray(data.output);
+        const outputTypes = hasOutput ? data.output.map((item: any) => typeof item).join(",") : "none";
+        const hasText = message?.content && typeof message.content === "string";
+        
+        console.log("[AI Ranking] structured_outputs missing parsed output", {
+          model,
+          hasOutput,
+          outputTypes,
+          hasText,
+          status: responseStatus
+        });
+        
         lastError = new Error("Structured outputs missing parsed output");
         lastParseFailReason = "Missing parsed output in structured response";
         console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
@@ -1525,9 +1581,14 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           ? reasoningParts.join(" ")
           : `Built a bundle with ${bundleResult.selected_by_item.length} items.`;
         
+        // Bundle mode: AI succeeded (structured output parsed and validated)
+        console.log("[AI Ranking] source=ai trustFallback=", bundleResult.trustFallback);
         return {
-          rankedHandles,
+          selectedHandles: rankedHandles,
           reasoning,
+          trustFallback: bundleResult.trustFallback,
+          source: "ai",
+          parseFailReason: null,
         };
       }
 
@@ -1545,10 +1606,13 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
               .map(h => h.trim())
               .slice(0, resultCount);
             if (validHandles.length > 0) {
-              console.log("[AI Ranking] Successfully parsed old format, returning result");
+              console.log("[AI Ranking] source=ai trustFallback=", trustFallback, "(old format fallback)");
               return {
-                rankedHandles: validHandles,
+                selectedHandles: validHandles,
                 reasoning: oldFormat.reasoning || "AI-ranked products based on user intent",
+                trustFallback,
+                source: "ai",
+                parseFailReason: null,
               };
             }
           }
@@ -1630,7 +1694,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       // Extract handles and build reasoning
-      const rankedHandles = validSelectedItems
+      const selectedHandles = validSelectedItems
         .slice(0, resultCount)
         .map(item => item.handle.trim());
       
@@ -1672,7 +1736,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           }
       }
 
-      console.log("[AI Ranking] Successfully ranked", rankedHandles.length, "products");
+      console.log("[AI Ranking] source=ai trustFallback=", trustFallback);
+      console.log("[AI Ranking] Successfully ranked", selectedHandles.length, "products");
       
       // Cache the result for future requests (best-effort, don't block)
       if (shopId) {
@@ -1691,8 +1756,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           shopId,
           userIntent,
           candidates,
-          rankedHandles,
-          reasoning,
+          selectedHandles,
+          reasoning || null,
           resultCount
         ).catch(err => {
           console.error("[AI Ranking] Error caching result (non-blocking):", err);
@@ -1704,8 +1769,11 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // This allows multi-pass AI ranking (top-up passes) without duplicate charges.
       
       return {
-        rankedHandles,
-        reasoning,
+        selectedHandles,
+        reasoning: reasoning || null,
+        trustFallback,
+        source: "ai",
+        parseFailReason: null,
       };
       }
     } catch (error: any) {
@@ -1727,11 +1795,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
 
   // All attempts failed - return deterministic fallback (structured result, not throwing)
   const failReason = lastParseFailReason || (lastError instanceof Error ? lastError.message : String(lastError || "Unknown error"));
-  console.log("[AI Ranking] All AI attempts failed, using deterministic fallback");
-  console.log("[AI Ranking] parse_fail_reason=", failReason);
+  console.log("[AI Ranking] source=fallback parse_fail_reason=", failReason);
   
   // Return structured fallback result instead of throwing
-  return deterministicRanking(candidates, resultCount, variantPreferences);
+  return deterministicRanking(candidates, resultCount, variantPreferences, failReason);
 }
 
 /**
