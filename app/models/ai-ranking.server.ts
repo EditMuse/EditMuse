@@ -225,13 +225,71 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
     jsonSlice = jsonSlice.replace(/,(\s*[}\]])/g, "$1");
   }
   
-  // 4) Attempt JSON.parse
+  // 4) Fix missing commas more intelligently
+  // We need to be careful not to break valid JSON, so we'll use a more targeted approach
+  
+  // Fix: missing comma between closing brace/bracket and opening brace/bracket
+  // Pattern: "}" or "]" followed by "{" or "["
+  jsonSlice = jsonSlice.replace(/([}\]"])\s*([{[])/g, '$1, $2');
+  
+  // Fix: missing comma between closing brace/bracket and property name
+  // Pattern: "}" or "]" followed by a quoted string (property name)
+  jsonSlice = jsonSlice.replace(/([}\]"])\s*"([^"]+)":/g, '$1, "$2":');
+  
+  // Fix: missing comma after string value before another value
+  // Pattern: closing quote followed by opening quote (array/object element)
+  // But be careful: only if not already followed by comma
+  jsonSlice = jsonSlice.replace(/([^\\]")"([^,\s}\]])/g, (match, p1, p2) => {
+    // Check if p2 looks like the start of a new property or array element
+    if (p2 === '"' || p2 === '{' || p2 === '[' || /^\d/.test(p2) || p2 === 't' || p2 === 'f' || p2 === 'n') {
+      return p1 + '", ' + p2;
+    }
+    return match;
+  });
+  
+  // Fix: missing comma after number before another value
+  // Pattern: digit followed by quote, brace, or bracket (but not already comma)
+  jsonSlice = jsonSlice.replace(/(\d)\s+(["{[])/g, '$1, $2');
+  
+  // Fix: missing comma after boolean/null before another value
+  jsonSlice = jsonSlice.replace(/(true|false|null)\s+(["{[])/g, '$1, $2');
+  
+  // 7) Attempt JSON.parse with retry on failure
+  let parsed: any;
+  let lastParseError: string | null = null;
+  
+  // First attempt: try as-is
   try {
-    const parsed = JSON.parse(jsonSlice);
+    parsed = JSON.parse(jsonSlice);
     return parsed as StructuredRankingResult;
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    throw new JSONParseError(`JSON.parse failed: ${errorMessage}`, content);
+    lastParseError = err instanceof Error ? err.message : String(err);
+    
+    // Second attempt: try to fix common issues
+    let fixed = jsonSlice;
+    
+    // Fix: missing comma between array elements (e.g., "]" "{" should be "], {")
+    fixed = fixed.replace(/([}\]"])\s*([{["])/g, '$1, $2');
+    
+    // Fix: missing comma after closing brace/bracket before property name
+    fixed = fixed.replace(/([}\]"])\s*"([^"]+)":/g, '$1, "$2":');
+    
+    // Fix: missing comma after closing brace/bracket before opening brace/bracket
+    fixed = fixed.replace(/([}\]"])\s*([{[])/g, '$1, $2');
+    
+    // Remove any double commas that might have been created
+    fixed = fixed.replace(/,+/g, ',');
+    fixed = fixed.replace(/,\s*,/g, ',');
+    
+    try {
+      parsed = JSON.parse(fixed);
+      console.log("[AI Ranking] Fixed JSON syntax errors and successfully parsed");
+      return parsed as StructuredRankingResult;
+    } catch (retryErr) {
+      // Both attempts failed
+      const retryError = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      throw new JSONParseError(`JSON.parse failed: ${lastParseError}. Retry after fixes also failed: ${retryError}`, content);
+    }
   }
 }
 
