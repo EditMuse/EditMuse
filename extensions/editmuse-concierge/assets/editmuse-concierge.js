@@ -91,20 +91,34 @@
           shopConfigPromise = null;
           throw new Error('Failed to fetch config');
         }
-        return response.json().then(function(config) {
-          shopConfigCache = config;
-          shopConfigPromise = null;
-          // Cache config and ETag in sessionStorage
-          try {
-            sessionStorage.setItem('editmuse_shop_config', JSON.stringify(config));
-            var etag = response.headers.get('ETag');
-            if (etag) {
-              sessionStorage.setItem('editmuse_shop_config_etag', etag);
-            }
-          } catch (e) {
-            // Ignore storage errors
+        // Safely parse JSON response - don't assume it's JSON
+        return response.text().then(function(text) {
+          if (!text || !text.trim()) {
+            throw new Error('Empty response from config endpoint');
           }
-          return config;
+          var trimmed = text.trim();
+          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+              var config = JSON.parse(trimmed);
+              shopConfigCache = config;
+              shopConfigPromise = null;
+              // Cache config and ETag in sessionStorage
+              try {
+                sessionStorage.setItem('editmuse_shop_config', JSON.stringify(config));
+                var etag = response.headers.get('ETag');
+                if (etag) {
+                  sessionStorage.setItem('editmuse_shop_config_etag', etag);
+                }
+              } catch (e) {
+                // Ignore storage errors
+              }
+              return config;
+            } catch (e) {
+              throw new Error('Invalid JSON response from config endpoint');
+            }
+          } else {
+            throw new Error('Invalid response format from config endpoint');
+          }
         });
       })
       .catch(function(error) {
@@ -208,7 +222,24 @@
         if (!response.ok) {
           throw new Error('Failed to fetch experiments');
         }
-        return response.json();
+        // Safely parse JSON response - don't assume it's JSON
+        return response.text().then(function(text) {
+          if (!text || !text.trim()) {
+            return { experiments: [] };
+          }
+          var trimmed = text.trim();
+          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+              return JSON.parse(trimmed);
+            } catch (e) {
+              // Not valid JSON - return empty experiments
+              return { experiments: [] };
+            }
+          } else {
+            // Not JSON - return empty experiments
+            return { experiments: [] };
+          }
+        });
       })
       .then(function(data) {
         var experiments = Array.isArray(data.experiments) ? data.experiments : [];
@@ -2690,25 +2721,46 @@
 
     /**
      * Safely parse JSON from response - returns {text, parsed} where parsed is null if not JSON
+     * Never throws - always returns a result object
      */
     async safeParseJson(response) {
       try {
-        var text = await response.text();
+        // Check if response body can be read (might be aborted)
+        if (!response || !response.body) {
+          return { text: '', parsed: null };
+        }
+        
+        var text;
+        try {
+          text = await response.text();
+        } catch (readError) {
+          // Response body read failed (aborted, network error, etc.)
+          // Don't try to parse - just return empty
+          return { text: '', parsed: null };
+        }
+        
         if (!text || !text.trim()) {
           return { text: text || '', parsed: null };
         }
+        
         var trimmed = text.trim();
+        
         // Only attempt JSON parse if it looks like JSON
+        // This prevents trying to parse plain text error messages like "Request timed out"
         if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
           try {
             return { text: trimmed, parsed: JSON.parse(trimmed) };
-          } catch (e) {
+          } catch (parseError) {
             // Not valid JSON - return text but no parsed
+            // This handles cases where text looks like JSON but isn't valid
             return { text: trimmed, parsed: null };
           }
         }
+        
+        // Not JSON-like - return as plain text
         return { text: trimmed, parsed: null };
       } catch (e) {
+        // Any other error - return empty result
         return { text: '', parsed: null };
       }
     }
@@ -2723,15 +2775,35 @@
       }, timeoutMs);
 
       try {
-        var response = await fetch(proxyUrl('/session/start'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify(payload),
-          signal: abortController.signal
-        });
+        var response;
+        try {
+          response = await fetch(proxyUrl('/session/start'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload),
+            signal: abortController.signal
+          });
+        } catch (fetchError) {
+          // Fetch itself failed (network error, abort, etc.)
+          clearTimeout(timeoutId);
+          if (fetchError.name === 'AbortError' || (fetchError.message && fetchError.message.includes('aborted'))) {
+            var timeoutError = new Error('Request timed out');
+            timeoutError.name = 'TimeoutError';
+            throw timeoutError;
+          }
+          // Re-throw other fetch errors
+          throw fetchError;
+        }
 
         clearTimeout(timeoutId);
+
+        // Check if request was aborted after fetch completed
+        if (abortController.signal.aborted) {
+          var timeoutError = new Error('Request timed out');
+          timeoutError.name = 'TimeoutError';
+          throw timeoutError;
+        }
 
         if (!response.ok) {
           // Safely parse error response - don't assume it's JSON
@@ -2762,10 +2834,16 @@
         }
       } catch (error) {
         clearTimeout(timeoutId);
-        if (error.name === 'AbortError' || (error.message && error.message.includes('aborted'))) {
+        // Don't try to parse timeout errors as JSON - they're already Error objects
+        if (error.name === 'TimeoutError' || error.name === 'AbortError' || (error.message && error.message.includes('aborted'))) {
           var timeoutError = new Error('Request timed out');
           timeoutError.name = 'TimeoutError';
           throw timeoutError;
+        }
+        // For any other error, check if it's a JSON parse error and handle it
+        if (error.message && (error.message.includes('JSON') || error.message.includes('Unexpected token'))) {
+          // This was a JSON parse error - don't re-throw as is, create a plain error
+          throw new Error('Invalid response format from server');
         }
         throw error;
       }
@@ -3216,10 +3294,21 @@
           }
 
         } catch (error) {
-          // Only set error state for real errors (non-timeout, non-abort)
+          // Check if this is a JSON parse error (which should never happen, but handle it defensively)
+          var isJsonParseError = error.message && (
+            error.message.includes('JSON') || 
+            error.message.includes('Unexpected token') ||
+            error.message.includes('not valid JSON')
+          );
+          
+          // If it's a JSON parse error with "Request timed out", it's actually a timeout
+          var isTimeoutFromJsonError = isJsonParseError && error.message.includes('Request timed out');
+          
+          // Only set error state for real errors (non-timeout, non-abort, non-JSON-parse-timeout)
           var isTimeoutError = error.name === 'TimeoutError' || 
                               error.name === 'AbortError' ||
                               error.name === 'NetworkError' ||
+                              isTimeoutFromJsonError ||
                               (error.message && (
                                 error.message.includes('timeout') ||
                                 error.message.includes('aborted') ||
@@ -3228,6 +3317,7 @@
           
           if (!isTimeoutError) {
             // Real error from server - show error state
+            // Never try to parse error.message as JSON - it's always a plain string
             this.state.status = 'error';
             this.state.error = error.message || 'Failed to submit';
             this.state.loading = false;
@@ -3241,7 +3331,11 @@
             console.debug('Error in handleSubmit:', error);
           } else {
             // Timeout/network error - keep in stillWorking state (backend still processing)
-            console.debug('[Concierge] Timeout/network error caught - keeping stillWorking state');
+            console.debug('[Concierge] Timeout/network error caught - keeping stillWorking state', { 
+              errorName: error.name, 
+              errorMessage: error.message,
+              isTimeoutFromJsonError: isTimeoutFromJsonError 
+            });
             this.state.status = 'stillWorking';
             this.state.stillWorking = true;
             this.state.loading = true; // Keep spinner
@@ -3252,9 +3346,19 @@
       } catch (outerError) {
         // Fallback error handler for any unexpected errors
         // Don't set error state for timeout/abort errors - keep stillWorking
+        
+        // Check if this is a JSON parse error that's actually a timeout
+        var isJsonParseError = outerError.message && (
+          outerError.message.includes('JSON') || 
+          outerError.message.includes('Unexpected token') ||
+          outerError.message.includes('not valid JSON')
+        );
+        var isTimeoutFromJsonError = isJsonParseError && outerError.message.includes('Request timed out');
+        
         var isTimeoutError = outerError.name === 'TimeoutError' || 
                             outerError.name === 'AbortError' ||
                             outerError.name === 'NetworkError' ||
+                            isTimeoutFromJsonError ||
                             (outerError.message && (
                               outerError.message.includes('aborted') || 
                               outerError.message.includes('timeout') ||
@@ -3263,6 +3367,11 @@
         
         if (isTimeoutError) {
           // Timeout/abort - keep in stillWorking state (backend still processing)
+          console.debug('[Concierge] Outer timeout/network error caught - keeping stillWorking state', {
+            errorName: outerError.name,
+            errorMessage: outerError.message,
+            isTimeoutFromJsonError: isTimeoutFromJsonError
+          });
           console.debug('[Concierge] Outer timeout/network error - keeping stillWorking state');
           this.state.status = 'stillWorking';
           this.state.stillWorking = true;
