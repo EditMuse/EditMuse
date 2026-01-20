@@ -1098,11 +1098,11 @@ export async function proxySessionStartAction(
   const includedCollections = JSON.parse(experience.includedCollections || "[]") as string[];
   const excludedTags = JSON.parse(experience.excludedTags || "[]") as string[];
 
-      // Parse answers to extract price/budget range if present
-      let priceMin: number | null = null;
-      let priceMax: number | null = null;
-      
-      if (Array.isArray(answers)) {
+  // Parse answers to extract price/budget range if present
+  let priceMin: number | null = null;
+  let priceMax: number | null = null;
+  
+  if (Array.isArray(answers)) {
     // Look for budget/price range answers - check if any answer matches common budget patterns
     for (const answer of answers) {
       const answerStr = String(answer).toLowerCase().trim();
@@ -1145,18 +1145,18 @@ export async function proxySessionStartAction(
           console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin);
         }
       }
-      }
     }
+  }
 
-    // Get access token from Session table
-    const accessToken = await getAccessTokenForShop(shopDomain);
-    
-    let productHandles: string[] = [];
-    let chargeResult: { charged: boolean; creditsBurned: number; overageCreditsX2Delta: number } | null = null;
-    
+  // Get access token from Session table
+  const accessToken = await getAccessTokenForShop(shopDomain);
+  
+  let productHandles: string[] = [];
+  let chargeResult: { charged: boolean; creditsBurned: number; overageCreditsX2Delta: number } | null = null;
+  
     try {
       if (accessToken) {
-        console.log("[App Proxy] Fetching products from Shopify Admin API");
+      console.log("[App Proxy] Fetching products from Shopify Admin API");
       
       // Fetch products
       let products = await fetchShopifyProducts({
@@ -1428,6 +1428,10 @@ export async function proxySessionStartAction(
       // Parse bundle intent
       const bundleIntent = parseBundleIntentGeneric(userIntent);
       console.log("[Bundle] detected:", bundleIntent.isBundle, "items:", bundleIntent.items.length, "totalBudget:", bundleIntent.totalBudget);
+      
+      // For bundle/hard-term queries that require AI ranking, process asynchronously to avoid timeouts
+      // Check if we need async processing (bundle queries or queries with hard terms that will use AI)
+      const willUseAI = bundleIntent.isBundle === true || hardTerms.length > 0;
       
       // Allocate budget per item if total budget provided
       type BundleItemWithBudget = { hardTerms: string[]; quantity: number; budgetMin?: number; budgetMax?: number };
@@ -1747,42 +1751,49 @@ export async function proxySessionStartAction(
           if (!added) break;
         }
         
-        // PASS 3: Relaxed substitutes (allow substitutes, exceed budget if needed)
-        // Build substitute pools
-        const substituteMap = new Map<number, string[]>(); // itemIdx -> substitute terms
-        for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
-          const item = bundleItemsWithBudget[itemIdx];
-          const mainTerm = item.hardTerms[0]?.toLowerCase() || "";
-          const substitutes: string[] = [];
-          
-          // Define substitutes
-          if (mainTerm.includes("blazer") || mainTerm.includes("outerwear")) {
-            substitutes.push("jacket", "coat", "waistcoat");
-          }
-          if (mainTerm.includes("trouser")) {
-            substitutes.push("pant", "chino");
-          }
-          if (mainTerm.includes("shirt")) {
-            substitutes.push("dress shirt", "button-up", "formal shirt");
-          }
-          if (mainTerm.includes("suit")) {
-            // Only allow tuxedo if wedding/formal intent (check userIntent later, for now skip)
-            // substitutes.push("tuxedo");
-          }
-          
-          if (substitutes.length > 0) {
-            substituteMap.set(itemIdx, substitutes);
-          }
-        }
+        // PASS 3: Relaxed substitutes (allow substitutes, but try to stay within budget)
+        // Only proceed if we still need more items AND haven't exceeded budget too much
+        // If budget is already exceeded by >50%, stop adding more items
+        const budgetExceededThreshold = totalBudget !== null ? totalBudget * 1.5 : Infinity;
+        const shouldContinuePass3 = handles.length < requestedCount && 
+          (totalBudget === null || totalPrice <= budgetExceededThreshold);
         
-        // Check if any item pool is too small (< 5 candidates)
-        const needsSubstitutes = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => {
-          const pool = bundleItemPools.get(i) || [];
-          const availableInPool = pool.filter(c => !used.has(c.handle)).length;
-          return availableInPool < 5;
-        });
-        
-        while (handles.length < requestedCount) {
+        if (shouldContinuePass3) {
+          // Build substitute pools
+          const substituteMap = new Map<number, string[]>(); // itemIdx -> substitute terms
+          for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+            const item = bundleItemsWithBudget[itemIdx];
+            const mainTerm = item.hardTerms[0]?.toLowerCase() || "";
+            const substitutes: string[] = [];
+            
+            // Define substitutes
+            if (mainTerm.includes("blazer") || mainTerm.includes("outerwear")) {
+              substitutes.push("jacket", "coat", "waistcoat");
+            }
+            if (mainTerm.includes("trouser")) {
+              substitutes.push("pant", "chino");
+            }
+            if (mainTerm.includes("shirt")) {
+              substitutes.push("dress shirt", "button-up", "formal shirt");
+            }
+            if (mainTerm.includes("suit")) {
+              // Only allow tuxedo if wedding/formal intent (check userIntent later, for now skip)
+              // substitutes.push("tuxedo");
+            }
+            
+            if (substitutes.length > 0) {
+              substituteMap.set(itemIdx, substitutes);
+            }
+          }
+          
+          // Check if any item pool is too small (< 5 candidates)
+          const needsSubstitutes = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => {
+            const pool = bundleItemPools.get(i) || [];
+            const availableInPool = pool.filter(c => !used.has(c.handle)).length;
+            return availableInPool < 5;
+          });
+          
+          while (handles.length < requestedCount && (totalBudget === null || totalPrice <= budgetExceededThreshold)) {
           let added = false;
           const itemIndices = Array.from({ length: bundleItemsWithBudget.length }, (_, i) => i);
           
@@ -1841,7 +1852,18 @@ export async function proxySessionStartAction(
               return true;
             });
             
-            const selected = withinBudget.length > 0 ? withinBudget[0] : candidates[0];
+            // Prefer within-budget candidates, but if none exist, use cheapest to minimize excess
+            let selected: EnrichedCandidate | null = null;
+            if (withinBudget.length > 0) {
+              selected = withinBudget[0]; // Already sorted by price (cheapest first)
+            } else if (candidates.length > 0) {
+              // No within-budget candidates - use cheapest to minimize budget excess
+              selected = candidates[0]; // Already sorted by price
+              if (totalBudget !== null) {
+                budgetExceeded = true;
+                trustFallback = true;
+              }
+            }
             
             if (selected) {
               const price = getPrice(selected);
@@ -1859,7 +1881,8 @@ export async function proxySessionStartAction(
             }
           }
           
-          if (!added) break;
+            if (!added) break;
+          }
         }
         
         return { handles, trustFallback, budgetExceeded, totalPrice, pass1Added, pass2Added, pass3Added };
@@ -3555,17 +3578,17 @@ export async function proxySessionStartAction(
           // (This allows the session to complete even if billing tracking fails)
           console.warn("[App Proxy] Billing error (non-blocking):", errorMessage);
         }
-      }
-    } else {
-      console.log("[App Proxy] No access token available - skipping product fetch");
+    }
+  } else {
+    console.log("[App Proxy] No access token available - skipping product fetch");
 
-        // Save empty results if no access token
-        await saveConciergeResult({
-          sessionToken,
-          productHandles: [],
-          productIds: null,
-          reasoning: "No products available. Please ensure the app is installed and products exist.",
-        });
+    // Save empty results if no access token
+  await saveConciergeResult({
+    sessionToken,
+      productHandles: [],
+    productIds: null,
+      reasoning: "No products available. Please ensure the app is installed and products exist.",
+  });
         
         // Mark session as ERROR
         await prisma.conciergeSession.update({
