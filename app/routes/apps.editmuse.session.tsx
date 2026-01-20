@@ -164,46 +164,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
   
-  // If COLLECTING or PROCESSING, return pending status
-  if (status === ConciergeSessionStatus.COLLECTING || status === ConciergeSessionStatus.PROCESSING) {
+  // If not COMPLETE, return error or empty
+  if (status !== ConciergeSessionStatus.COMPLETE) {
     console.log("[App Proxy] /session", status, { sid: sessionId, requestId });
     return Response.json({
       ok: true,
       sid: sessionId,
-      status: status === ConciergeSessionStatus.COLLECTING ? "PENDING" : "PROCESSING",
+      status: status === ConciergeSessionStatus.FAILED ? "ERROR" : "PENDING",
       products: [],
+      errorMessage: status === ConciergeSessionStatus.FAILED ? (session.result?.reasoning || "Session processing failed") : null,
       requestId,
     }, {
       headers: { "Content-Type": "application/json", "x-request-id": requestId },
     });
   }
-  
-  // If FAILED, return error status
-  if (status === ConciergeSessionStatus.FAILED) {
-    console.log("[App Proxy] /session", status, { sid: sessionId, requestId });
-    return Response.json({
-      ok: true,
-      sid: sessionId,
-      status: "ERROR",
-      products: [],
-      errorMessage: session.result?.reasoning || "Session processing failed",
-      requestId,
-    }, {
-      headers: { "Content-Type": "application/json", "x-request-id": requestId },
-    });
-  }
-  
-  // Default: return pending
-  console.log("[App Proxy] /session unknown status", { sid: sessionId, status, requestId });
-  return Response.json({
-    ok: true,
-    sid: sessionId,
-    status: "PENDING",
-    products: [],
-    requestId,
-  }, {
-    headers: { "Content-Type": "application/json", "x-request-id": requestId },
-  });
 
 };
 

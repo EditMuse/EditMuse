@@ -825,10 +825,8 @@ export async function proxySessionStartAction(
         responseData.reasoning = existing.result.reasoning || null;
       }
       
-      // If COLLECTING or PROCESSING, return immediately without restarting work
-      if (existing.status === ConciergeSessionStatus.COLLECTING || existing.status === ConciergeSessionStatus.PROCESSING) {
-        // Map COLLECTING to PENDING in response
-        responseData.status = existing.status === ConciergeSessionStatus.COLLECTING ? "PENDING" : "PROCESSING";
+      // If already COMPLETE, return immediately
+      if (existing.status === "COMPLETE") {
         return Response.json(responseData);
       }
       
@@ -1078,7 +1076,7 @@ export async function proxySessionStartAction(
     ? JSON.stringify(answers) 
     : (typeof answers === "string" ? answers : "[]");
 
-  // Create session with PENDING status (will be updated to PROCESSING/COMPLETE/ERROR during async processing)
+  // Create session
   const sessionToken = await createConciergeSession({
     shopId: shop.id,
     experienceId: experience.id,
@@ -1086,8 +1084,6 @@ export async function proxySessionStartAction(
     answersJson,
     clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null,
   });
-  
-  console.log('[App Proxy] Created PENDING session', { clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null, resultCount: finalResultCount, sessionToken });
 
   // Track usage: session started
   await trackUsageEvent(shop.id, "SESSION_STARTED" as UsageEventType, {
@@ -1098,20 +1094,9 @@ export async function proxySessionStartAction(
 
   console.log("[App Proxy] Session created:", sessionToken, "mode:", modeUsed, "experienceId:", experienceIdUsed);
 
-  // Return immediately with PENDING status - processing continues asynchronously
-  // Process ranking asynchronously using setImmediate (runs after response is sent)
-  setImmediate(async () => {
-    try {
-      // Update status to PROCESSING when starting async work
-      await prisma.conciergeSession.update({
-        where: { publicToken: sessionToken },
-        data: { status: ConciergeSessionStatus.PROCESSING },
-      });
-      console.log("[App Proxy] Async processing started for session:", sessionToken);
-
-      // Parse experience filters
-      const includedCollections = JSON.parse(experience.includedCollections || "[]") as string[];
-      const excludedTags = JSON.parse(experience.excludedTags || "[]") as string[];
+  // Parse experience filters
+  const includedCollections = JSON.parse(experience.includedCollections || "[]") as string[];
+  const excludedTags = JSON.parse(experience.excludedTags || "[]") as string[];
 
       // Parse answers to extract price/budget range if present
       let priceMin: number | null = null;
@@ -1169,9 +1154,9 @@ export async function proxySessionStartAction(
     let productHandles: string[] = [];
     let chargeResult: { charged: boolean; creditsBurned: number; overageCreditsX2Delta: number } | null = null;
     
-    if (accessToken) {
-      try {
-      console.log("[App Proxy] Fetching products from Shopify Admin API");
+    try {
+      if (accessToken) {
+        console.log("[App Proxy] Fetching products from Shopify Admin API");
       
       // Fetch products
       let products = await fetchShopifyProducts({
@@ -2128,155 +2113,7 @@ export async function proxySessionStartAction(
       const strictGateCount = strictGate.length;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
       
-      // FAST-PATH: Skip AI ranking for no-hard-terms single-item queries
-      // STRICT GUARDS: Fast-path ONLY runs when ALL conditions are met:
-      // - isBundle === false
-      // - hardTerms.length === 0
-      // Fast-path MUST NOT run if ANY of these are true:
-      // - isBundle === true
-      // - hardTerms.length > 0
-      // - bundleItems.length > 0
-      // - totalBudget != null
-      const canUseFastPath = 
-        bundleIntent.isBundle === false &&
-        hardTerms.length === 0 &&
-        bundleIntent.items.length === 0 &&
-        bundleIntent.totalBudget === null;
-      
-      // Determine which path to use
-      const isBundlePath = bundleIntent.isBundle && bundleIntent.items.length >= 2;
-      const isHardTermPath = hardTerms.length > 0;
-      const isFastPath = canUseFastPath;
-      
-      if (isBundlePath) {
-        console.log("[BundlePath] detected=true items=", bundleIntent.items.length, "totalBudget=", bundleIntent.totalBudget);
-      } else if (isHardTermPath) {
-        console.log("[HardTermPath] detected=true hardTerms=", hardTerms.length);
-      } else if (isFastPath) {
-        console.log("[FastPath] enabled=true reason=\"noHardTerms\" gatedPool=", gatedCandidates.length);
-      }
-      
-      // For fast-path: process synchronously and return COMPLETE
-      // For bundle/hard-term: return PENDING and process async
-      if (isFastPath) {
-        // FAST-PATH: Process synchronously (fast, no AI needed)
-        // Limit Layer 1 enrichment to top 40 if needed (already enriched, but limit candidates for processing)
-        const fastPathCandidates = gatedCandidates.slice(0, 40);
-        
-        // Deterministic selection: available first, then best data quality
-        const deterministicSorted = [...fastPathCandidates].sort((a, b) => {
-          // 1) Available first
-          if (a.available !== b.available) {
-            return a.available ? -1 : 1;
-          }
-          
-          // 2) Data quality: has image, has priceAmount, has productType, has tags
-          const aHasImage = !!a.title; // Assume if title exists, image likely exists
-          const bHasImage = !!b.title;
-          if (aHasImage !== bHasImage) {
-            return bHasImage ? 1 : -1;
-          }
-          
-          const aHasPrice = !!a.price;
-          const bHasPrice = !!b.price;
-          if (aHasPrice !== bHasPrice) {
-            return bHasPrice ? 1 : -1;
-          }
-          
-          const aHasProductType = !!a.productType;
-          const bHasProductType = !!b.productType;
-          if (aHasProductType !== bHasProductType) {
-            return bHasProductType ? 1 : -1;
-          }
-          
-          const aTagCount = (a.tags || []).length;
-          const bTagCount = (b.tags || []).length;
-          if (aTagCount !== bTagCount) {
-            return bTagCount - aTagCount;
-          }
-          
-          // Final tiebreaker
-          return a.handle.localeCompare(b.handle);
-        });
-        
-        let fastPathHandles = deterministicSorted.slice(0, finalResultCount).map(c => c.handle);
-        
-        // Run diversity + top-up as needed
-        const candidatesForDiversity = gatedCandidates.map(c => ({
-          handle: c.handle,
-          title: c.title,
-          tags: c.tags,
-          productType: c.productType,
-          vendor: c.vendor,
-          price: c.price,
-          description: c.description,
-          available: c.available,
-          sizes: c.sizes,
-          colors: c.colors,
-          materials: c.materials,
-          optionValues: c.optionValues,
-        }));
-        
-        const diverseHandles = ensureResultDiversity(
-          fastPathHandles,
-          candidatesForDiversity,
-          finalResultCount
-        );
-        
-        // Top-up if needed (from remaining gated pool)
-        const used = new Set(diverseHandles);
-        let topUpHandles = [...diverseHandles];
-        const remainingCandidates = deterministicSorted.filter(c => !used.has(c.handle));
-        
-        while (topUpHandles.length < finalResultCount && remainingCandidates.length > 0) {
-          const next = remainingCandidates.shift();
-          if (next && !used.has(next.handle)) {
-            topUpHandles.push(next.handle);
-            used.add(next.handle);
-          }
-        }
-        
-        const deliveredCount = topUpHandles.length;
-        const requestedCount = finalResultCount;
-        console.log("[FastPath] delivered=", deliveredCount, "requested=", requestedCount);
-        
-        // Set trustFallback=true
-        const trustFallback = true;
-        const reasoning = "Products selected using relevance ranking.";
-        
-        // Save ConciergeResult with status COMPLETE (saveConciergeResult marks session as COMPLETE)
-        const finalHandlesToSave = topUpHandles.slice(0, finalResultCount);
-        await saveConciergeResult({
-          sessionToken,
-          productHandles: finalHandlesToSave,
-          productIds: null,
-          reasoning,
-        });
-        
-        // Charge billing based on delivered count (exactly once)
-        const creditsForDeliveredCount = (n: number): number => {
-          if (n <= 0) return 0;
-          if (n <= 8) return 1;
-          if (n <= 12) return 1.5;
-          return 2; // 13-16
-        };
-        
-        const credits = creditsForDeliveredCount(deliveredCount);
-        console.log("[Billing] requested=", requestedCount, "delivered=", deliveredCount, "credits=", credits, "sid=", sessionToken, "experienceId=", experienceIdUsed);
-        
-        await chargeConciergeSessionOnce({
-          shopId: shop.id,
-          sessionToken,
-          resultCount: deliveredCount,
-          experienceId: experienceIdUsed,
-        });
-        
-        // Fast-path complete - status already set to COMPLETE by saveConciergeResult
-        console.log("[FastPath] Completed - session:", sessionToken);
-        return; // Exit async callback
-      }
-      
-      // BUNDLE/HARD-TERM PATH: Continue processing in async callback
+      // BUNDLE/HARD-TERM PATH: Continue processing
       // Reduce AI window when no hardTerms (max 60 candidates)
       if (hardTerms.length === 0 && aiWindow > 60) {
         aiWindow = 60;
@@ -3640,7 +3477,8 @@ export async function proxySessionStartAction(
                         where: { publicToken: sessionToken },
                         data: { status: ConciergeSessionStatus.FAILED },
                       }).catch(() => {});
-                      return; // Exit async callback
+                      // Mark session as failed - will be handled by outer catch
+                      throw new Error("Usage cap reached. Please contact support or wait for the next billing cycle.");
                     }
                   }
                 }
@@ -3681,7 +3519,8 @@ export async function proxySessionStartAction(
                   where: { publicToken: sessionToken },
                   data: { status: ConciergeSessionStatus.FAILED },
                 }).catch(() => {});
-                return; // Exit async callback
+                // Mark session as failed - will be handled by outer catch
+                throw new Error(errorMessage);
               }
               // Never throw for other overage errors - this should not fail the request
             }
@@ -3704,17 +3543,18 @@ export async function proxySessionStartAction(
               where: { publicToken: sessionToken },
               data: { status: ConciergeSessionStatus.FAILED },
             }).catch(() => {});
-            return; // Exit async callback
+            // Mark session as failed and return error response
+            return Response.json({
+              ok: false,
+              error: errorMessage,
+              sid: sessionToken,
+            }, { status: 403 });
           }
           
           // For other billing errors, still return success but log the error
           // (This allows the session to complete even if billing tracking fails)
           console.warn("[App Proxy] Billing error (non-blocking):", errorMessage);
         }
-      }
-      } catch (innerError: any) {
-        // Re-throw to be caught by outer catch
-        throw innerError;
       }
     } else {
       console.log("[App Proxy] No access token available - skipping product fetch");
@@ -3733,32 +3573,37 @@ export async function proxySessionStartAction(
           data: { status: ConciergeSessionStatus.FAILED },
         }).catch(() => {});
       }
-    } catch (asyncError: any) {
-      console.error("[App Proxy] Async processing failed:", asyncError);
-      // Mark session as ERROR
-      await prisma.conciergeSession.update({
-        where: { publicToken: sessionToken },
-        data: { 
-          status: ConciergeSessionStatus.FAILED,
-        },
-      }).catch(() => {});
-      
-      // Save error result
-      await saveConciergeResult({
-        sessionToken,
-        productHandles: [],
-        productIds: null,
-        reasoning: asyncError instanceof Error ? asyncError.message : "Error processing request. Please try again.",
-      }).catch(() => {});
-    }
-  }); // End setImmediate callback
+    } catch (error: any) {
+    console.error("[App Proxy] Processing failed:", error);
+    // Mark session as ERROR
+    await prisma.conciergeSession.update({
+      where: { publicToken: sessionToken },
+      data: { 
+        status: ConciergeSessionStatus.FAILED,
+      },
+    }).catch(() => {});
+    
+    // Save error result
+    await saveConciergeResult({
+      sessionToken,
+      productHandles: [],
+      productIds: null,
+      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+    }).catch(() => {});
+    
+    return Response.json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Error processing request. Please try again.",
+      sid: sessionToken,
+    }, { status: 500 });
+  }
   
-  // Return PENDING immediately (processing continues async)
+  // Return success with session ID (results are saved, frontend can poll /session endpoint)
   return Response.json({
     ok: true,
     sid: sessionToken,
     sessionId: sessionToken, // Keep for backward compatibility
-    status: "PENDING",
+    status: "COMPLETE",
     resultCount: finalResultCount,
   });
 }

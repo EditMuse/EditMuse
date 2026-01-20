@@ -14,7 +14,6 @@
 
 import crypto from "crypto";
 import prisma from "~/db.server";
-import OpenAI from "openai";
 
 interface ProductCandidate {
   handle: string;
@@ -88,6 +87,7 @@ interface StructuredBundleResult {
   rejected_candidates?: RejectedCandidate[];
 }
 
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "60000"); // Configurable timeout, default 60 seconds
 const MAX_RETRIES = 2; // Max 2 retries, so at most 3 attempts total (initial attempt + 2 retries)
@@ -584,13 +584,6 @@ export async function rankProductsWithAI(
     console.log("[AI Ranking] Feature disabled via FEATURE_AI_RANKING - using deterministic fallback");
     return deterministicRanking(candidates, resultCount, variantPreferences);
   }
-
-  // Initialize OpenAI client
-  const openai = new OpenAI({
-    apiKey: apiKey,
-    timeout: TIMEOUT_MS,
-    maxRetries: 0, // We handle retries manually
-  });
   
   // Check cache first
   if (shopId) {
@@ -1194,33 +1187,56 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         console.log("[AI Ranking] First attempt using compressed prompt (adaptive compression)");
       }
 
-      // Use strict Structured Outputs with JSON schema
-      const responseFormat = {
-        type: "json_schema" as const,
-        json_schema: {
-          name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
-          strict: true,
-          schema: buildJsonSchema(isBundle),
-        },
-      };
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-      console.log("[AI Ranking] structured_outputs=true");
-
-      // Call OpenAI with strict structured outputs
-      const response = await openai.chat.completions.create({
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
+      // Build request body with JSON mode/schema if supported
+      const requestBody: any = {
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
           { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
         ],
-        temperature: 0,
+        temperature: 0, // Set to 0 for more deterministic output
         max_tokens: 1500,
-        response_format: responseFormat,
+      };
+      
+      // Add JSON schema if supported, otherwise JSON object mode
+      if (supportsJsonSchema) {
+        requestBody.response_format = {
+          type: "json_schema",
+          json_schema: {
+            name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
+            strict: true,
+            schema: buildJsonSchema(isBundle),
+          },
+        };
+      } else if (supportsJsonMode) {
+        requestBody.response_format = { type: "json_object" };
+      }
+
+      const response = await fetch(OPENAI_API_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+        body: JSON.stringify(requestBody),
       });
 
-      // With strict structured outputs, the response is pre-parsed
-      // The content should be valid JSON matching our schema
-      const content = response.choices?.[0]?.message?.content;
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[AI Ranking] OpenAI API error:", response.status, errorText);
+        lastError = new Error(`OpenAI API error: ${response.status}`);
+        lastParseFailReason = `API error: ${response.status}`;
+        continue; // Try again if retries remaining
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
 
       if (!content) {
         console.error("[AI Ranking] No content in OpenAI response");
@@ -1229,26 +1245,26 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      // Parse the JSON content (should be valid JSON from structured outputs)
+      console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
+
+      // Parse JSON response using improved parser
       let structuredResult: StructuredRankingResult | StructuredBundleResult;
       
       try {
-        // With strict structured outputs, content should be valid JSON
-        structuredResult = JSON.parse(content) as StructuredRankingResult | StructuredBundleResult;
+        structuredResult = parseStructuredRanking(content);
       } catch (err) {
-        // Fallback to improved parser if JSON.parse fails (shouldn't happen with strict mode, but keep as safety)
-        try {
-          structuredResult = parseStructuredRanking(content);
-        } catch (parseErr) {
-          if (parseErr instanceof JSONParseError) {
-            lastError = parseErr;
-            lastParseFailReason = parseErr.message;
-          } else {
-            lastError = parseErr as Error;
-            lastParseFailReason = `Unexpected parsing error: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`;
-          }
+        if (err instanceof JSONParseError) {
+          lastError = err;
+          lastParseFailReason = err.message;
           console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-        continue; // Try again if retries remaining
+          // This typed error triggers compressed retry
+          continue; // Try again if retries remaining
+        } else {
+          // Unexpected error type
+          lastError = err;
+          lastParseFailReason = `Unexpected parsing error: ${err instanceof Error ? err.message : String(err)}`;
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          continue; // Try again if retries remaining
         }
       }
 
