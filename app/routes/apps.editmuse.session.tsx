@@ -1,12 +1,13 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
-import { getConciergeSessionByToken } from "~/models/concierge.server";
 import {
   getOfflineAccessTokenForShop,
   fetchShopifyProductsByHandlesGraphQL,
 } from "~/shopify-admin.server";
 import { getOrCreateRequestId } from "~/utils/request-id.server";
 import { ConciergeSessionStatus } from "@prisma/client";
+import { chargeConciergeSessionOnce } from "~/models/billing.server";
+import prisma from "~/db.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   console.log("[App Proxy] GET /apps/editmuse/session");
@@ -31,8 +32,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 
   // Get session to determine shop (before validation)
-  // Note: getConciergeSessionByToken now includes result relation
-  const session = await getConciergeSessionByToken(sessionId);
+  // Need chargedAt and deliveredAt for billing on delivery
+  const session = await prisma.conciergeSession.findUnique({
+    where: { publicToken: sessionId },
+    include: { 
+      shop: true,
+      result: true,
+    },
+  });
   if (!session) {
     console.log("[App Proxy] Session not found:", sessionId);
     return Response.json({ 
@@ -106,10 +113,52 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Return session status and products based on current state
   const status = session.status;
   
-  // If COMPLETE and result exists, fetch products
+  // If COMPLETE and result exists, fetch products and charge on first delivery
   if (status === ConciergeSessionStatus.COMPLETE && session.result) {
     const raw = session.result.productHandles;
     const savedHandles = Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string") : [];
+    const deliveredCount = savedHandles.length;
+
+    // Set deliveredAt on first delivery (idempotent)
+    const now = new Date();
+    if (!session.deliveredAt) {
+      await prisma.conciergeSession.update({
+        where: { id: session.id },
+        data: { deliveredAt: now },
+      });
+      console.log("[App Proxy] /session marked deliveredAt", { sid: sessionId, requestId });
+    }
+
+    // Charge on first delivery (idempotent - guard by chargedAt)
+    if (!session.chargedAt && deliveredCount > 0) {
+      try {
+        const credits = deliveredCount <= 8 ? 1 : deliveredCount <= 12 ? 1.5 : 2;
+        console.log("[Billing] Charging on delivery", { 
+          sid: sessionId, 
+          deliveredCount, 
+          credits,
+          requestId 
+        });
+
+        await chargeConciergeSessionOnce({
+          sessionToken: sessionId,
+          shopId: session.shopId,
+          resultCount: deliveredCount,
+          experienceId: session.experienceId || undefined,
+        });
+
+        console.log("[Billing] Charged on delivery", { sid: sessionId, deliveredCount, credits, requestId });
+      } catch (billingError) {
+        // Log billing error but don't block delivery
+        console.error("[Billing] Error charging on delivery", { 
+          sid: sessionId, 
+          error: billingError instanceof Error ? billingError.message : String(billingError),
+          requestId 
+        });
+      }
+    } else if (session.chargedAt) {
+      console.log("[Billing] Already charged", { sid: sessionId, chargedAt: session.chargedAt, requestId });
+    }
 
     if (savedHandles.length > 0) {
       console.log("[App Proxy] /session served COMPLETE result", { sid: sessionId, requestId, count: savedHandles.length });

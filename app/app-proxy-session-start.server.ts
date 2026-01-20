@@ -860,13 +860,14 @@ export async function proxySessionStartAction(
         ok: true,
         sid: existing.publicToken,
         sessionId: existing.publicToken, // Keep for backward compatibility
-        status: existing.status,
+        status: existing.status === ConciergeSessionStatus.COMPLETE ? "COMPLETE" : 
+                existing.status === ConciergeSessionStatus.FAILED ? "ERROR" : "PENDING",
         resultCount: existing.resultCount || 8,
         idempotent: true,
       };
       
       // If COMPLETE and result exists, include handles/reasoning
-      if (existing.status === "COMPLETE" && existing.result) {
+      if (existing.status === ConciergeSessionStatus.COMPLETE && existing.result) {
         const productHandles = Array.isArray(existing.result.productHandles) 
           ? existing.result.productHandles 
           : (typeof existing.result.productHandles === "string" ? JSON.parse(existing.result.productHandles) : []);
@@ -874,11 +875,7 @@ export async function proxySessionStartAction(
         responseData.reasoning = existing.result.reasoning || null;
       }
       
-      // If already COMPLETE, return immediately
-      if (existing.status === "COMPLETE") {
-        return Response.json(responseData);
-      }
-      
+      // Return immediately (don't start duplicate processing)
       return Response.json(responseData);
     }
   }
@@ -1128,13 +1125,19 @@ export async function proxySessionStartAction(
     ? JSON.stringify(answers) 
     : (typeof answers === "string" ? answers : "[]");
 
-  // Create session
+  // Create session with PROCESSING status (will be updated to COMPLETE/FAILED by background processing)
   const sessionToken = await createConciergeSession({
     shopId: shop.id,
     experienceId: experience.id,
     resultCount: finalResultCount,
     answersJson,
     clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null,
+  });
+
+  // Update status to PROCESSING immediately
+  await prisma.conciergeSession.update({
+    where: { publicToken: sessionToken },
+    data: { status: ConciergeSessionStatus.PROCESSING },
   });
 
   // Track usage: session started
@@ -1145,10 +1148,101 @@ export async function proxySessionStartAction(
   });
 
   console.log("[App Proxy] Session created:", sessionToken, "mode:", modeUsed, "experienceId:", experienceIdUsed);
+  console.log("[App Proxy] Returning PENDING immediately", { sid: sessionToken, resultCount: finalResultCount });
 
-  // Parse experience filters
-  const includedCollections = JSON.parse(experience.includedCollections || "[]") as string[];
-  const excludedTags = JSON.parse(experience.excludedTags || "[]") as string[];
+  // Start background processing asynchronously
+  setImmediate(async () => {
+    const startTime = Date.now();
+    console.log("[App Proxy] Background processing started", { sid: sessionToken });
+    
+    try {
+      await processSessionInBackground({
+        sessionToken,
+        shop,
+        shopDomain,
+        experience,
+        experienceIdUsed,
+        finalResultCount,
+        answersJson,
+        includedCollections: JSON.parse(experience.includedCollections || "[]") as string[],
+        excludedTags: JSON.parse(experience.excludedTags || "[]") as string[],
+        entitlements,
+        modeUsed,
+        baseAiWindow: Math.min(entitlements.candidateCap, 40), // Single-item window
+      });
+      
+      const durationMs = Date.now() - startTime;
+      console.log("[App Proxy] Background processing completed", { sid: sessionToken, durationMs });
+    } catch (error: any) {
+      const durationMs = Date.now() - startTime;
+      console.error("[App Proxy] Background processing failed", { sid: sessionToken, durationMs, error: error instanceof Error ? error.message : String(error) });
+      
+      // Mark session as FAILED
+      await prisma.conciergeSession.update({
+        where: { publicToken: sessionToken },
+        data: { status: ConciergeSessionStatus.FAILED },
+      }).catch(() => {});
+      
+      // Save error result
+      await saveConciergeResult({
+        sessionToken,
+        productHandles: [],
+        productIds: null,
+        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+      }).catch(() => {});
+    }
+  });
+
+  // Return immediately with PENDING status - processing will happen in background
+  return Response.json({
+    ok: true,
+    sid: sessionToken,
+    sessionId: sessionToken, // Keep for backward compatibility
+    status: "PENDING",
+    resultCount: finalResultCount,
+  });
+}
+
+/**
+ * Background processing function - runs the full pipeline asynchronously
+ * NOTE: Billing is NOT performed here - will be handled separately
+ */
+async function processSessionInBackground({
+  sessionToken,
+  shop,
+  shopDomain,
+  experience,
+  experienceIdUsed,
+  finalResultCount,
+  answersJson,
+  includedCollections,
+  excludedTags,
+  entitlements,
+  modeUsed,
+  baseAiWindow,
+}: {
+  sessionToken: string;
+  shop: { id: string; domain: string };
+  shopDomain: string;
+  experience: any;
+  experienceIdUsed: string;
+  finalResultCount: number;
+  answersJson: string;
+  includedCollections: string[];
+  excludedTags: string[];
+  entitlements: any;
+  modeUsed: string;
+  baseAiWindow: number;
+}): Promise<void> {
+
+  // Parse answers from JSON
+  let answers: any[] = [];
+  try {
+    const parsed = JSON.parse(answersJson);
+    answers = Array.isArray(parsed) ? parsed : (typeof parsed === "string" ? [parsed] : []);
+  } catch (e) {
+    console.error("[App Proxy] Failed to parse answersJson in background processing:", e);
+  }
 
   // Parse answers to extract price/budget range if present
   let priceMin: number | null = null;
@@ -1204,7 +1298,6 @@ export async function proxySessionStartAction(
   const accessToken = await getAccessTokenForShop(shopDomain);
   
   let productHandles: string[] = [];
-  let chargeResult: { charged: boolean; creditsBurned: number; overageCreditsX2Delta: number } | null = null;
   
     try {
       if (accessToken) {
@@ -3484,153 +3577,12 @@ export async function proxySessionStartAction(
           : finalReasoning,
       });
 
-      console.log("[App Proxy] Results saved, session marked COMPLETE. billedCount=", billedCount);
+      console.log("[App Proxy] Results saved, session marked COMPLETE. deliveredCount=", deliveredCount);
 
       // Log 3-layer pipeline metrics
       console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
 
-      // Charge session based on delivered results, not requested (ONLY AFTER saving)
-      // NOTE: Credits are charged regardless of cache hit/miss - you're paying for the ranking service, not the OpenAI API call
-      const credits = creditsForDeliveredCount(billedCount);
-      
-      if (billedCount === 0) {
-        console.log("[Billing] Skipping charge: billedCount=0");
-      } else {
-        try {
-          // Charge based on billedCount (delivered count)
-          chargeResult = await chargeConciergeSessionOnce({
-            sessionToken,
-            shopId: shop.id,
-            resultCount: billedCount, // Use delivered count for billing
-            experienceId: experience.id,
-          });
-          console.log("[Billing] requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "credits=", credits, "sid=", sessionToken, "experienceId=", experienceIdUsed);
-          console.log("[App Proxy] Session charged for", deliveredCount, "delivered results, overage delta:", chargeResult.overageCreditsX2Delta);
-
-          // Handle overage charges if any
-          if (chargeResult.overageCreditsX2Delta > 0) {
-            try {
-              // Convert x2 units to credits
-              const overageCredits = chargeResult.overageCreditsX2Delta / 2;
-              const overageAmountUsd = overageCredits * entitlements.overageRatePerCredit;
-              
-              // Check if overage would exceed cap (best-effort check using cached balanceUsed)
-              // Note: balanceUsed may be stale, but this prevents obvious cap violations
-              const { getActiveCharge } = await import("~/models/shopify-billing.server");
-              try {
-                // Try to get access token for shop (for app proxy context)
-                let accessToken: string | undefined;
-                try {
-                  const token = await getAccessTokenForShop(shopDomain);
-                  accessToken = token || undefined;
-                } catch (tokenError) {
-                  // No access token available - skip cap check (non-fatal)
-                  console.log("[App Proxy] No access token for overage cap check, skipping (non-fatal)");
-                }
-                
-                // Only check cap if we have an access token
-                if (accessToken) {
-                  const activeCharge = await getActiveCharge(shopDomain, { accessToken });
-                  if (activeCharge?.usageCapAmountUsd && activeCharge?.usageBalanceUsedUsd !== null) {
-                    const projectedBalance = activeCharge.usageBalanceUsedUsd + overageAmountUsd;
-                    if (projectedBalance > activeCharge.usageCapAmountUsd) {
-                      // Cap would be exceeded - block the request
-                      console.warn("[Billing] Overage charge would exceed cap", {
-                        currentBalance: activeCharge.usageBalanceUsedUsd,
-                        cap: activeCharge.usageCapAmountUsd,
-                        overageAmount: overageAmountUsd,
-                        projected: projectedBalance,
-                      });
-                      // Delete the session results since billing would fail
-                      await saveConciergeResult({
-                        sessionToken,
-                        productHandles: [],
-                        productIds: null,
-                        reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
-                      });
-                      // Mark session as ERROR (don't return Response - we're in async callback)
-                      await prisma.conciergeSession.update({
-                        where: { publicToken: sessionToken },
-                        data: { status: ConciergeSessionStatus.FAILED },
-                      }).catch(() => {});
-                      // Mark session as failed - will be handled by outer catch
-                      throw new Error("Usage cap reached. Please contact support or wait for the next billing cycle.");
-                    }
-                  }
-                }
-              } catch (capCheckError) {
-                // Non-fatal: if we can't check the cap, proceed anyway (cap check is best-effort)
-                // Log but don't throw - this should never block the request
-                console.warn("[Billing] Could not check usage cap (non-fatal, proceeding):", capCheckError instanceof Error ? capCheckError.message : String(capCheckError));
-                console.warn("[Billing] Could not check usage cap, proceeding:", capCheckError);
-              }
-              
-              // Note: No admin session in app proxy context - will use offline token fallback
-              await createOverageUsageCharge({
-                shopDomain,
-                overageCredits,
-                overageRate: entitlements.overageRatePerCredit,
-                sessionPublicToken: sessionToken,
-                // opts not provided - will fallback to offline session token
-              });
-              console.log("[App Proxy] Overage charge created for", overageCredits, "credits");
-            } catch (error) {
-              console.warn("[Billing] Overage usage charge failed", { 
-                shop: shopDomain, 
-                sid: sessionToken, 
-                err: String(error) 
-              });
-              // If overage charge fails due to cap being reached, return error to user
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              if (errorMessage.includes("capped") || errorMessage.includes("cap") || errorMessage.includes("limit") || errorMessage.includes("exceeded")) {
-                // Delete the session results since billing failed
-                await saveConciergeResult({
-                  sessionToken,
-                  productHandles: [],
-                  productIds: null,
-                  reasoning: "Usage cap reached. Please contact support or wait for the next billing cycle.",
-                });
-                // Mark session as ERROR (don't return Response - we're in async callback)
-                await prisma.conciergeSession.update({
-                  where: { publicToken: sessionToken },
-                  data: { status: ConciergeSessionStatus.FAILED },
-                }).catch(() => {});
-                // Mark session as failed - will be handled by outer catch
-                throw new Error(errorMessage);
-              }
-              // Never throw for other overage errors - this should not fail the request
-            }
-          }
-        } catch (error) {
-          console.error("[App Proxy] Error charging session:", error);
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          
-          // If subscription is cancelled or trial expired, return error to user
-          if (errorMessage.includes("cancelled") || errorMessage.includes("subscribe")) {
-            // Delete the session results since billing failed
-            await saveConciergeResult({
-              sessionToken,
-              productHandles: [],
-              productIds: null,
-              reasoning: errorMessage,
-            });
-            // Mark session as ERROR (don't return Response - we're in async callback)
-            await prisma.conciergeSession.update({
-              where: { publicToken: sessionToken },
-              data: { status: ConciergeSessionStatus.FAILED },
-            }).catch(() => {});
-            // Mark session as failed and return error response
-            return Response.json({
-              ok: false,
-              error: errorMessage,
-              sid: sessionToken,
-            }, { status: 403 });
-          }
-          
-          // For other billing errors, still return success but log the error
-          // (This allows the session to complete even if billing tracking fails)
-          console.warn("[App Proxy] Billing error (non-blocking):", errorMessage);
-        }
+      // NOTE: Billing is NOT performed here - will be handled separately when results are delivered
     }
   } else {
     console.log("[App Proxy] No access token available - skipping product fetch");
@@ -3650,37 +3602,25 @@ export async function proxySessionStartAction(
         }).catch(() => {});
       }
     } catch (error: any) {
-    console.error("[App Proxy] Processing failed:", error);
-    // Mark session as ERROR
-    await prisma.conciergeSession.update({
-      where: { publicToken: sessionToken },
-      data: { 
-        status: ConciergeSessionStatus.FAILED,
-      },
-    }).catch(() => {});
-    
-    // Save error result
-    await saveConciergeResult({
-      sessionToken,
-      productHandles: [],
-      productIds: null,
-      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
-    }).catch(() => {});
-    
-    return Response.json({
-      ok: false,
-      error: error instanceof Error ? error.message : "Error processing request. Please try again.",
-      sid: sessionToken,
-    }, { status: 500 });
-  }
-  
-  // Return success with session ID (results are saved, frontend can poll /session endpoint)
-  return Response.json({
-    ok: true,
-    sid: sessionToken,
-    sessionId: sessionToken, // Keep for backward compatibility
-    status: "COMPLETE",
-    resultCount: finalResultCount,
-  });
+      console.error("[App Proxy] Background processing failed:", error);
+      // Mark session as FAILED
+      await prisma.conciergeSession.update({
+        where: { publicToken: sessionToken },
+        data: { 
+          status: ConciergeSessionStatus.FAILED,
+        },
+      }).catch(() => {});
+      
+      // Save error result
+      await saveConciergeResult({
+        sessionToken,
+        productHandles: [],
+        productIds: null,
+        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+      }).catch(() => {});
+      
+      // Re-throw to be caught by outer handler in setImmediate
+      throw error;
+    }
 }
 

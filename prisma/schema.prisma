@@ -118,7 +118,8 @@ model ConciergeSession {
   queryNormalized String?                // Normalized query (lowercased, trimmed) for grouping
   clientRequestId String?
   sessionToken    String?                // Stable token for attribution (set at creation, typically same as publicToken)
-  chargedAt       DateTime?
+  chargedAt       DateTime?              // When billing was charged (on first delivery)
+  deliveredAt     DateTime?              // When results were first delivered to storefront
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
   messages        ConciergeMessage[]

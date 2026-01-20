@@ -1333,7 +1333,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         max_tokens: 1500,
       };
       
-      // Add JSON schema if supported, otherwise JSON object mode
+      // Always use strict structured outputs (JSON schema with strict: true)
+      // This guarantees valid JSON output that matches the schema exactly
       if (supportsJsonSchema) {
         requestBody.response_format = {
           type: "json_schema",
@@ -1343,7 +1344,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             schema: buildJsonSchema(isBundle),
           },
         };
-      } else if (supportsJsonMode) {
+        console.log("[AI Ranking] structured_outputs=true");
+      } else {
+        // Fallback for models that don't support json_schema (shouldn't happen with current models)
+        console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
         requestBody.response_format = { type: "json_object" };
       }
 
@@ -1368,6 +1372,16 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       const data = await response.json();
+      
+      // With strict structured outputs, the content is guaranteed to be valid JSON
+      // Check for refusal (model refused to generate structured output)
+      if (data.choices?.[0]?.message?.refusal) {
+        console.error("[AI Ranking] Model refused to generate structured output:", data.choices[0].message.refusal);
+        lastError = new Error("Model refused to generate structured output");
+        lastParseFailReason = "Model refusal";
+        continue; // Try again if retries remaining
+      }
+
       const content = data.choices?.[0]?.message?.content;
 
       if (!content) {
@@ -1377,27 +1391,24 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      console.log("[AI Ranking] Raw OpenAI response content (first 500 chars):", content.substring(0, 500));
-
-      // Parse JSON response using improved parser
+      // With strict structured outputs, content is guaranteed to be valid JSON
+      // Parse directly without complex error handling
       let structuredResult: StructuredRankingResult | StructuredBundleResult;
       
       try {
-        structuredResult = parseStructuredRanking(content);
+        // Strict mode guarantees valid JSON, so simple parse is sufficient
+        structuredResult = JSON.parse(content) as StructuredRankingResult | StructuredBundleResult;
+        console.log("[AI Ranking] Successfully parsed structured output (strict mode)");
       } catch (err) {
-        if (err instanceof JSONParseError) {
-          lastError = err;
-          lastParseFailReason = err.message;
-          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-          // This typed error triggers compressed retry
-          continue; // Try again if retries remaining
-        } else {
-          // Unexpected error type
-          lastError = err;
-          lastParseFailReason = `Unexpected parsing error: ${err instanceof Error ? err.message : String(err)}`;
-          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-          continue; // Try again if retries remaining
-        }
+        // This should rarely happen with strict mode, but keep retry logic as fallback
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error("[AI Ranking] JSON parse failed even with strict mode:", errorMessage);
+        console.log("[AI Ranking] Raw content (first 500 chars):", content.substring(0, 500));
+        lastError = err;
+        lastParseFailReason = `JSON.parse failed: ${errorMessage}`;
+        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+        // This triggers compressed retry
+        continue; // Try again if retries remaining
       }
 
       // Validate bundle response if in bundle mode

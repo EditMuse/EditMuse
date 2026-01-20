@@ -3063,40 +3063,67 @@
             sid = await this.startSessionWithTimeout(requestBody, 25000);
             console.debug('[Concierge] startSessionWithTimeout succeeded sid=', sid);
           } catch (timeoutError) {
-            // Timeout is NOT an error - transition to stillWorking state
+            // Timeout is NOT an error - backend is still processing
+            console.log('[EditMuse] startSession timed out; switching to resume/poll flow');
             console.debug('[Concierge] submit timeout → stillWorking');
+            
+            // Set UI to "Still working" state (keep spinner)
             this.state.status = 'stillWorking';
             this.state.stillWorking = true;
+            this.state.loading = true; // Keep loading spinner
+            this.state.error = null; // Clear any error
             this.render();
             
-            // Step 2: Resume session (idempotent - server returns existing sid)
-            try {
-              sid = await this.resumeSession(requestBody);
-              console.debug('[Concierge] resume sid=', sid);
-            } catch (resumeError) {
-              // Resume failed - check if it's a real error or still processing
-              if (resumeError.message && resumeError.message.includes('timeout')) {
-                // Still processing - continue to polling without sid (will need to retry resume)
-                console.debug('[Concierge] resume also timed out, will poll after resume retry');
-              } else {
-                // Real error from server
-                throw resumeError;
+            // Step 2: Resume session with retry and backoff (idempotent - server returns existing sid)
+            // Retry up to 3 times over ~10 seconds: immediate, 2s, 5s
+            var resumeAttempts = 0;
+            var maxResumeAttempts = 3;
+            var resumeBackoffs = [0, 2000, 5000]; // ms delays
+            
+            while (!sid && resumeAttempts < maxResumeAttempts) {
+              if (resumeAttempts > 0) {
+                // Wait before retry (except first attempt)
+                await new Promise(function(resolve) {
+                  setTimeout(resolve, resumeBackoffs[resumeAttempts]);
+                });
+              }
+              
+              resumeAttempts++;
+              try {
+                console.debug('[Concierge] resume attempt', resumeAttempts, 'of', maxResumeAttempts);
+                sid = await this.resumeSession(requestBody);
+                console.debug('[Concierge] resume succeeded sid=', sid);
+                break; // Got sid, exit retry loop
+              } catch (resumeError) {
+                console.debug('[Concierge] resume attempt', resumeAttempts, 'failed:', resumeError.message);
+                
+                // If this was the last attempt, check if it's a real error
+                if (resumeAttempts >= maxResumeAttempts) {
+                  // Check if it's a timeout/network error (backend still processing) vs real error
+                  var isTimeoutError = resumeError.name === 'TimeoutError' || 
+                                      resumeError.name === 'AbortError' ||
+                                      resumeError.name === 'NetworkError' ||
+                                      (resumeError.message && (
+                                        resumeError.message.includes('timeout') ||
+                                        resumeError.message.includes('aborted') ||
+                                        resumeError.message.includes('network')
+                                      ));
+                  
+                  if (isTimeoutError) {
+                    // Backend still processing - show friendly message and continue to polling
+                    console.debug('[Concierge] resume failed but appears to be timeout - backend still processing');
+                    // Keep stillWorking state, will try polling with resume
+                  } else {
+                    // Real error from server - throw to be caught by outer handler
+                    throw resumeError;
+                  }
+                }
+                // Otherwise, continue to next retry
               }
             }
           }
 
-          // Step 3: If we have sid, poll for completion; otherwise try one more resume then poll
-          if (!sid) {
-            // One final resume attempt
-            try {
-              sid = await this.resumeSession(requestBody);
-              console.debug('[Concierge] final resume attempt sid=', sid);
-            } catch (finalResumeError) {
-              // If still no sid, we'll need to keep retrying resume in polling
-              console.debug('[Concierge] final resume failed, will retry during polling');
-            }
-          }
-
+          // Step 3: If we have sid, poll for completion; otherwise use pollSessionWithResume
           if (sid) {
             // Step 4: Poll until complete
             await this.pollSession(sid);
@@ -3107,13 +3134,24 @@
               return;
             }
           } else {
-            // No sid yet - keep polling with resume attempts
+            // No sid yet - use pollSessionWithResume which will retry resume during polling
+            console.debug('[Concierge] No sid after resume attempts, using pollSessionWithResume');
             await this.pollSessionWithResume(requestBody);
           }
 
         } catch (error) {
-          // Only set error state for real errors (non-timeout)
-          if (error.name !== 'TimeoutError' && !error.message.includes('aborted') && !error.message.includes('timeout')) {
+          // Only set error state for real errors (non-timeout, non-abort)
+          var isTimeoutError = error.name === 'TimeoutError' || 
+                              error.name === 'AbortError' ||
+                              error.name === 'NetworkError' ||
+                              (error.message && (
+                                error.message.includes('timeout') ||
+                                error.message.includes('aborted') ||
+                                error.message.includes('network')
+                              ));
+          
+          if (!isTimeoutError) {
+            // Real error from server - show error state
             this.state.status = 'error';
             this.state.error = error.message || 'Failed to submit';
             this.state.loading = false;
@@ -3122,24 +3160,38 @@
             this.render();
 
             // Release lock on error
-          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+            window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+            window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
             console.debug('Error in handleSubmit:', error);
-            } else {
-            // Timeout - keep in stillWorking state
+          } else {
+            // Timeout/network error - keep in stillWorking state (backend still processing)
+            console.debug('[Concierge] Timeout/network error caught - keeping stillWorking state');
             this.state.status = 'stillWorking';
             this.state.stillWorking = true;
+            this.state.loading = true; // Keep spinner
+            this.state.error = null; // Clear error
             this.render();
           }
         }
       } catch (outerError) {
         // Fallback error handler for any unexpected errors
         // Don't set error state for timeout/abort errors - keep stillWorking
-        if (outerError.name === 'TimeoutError' || outerError.name === 'AbortError' || 
-            outerError.message?.includes('aborted') || outerError.message?.includes('timeout')) {
-          // Timeout/abort - keep in stillWorking state
+        var isTimeoutError = outerError.name === 'TimeoutError' || 
+                            outerError.name === 'AbortError' ||
+                            outerError.name === 'NetworkError' ||
+                            (outerError.message && (
+                              outerError.message.includes('aborted') || 
+                              outerError.message.includes('timeout') ||
+                              outerError.message.includes('network')
+                            ));
+        
+        if (isTimeoutError) {
+          // Timeout/abort - keep in stillWorking state (backend still processing)
+          console.debug('[Concierge] Outer timeout/network error - keeping stillWorking state');
           this.state.status = 'stillWorking';
           this.state.stillWorking = true;
+          this.state.loading = true; // Keep spinner
+          this.state.error = null; // Clear error
           this.render();
         } else {
           // Real error - set error state
