@@ -2903,7 +2903,6 @@
      */
     async pollSession(sid) {
       var maxPollTime = 180000; // 180 seconds (3 minutes)
-      var pollInterval = 1200; // 1.2 seconds base
       var startTime = Date.now();
       var attempt = 0;
       
@@ -2921,6 +2920,23 @@
       var self = this;
 
       return new Promise(function(resolve, reject) {
+        function getPollInterval(elapsed) {
+          // Backoff strategy:
+          // - First 5 seconds: poll every 1s
+          // - Next 10 seconds (5s to 15s): poll every 2s
+          // - After 15s: poll every 3-5s (random, capped at 5s)
+          if (elapsed < 5000) {
+            // First 5 seconds: 1s interval
+            return 1000;
+          } else if (elapsed < 15000) {
+            // Next 10 seconds (5s to 15s): 2s interval
+            return 2000;
+          } else {
+            // After 15s: 3-5s interval (random between 3000-5000ms)
+            return 3000 + Math.random() * 2000; // 3000-5000ms
+          }
+        }
+
         function poll() {
           attempt++;
           var elapsed = Date.now() - startTime;
@@ -2938,9 +2954,8 @@
             return;
           }
 
-          // Add jitter to poll interval (0.8x to 1.2x)
-          var jitter = 0.8 + Math.random() * 0.4;
-          var currentInterval = Math.round(pollInterval * jitter);
+          // Calculate poll interval based on backoff strategy
+          var currentInterval = Math.round(getPollInterval(elapsed));
 
           var url = proxyUrl('/session') + '?sid=' + encodeURIComponent(sid);
           var currentParams = new URLSearchParams(window.location.search);
@@ -2988,7 +3003,12 @@
               throw new Error(data.error || 'Session error occurred');
             }
 
-            // Check if complete (has products or status is COMPLETE)
+            // Stop immediately if status is FAILED
+            if (status === 'FAILED') {
+              throw new Error(data.error || 'Session failed');
+            }
+
+            // Stop immediately if status is COMPLETE (has products or status is COMPLETE)
             if (productCount > 0 || status === 'COMPLETE') {
               console.debug('[Concierge] done sid=', sid);
               // Reset pollMaxReached flag on success

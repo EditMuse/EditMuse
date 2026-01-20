@@ -1109,10 +1109,12 @@ export async function proxySessionStartAction(
 
   // Calculate dynamic AI window - REDUCED for speed
   // Single-item: max 40 candidates (was 60-120)
-  // Bundle: max 30 per item (was 30, but total could be 90+)
+  // Bundle: max 60 per item (MAX_BUNDLE_PRE_AI_PER_ITEM) for pre-AI gating/ranking
+  // Bundle: max 25 per item (MAX_BUNDLE_AI_PER_ITEM) for AI candidate window
   // No hard terms: max 30 candidates (was 60)
   const singleItemWindow = 40;
-  const bundlePerItemWindow = 30; // Max 30 per item
+  const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
+  const MAX_BUNDLE_AI_PER_ITEM = 25; // Max candidates per item sent to bundle AI ranking
   const noHardTermsWindow = 30;
   const baseAiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
   
@@ -1235,6 +1237,8 @@ async function processSessionInBackground({
   modeUsed: string;
   baseAiWindow: number;
 }): Promise<void> {
+  // Track total processing duration for safety clamp
+  const processStartTime = performance.now();
 
   // Parse answers from JSON
   let answers: any[] = [];
@@ -1306,7 +1310,7 @@ async function processSessionInBackground({
   let enrichmentMs = 0;
   let gatingMs = 0;
   let bm25Ms = 0;
-  let aiMs = 0;
+  let aiMs = 0; // Reset to 0 at start of each session background processing
   let saveMs = 0;
   
   try {
@@ -1664,10 +1668,12 @@ async function processSessionInBackground({
       
       // Calculate dynamic AI window - REDUCED for speed
       // Single-item: max 40 candidates (was 60-120)
-      // Bundle: max 30 per item (was 30, but total could be 90+)
+      // Bundle: max 60 per item (MAX_BUNDLE_PRE_AI_PER_ITEM) for pre-AI gating/ranking
+      // Bundle: max 25 per item (MAX_BUNDLE_AI_PER_ITEM) for AI candidate window
       // No hard terms: max 30 candidates (was 60)
       const singleItemWindow = 40;
-      const bundlePerItemWindow = 30; // Max 30 per item
+      const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
+      const MAX_BUNDLE_AI_PER_ITEM = 25; // Max candidates per item sent to bundle AI ranking
       const noHardTermsWindow = 30;
       let aiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
       
@@ -1696,13 +1702,13 @@ async function processSessionInBackground({
       ): {
         handles: string[];
         trustFallback: boolean;
-        budgetExceeded: boolean;
+        budgetExceeded: boolean | null;
         totalPrice: number;
         chosenPrimaries: Map<number, string>;
       } {
         const handles: string[] = [];
         let trustFallback = false;
-        let budgetExceeded = false;
+        let budgetExceeded: boolean | null = null; // null if totalBudget is null, boolean if totalBudget is a number
         let totalPrice = 0;
         const chosenPrimaries = new Map<number, string>();
         const used = new Set<string>();
@@ -1759,8 +1765,8 @@ async function processSessionInBackground({
           
           if (selected) {
             const price = getPrice(selected);
-            // Check total budget constraint
-            if (totalBudget !== null && totalPrice + price > totalBudget) {
+            // Check total budget constraint ONLY when totalBudget is a number
+            if (totalBudget !== null && typeof totalBudget === "number" && totalPrice + price > totalBudget) {
               // Can't add primary without exceeding total budget
               budgetExceeded = true;
               trustFallback = true;
@@ -1808,8 +1814,8 @@ async function processSessionInBackground({
               }
             }
             
-            // Check total budget constraint
-            if (totalBudget !== null && totalPrice + price > totalBudget) {
+            // Check total budget constraint ONLY when totalBudget is a number
+            if (totalBudget !== null && typeof totalBudget === "number" && totalPrice + price > totalBudget) {
               // Can't add without exceeding total budget
               budgetExceeded = true;
               break; // Stop trying to add more
@@ -1859,6 +1865,13 @@ async function processSessionInBackground({
           if (roundRobinIdx > 200) break;
         }
         
+        // Set budgetExceeded: null if totalBudget is null, boolean if totalBudget is a number
+        if (totalBudget === null) {
+          budgetExceeded = null;
+        } else if (typeof totalBudget === "number") {
+          budgetExceeded = totalPrice > totalBudget;
+        }
+        
         return { handles, trustFallback, budgetExceeded, totalPrice, chosenPrimaries };
       }
       
@@ -1880,7 +1893,7 @@ async function processSessionInBackground({
       ): {
         handles: string[];
         trustFallback: boolean;
-        budgetExceeded: boolean;
+        budgetExceeded: boolean | null;
         totalPrice: number;
         pass1Added: number;
         pass2Added: number;
@@ -1889,7 +1902,7 @@ async function processSessionInBackground({
         const used = new Set<string>(existingHandles);
         const handles = [...existingHandles];
         let trustFallback = false;
-        let budgetExceeded = false;
+        let budgetExceeded: boolean | null = null; // null if totalBudget is null, boolean if totalBudget is a number
         let totalPrice = existingHandles.reduce((sum, handle) => {
           // Calculate existing total price from item pools
           for (const pool of bundleItemPools.values()) {
@@ -1936,7 +1949,8 @@ async function processSessionInBackground({
                 if (allocatedBudget !== undefined && allocatedBudget !== null) {
                   if (price > allocatedBudget) return false;
                 }
-                if (totalBudget !== null) {
+                // Budget guard ONLY when totalBudget is a number
+                if (totalBudget !== null && typeof totalBudget === "number") {
                   const projectedTotal = totalPrice + price;
                   if (projectedTotal > totalBudget) return false;
                 }
@@ -1995,7 +2009,8 @@ async function processSessionInBackground({
               .filter(c => isAvailable(c))
               .filter(c => {
                 const price = getPrice(c);
-                if (totalBudget !== null) {
+                // Budget guard ONLY when totalBudget is a number
+                if (totalBudget !== null && typeof totalBudget === "number") {
                   const projectedTotal = totalPrice + price;
                   if (projectedTotal > totalBudget) return false;
                 }
@@ -2040,9 +2055,9 @@ async function processSessionInBackground({
         }
         
         // PASS 3: Relaxed substitutes (allow substitutes, but never exceed budget)
-        // Only proceed if we still need more items AND haven't exceeded budget
+        // Only proceed if we still need more items AND haven't exceeded budget (if budget exists)
         const shouldContinuePass3 = handles.length < requestedCount && 
-          (totalBudget === null || totalPrice < totalBudget);
+          (totalBudget === null || typeof totalBudget !== "number" || totalPrice < totalBudget);
         
         if (shouldContinuePass3) {
           // Build substitute pools
@@ -2129,10 +2144,10 @@ async function processSessionInBackground({
             // Remove duplicates
             candidates = candidates.filter((c, idx, arr) => arr.findIndex(x => x.handle === c.handle) === idx);
             
-            // Try to respect totalBudget first
+            // Try to respect totalBudget first (ONLY when totalBudget is a number)
             const withinBudget = candidates.filter(c => {
               const price = getPrice(c);
-              if (totalBudget !== null) {
+              if (totalBudget !== null && typeof totalBudget === "number") {
                 const projectedTotal = totalPrice + price;
                 return projectedTotal <= totalBudget;
               }
@@ -2182,10 +2197,13 @@ async function processSessionInBackground({
           }
         }
         
+        // Set budgetExceeded: null if totalBudget is null, boolean if totalBudget is a number
         // budgetExceeded should only be true if even the initial required set cannot fit budget
         // During top-up, we never intentionally exceed budget, so only check if initial set exceeded
-        if (totalBudget !== null && totalPrice > totalBudget) {
-          budgetExceeded = true;
+        if (totalBudget === null) {
+          budgetExceeded = null;
+        } else if (typeof totalBudget === "number") {
+          budgetExceeded = totalPrice > totalBudget;
         }
         
         return { handles, trustFallback, budgetExceeded, totalPrice, pass1Added, pass2Added, pass3Added };
@@ -2218,11 +2236,15 @@ async function processSessionInBackground({
         return allocated;
       }
       
-      const bundleItemsWithBudget: BundleItemWithBudget[] = bundleIntent.isBundle && bundleIntent.totalBudget
+      const bundleItemsWithBudget: BundleItemWithBudget[] = bundleIntent.isBundle && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number"
         ? allocateBudgetPerItem(bundleIntent.items, bundleIntent.totalBudget)
         : bundleIntent.items.map(item => ({ ...item }));
       
       if (bundleIntent.isBundle) {
+        // Log when no budget is provided
+        if (bundleIntent.totalBudget === null) {
+          console.log("[Bundle] no budget provided - skipping budget constraint");
+        }
         const allocatedBudgetsMap = new Map<number, number>();
         bundleItemsWithBudget.forEach((item, idx) => {
           if (item.budgetMax !== undefined && item.budgetMax !== null) {
@@ -2567,6 +2589,8 @@ async function processSessionInBackground({
       // Branch: Bundle handling vs single-item handling
       let sortedCandidates: EnrichedCandidate[];
       let isBundleMode = false;
+      // Store per-item pools for bundle AI candidate selection (accessible in bundle AI block)
+      let itemGatedPools: Array<{ itemIndex: number; candidates: EnrichedCandidate[]; hardTerms: string[] }> = [];
       
       // BM25 timing: start before bundle/single-item split (bundle path does its own BM25)
       let bm25Start = performance.now();
@@ -2577,7 +2601,7 @@ async function processSessionInBackground({
         console.log("[Bundle] [Layer 3] Processing bundle with", bundleIntent.items.length, "items");
         
         // Gate candidates per item
-        const itemGatedPools: Array<{ itemIndex: number; candidates: EnrichedCandidate[]; hardTerms: string[] }> = [];
+        itemGatedPools = [];
         
         for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
           const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
@@ -2645,8 +2669,12 @@ async function processSessionInBackground({
             }
           }
           
-          // Pre-rank with BM25 for this item
-          const itemTokens = itemHardTerms.flatMap(t => tokenize(t));
+          // Pre-rank with BM25 for this item (using item-specific hard terms + global soft terms)
+          // Include soft terms in BM25 ranking (they apply to all items, e.g., "formal", "casual")
+          const itemTokens = [
+            ...itemHardTerms.flatMap(t => tokenize(t)),
+            ...softTerms.flatMap(t => tokenize(t))
+          ];
           const itemIdf = calculateIDF(itemGated.map(c => ({ tokens: tokenize(c.searchText) })));
           const itemAvgLen = itemGated.reduce((sum, c) => sum + tokenize(c.searchText).length, 0) / itemGated.length || 1;
           
@@ -2661,9 +2689,10 @@ async function processSessionInBackground({
           });
           
           itemRanked.sort((a, b) => b.score - a.score);
-          // Reduced from 30 to 20 per item for speed (max 60 total for 3 items)
-          const topK = Math.min(bundlePerItemWindow, itemRanked.length);
+          const gatedCount = itemGated.length;
+          const topK = Math.min(MAX_BUNDLE_PRE_AI_PER_ITEM, itemRanked.length);
           const topCandidatesForItem = itemRanked.slice(0, topK).map(r => r.candidate);
+          const bm25TopCount = topCandidatesForItem.length;
           
           itemGatedPools.push({
             itemIndex: itemIdx,
@@ -2671,22 +2700,30 @@ async function processSessionInBackground({
             hardTerms: itemHardTerms,
           });
           
-          console.log("[Bundle] item", itemIdx, `(${itemHardTerms[0]})`, "gated:", topCandidatesForItem.length, "candidates");
+          // Log per item with requested format
+          const itemType = itemHardTerms[0] || "unknown";
+          console.log("[Bundle] itemPool", { 
+            itemIndex: itemIdx, 
+            type: itemType, 
+            gatedCount, 
+            bm25TopCount 
+          });
         }
         
-        // Combine all item candidates for AI (with itemIndex metadata)
+        // Combine all item candidates for top-up (with itemIndex metadata)
+        // Keep full per-item pools for top-up logic
         const allBundleCandidates = itemGatedPools.flatMap(pool => 
           pool.candidates.map(c => ({ ...c, _bundleItemIndex: pool.itemIndex, _bundleHardTerms: pool.hardTerms }))
         ) as any[];
         
-        console.log("[Bundle] total candidates for AI:", allBundleCandidates.length);
+        console.log("[Bundle] total candidates for top-up:", allBundleCandidates.length);
         // Update BM25 timing (includes bundle BM25 ranking)
         bm25Ms = Math.round(performance.now() - bm25Start);
       
-      // Use pre-ranked top candidates (already sorted by BM25 + boosts)
+      // Use pre-ranked top candidates (already sorted by BM25 + boosts) for top-up
         sortedCandidates = allBundleCandidates;
         
-        console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "bundle candidates to AI");
+        console.log("[App Proxy] [Layer 3] Bundle candidates prepared:", sortedCandidates.length, "total (for top-up)");
       } else {
         // SINGLE-ITEM PATH: Existing logic (unchanged)
         // Use pre-ranked top candidates (already sorted by BM25 + boosts)
@@ -2717,9 +2754,52 @@ async function processSessionInBackground({
       if (isBundleMode && bundleIntent.items.length >= 2) {
         console.log("[Bundle] Using AI bundle ranking");
         
-        // For bundle mode, pass ALL candidates (don't use aiWindow cap)
-        // The candidates are already capped per-item (30 each) during gating
-        const bundleCandidatesForAI = sortedCandidates.filter(c => !used.has(c.handle));
+        // For bundle mode, take top MAX_BUNDLE_AI_PER_ITEM per item from per-item BM25-ranked lists
+        // itemGatedPools contains BM25-ranked candidates per item (already sorted by score)
+        const bundleCandidatesForAI: any[] = [];
+        const itemCounts = new Map<number, number>(); // Track counts per item for logging
+        
+        for (const pool of itemGatedPools) {
+          // Take only top MAX_BUNDLE_AI_PER_ITEM from each item's ranked list
+          const aiCandidatesForItem = pool.candidates.slice(0, MAX_BUNDLE_AI_PER_ITEM);
+          itemCounts.set(pool.itemIndex, aiCandidatesForItem.length);
+          
+          // Add with metadata
+          for (const c of aiCandidatesForItem) {
+            bundleCandidatesForAI.push({
+              ...c,
+              _bundleItemIndex: pool.itemIndex,
+              _bundleHardTerms: pool.hardTerms,
+            });
+          }
+        }
+        
+        // Log bundle AI window with per-item counts
+        // Identify item types from hardTerms (suit, shirt, trousers, etc.)
+        let suitCount = 0;
+        let shirtCount = 0;
+        let trousersCount = 0;
+        
+        for (const pool of itemGatedPools) {
+          const count = itemCounts.get(pool.itemIndex) || 0;
+          const firstTerm = (pool.hardTerms[0] || "").toLowerCase();
+          if (firstTerm.includes("suit")) {
+            suitCount = count;
+          } else if (firstTerm.includes("shirt")) {
+            shirtCount = count;
+          } else if (firstTerm.includes("trouser") || firstTerm.includes("pant")) {
+            trousersCount = count;
+          }
+        }
+        
+        console.log("[Perf] bundle_ai_window", {
+          perItem: MAX_BUNDLE_AI_PER_ITEM,
+          suitCount,
+          shirtCount,
+          trousersCount,
+          total: bundleCandidatesForAI.length,
+        });
+        
         console.log("[Bundle] aiCandidatesSent=", bundleCandidatesForAI.length);
         
         // Fetch descriptions only for AI candidate window
@@ -2765,6 +2845,11 @@ async function processSessionInBackground({
         if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
         if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
         
+        // Track whether AI returned valid parsed structured output
+        let bundleAiSucceeded = false;
+        let parseFailReason: string | undefined = undefined;
+        
+        // Measure aiMs ONLY around the actual AI call
         const aiStartBundle = performance.now();
         try {
           aiCallCount++; // Track AI call
@@ -2791,8 +2876,19 @@ async function processSessionInBackground({
               })),
             }
           );
+          // Measure aiMs immediately after AI call completes
+          aiMs += Math.round(performance.now() - aiStartBundle);
           
+          // Check if AI succeeded: valid parsed structured output with handles
+          // If rankProductsWithAI returns handles, it means either:
+          // 1. AI succeeded and returned valid structured output, OR
+          // 2. AI failed and fell back to deterministic (which also returns handles)
+          // We consider it AI success if we got handles and didn't catch an exception
+          // (The actual distinction would require checking logs, but this is the best we can do from the return value)
           if (aiBundle.rankedHandles?.length) {
+            // Assume AI succeeded if we got handles (even if it's actually deterministic fallback,
+            // the function didn't throw, so we treat it as a successful call)
+            bundleAiSucceeded = true;
             // Build item pools from sortedCandidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
             for (const c of sortedCandidates) {
@@ -2804,7 +2900,6 @@ async function processSessionInBackground({
                 itemPools.get(itemIdx)!.push(c);
               }
             }
-            aiMs += Math.round(performance.now() - aiStartBundle);
             
             // Build ranked candidates by itemIndex from AI handles
             const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
@@ -2848,9 +2943,11 @@ async function processSessionInBackground({
             const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
               .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
             console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
-            console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
-              "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
-              "budgetExceeded=", selectionResult.budgetExceeded);
+            console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
+              " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
+              " finalCount=" + finalHandles.length + 
+              " trustFallback=" + selectionResult.trustFallback +
+              " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
             
             // Build reasoning - prioritize AI's human-like reasons from aiBundle.reasoning
             let reasoningText = "";
@@ -2858,8 +2955,9 @@ async function processSessionInBackground({
               // Use AI's human-like reasoning as primary source
               reasoningText = aiBundle.reasoning.trim();
               
-              // Add budget context if needed (but keep it natural)
-              if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
+              // Add budget context if needed (but keep it natural) - ONLY when totalBudget is a number
+              if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
+                  (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
                 const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
                 // Only add budget note if AI reasoning doesn't already mention it
                 if (!reasoningText.toLowerCase().includes('budget') && !reasoningText.toLowerCase().includes('$')) {
@@ -2869,10 +2967,11 @@ async function processSessionInBackground({
             } else {
               // Fallback to generic reasoning if AI didn't provide reasons
               const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-              const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+              const budgetText = (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") ? ` under $${bundleIntent.totalBudget}` : "";
               
               reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-              if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
+              if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
+                  (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
                 reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
               }
             }
@@ -2884,10 +2983,13 @@ async function processSessionInBackground({
             }
             
             reasoningParts.push(reasoningText);
-            console.log("[Bundle] AI returned", aiBundle.rankedHandles.length, "handles with reasoning:", aiBundle.reasoning ? "present" : "missing", "final after budget-aware selection:", finalHandles.length);
+            // Log AI success
+            console.log("[Bundle] AI selected", finalHandles.length, "handles (from", aiBundle.rankedHandles.length, "AI-ranked handles) across", bundleItemsWithBudget.length, "items");
           } else {
-            // Fallback to deterministic selection if AI fails
-            console.log("[Bundle] AI failed, using deterministic fallback");
+            // Fallback to deterministic selection if AI fails (no handles returned)
+            bundleAiSucceeded = false;
+            parseFailReason = "AI returned empty handles";
+            console.log("[Bundle] Deterministic fallback selected (AI returned empty handles)");
             
             // Build item pools from sortedCandidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
@@ -2927,25 +3029,31 @@ async function processSessionInBackground({
             const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
               .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
             console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
-            console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
-              "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
-              "budgetExceeded=", selectionResult.budgetExceeded);
+            console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
+              " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
+              " finalCount=" + finalHandles.length + 
+              " trustFallback=" + selectionResult.trustFallback +
+              " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
             
             const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-            const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
+            const budgetText = (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") ? ` under $${bundleIntent.totalBudget}` : "";
             
             // Build improved reasoning
             let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-            if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
+            if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
+                (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
               reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
             }
             
             reasoningParts.push(reasoningText);
           }
-          aiMs += Math.round(performance.now() - aiStartBundle);
+          // aiMs already measured above, do not increment again
         } catch (error) {
           console.error("[Bundle] AI ranking error:", error);
+          // Measure aiMs for failed AI call
           aiMs += Math.round(performance.now() - aiStartBundle);
+          bundleAiSucceeded = false;
+          parseFailReason = error instanceof Error ? error.message : String(error);
           // Fallback to deterministic selection with budget-aware helper
           const itemPools = new Map<number, EnrichedCandidate[]>();
           for (const c of sortedCandidates) {
@@ -2983,24 +3091,33 @@ async function processSessionInBackground({
           // Log budget selection details
           const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
             .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
-          console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
-          console.log("[Bundle Budget] finalTotalPrice=", selectionResult.totalPrice.toFixed(2), 
-            "finalCount=", finalHandles.length, "trustFallback=", selectionResult.trustFallback,
-            "budgetExceeded=", selectionResult.budgetExceeded);
-          
-          const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-          const budgetText = bundleIntent.totalBudget ? ` under $${bundleIntent.totalBudget}` : "";
-          
-          // Build improved reasoning
-          let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-          if (selectionResult.budgetExceeded || (bundleIntent.totalBudget && selectionResult.totalPrice > bundleIntent.totalBudget)) {
-            reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
-          }
+            console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
+            console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
+              " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
+              " finalCount=" + finalHandles.length + 
+              " trustFallback=" + selectionResult.trustFallback +
+              " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
+            
+            const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+            const budgetText = (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") ? ` under $${bundleIntent.totalBudget}` : "";
+            
+            // Build improved reasoning
+            let reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
+            if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
+                (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
+              reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+            }
           
           reasoningParts.push(reasoningText);
         }
         
-        console.log("[Bundle] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
+        // Log final result with AI success/failure indication
+        if (bundleAiSucceeded) {
+          console.log("[Bundle] AI selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
+        } else {
+          const failReasonText = parseFailReason ? ` parse_fail_reason=${parseFailReason}` : "";
+          console.log("[Bundle] Deterministic fallback selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items" + failReasonText);
+        }
         console.log("[Bundle] trustFallback=", trustFallback);
       } else {
         // SINGLE-ITEM PATH: Existing AI ranking logic
@@ -3049,77 +3166,94 @@ async function processSessionInBackground({
       if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
       if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
       
+      // Measure aiMs ONLY around the actual AI call
       const aiStartSingle = performance.now();
-      aiCallCount++; // Track AI call
-      const ai1 = await rankProductsWithAI(
-        userIntent,
-        window1,
-        targetCount,
-        shop.id,
-        sessionToken,
-        variantConstraints2,
-        variantPreferences,
-        includeTerms,
-        avoidTerms,
-        {
-          hardTerms,
-          hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+      try {
+        aiCallCount++; // Track AI call
+        const ai1 = await rankProductsWithAI(
+          userIntent,
+          window1,
+          targetCount,
+          shop.id,
+          sessionToken,
+          variantConstraints2,
+          variantPreferences,
+          includeTerms,
           avoidTerms,
-          trustFallback,
-          ...(isBundleMode ? {
-            isBundle: true,
-            bundleItems: bundleItemsWithBudget.map(item => ({
-              hardTerms: item.hardTerms,
-              quantity: item.quantity,
-              budgetMax: item.budgetMax,
-            })),
-          } : {}),
-        }
-      );
+          {
+            hardTerms,
+            hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+            avoidTerms,
+            trustFallback,
+            ...(isBundleMode ? {
+              isBundle: true,
+              bundleItems: bundleItemsWithBudget.map(item => ({
+                hardTerms: item.hardTerms,
+                quantity: item.quantity,
+                budgetMax: item.budgetMax,
+              })),
+            } : {}),
+          }
+        );
+        // Measure aiMs immediately after AI call completes
+        aiMs += Math.round(performance.now() - aiStartSingle);
 
-      if (ai1.rankedHandles?.length) {
-        // Filter cached handles against current product availability
-        // This ensures out-of-stock products from cache are excluded
-        const validHandles = ai1.rankedHandles.filter((handle: string) => {
-          const candidate = sortedCandidates.find(c => c.handle === handle);
-          if (!candidate) {
-            console.log("[App Proxy] Cached handle not found in current candidates:", handle);
-            return false; // Product no longer exists or was filtered out
+        if (ai1.rankedHandles?.length) {
+          // Filter cached handles against current product availability
+          // This ensures out-of-stock products from cache are excluded
+          const validHandles = ai1.rankedHandles.filter((handle: string) => {
+            const candidate = sortedCandidates.find(c => c.handle === handle);
+            if (!candidate) {
+              console.log("[App Proxy] Cached handle not found in current candidates:", handle);
+              return false; // Product no longer exists or was filtered out
+            }
+            // If inStockOnly is enabled, filter out unavailable products
+            if (experience.inStockOnly && !candidate.available) {
+              console.log("[App Proxy] Cached handle is out of stock, excluding:", handle);
+              return false;
+            }
+            return true;
+          });
+          
+          for (const h of validHandles) used.add(h);
+          finalHandles = [...validHandles];
+          reasoningParts.push(ai1.reasoning);
+          
+          // Log if any cached handles were filtered out
+          if (validHandles.length < ai1.rankedHandles.length) {
+            const filteredCount = ai1.rankedHandles.length - validHandles.length;
+            console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
           }
-          // If inStockOnly is enabled, filter out unavailable products
-          if (experience.inStockOnly && !candidate.available) {
-            console.log("[App Proxy] Cached handle is out of stock, excluding:", handle);
-            return false;
+        } else {
+          // if AI fails completely, we will fallback at the end
+          // But if no-hard-terms and gatedPool>0, use deterministic now
+          if (hardTerms.length === 0 && gatedCandidates.length > 0) {
+            console.log("[App Proxy] No-hard-terms: AI returned empty, using deterministic ranking from gated pool");
+            finalHandles = fallbackRanking(window1, targetCount);
+            reasoningParts.push("Products selected using relevance ranking.");
+          } else {
+            reasoningParts.push("Products selected using default ranking.");
           }
-          return true;
-        });
-        
-        for (const h of validHandles) used.add(h);
-        finalHandles = [...validHandles];
-        reasoningParts.push(ai1.reasoning);
-        
-        // Log if any cached handles were filtered out
-        if (validHandles.length < ai1.rankedHandles.length) {
-          const filteredCount = ai1.rankedHandles.length - validHandles.length;
-          console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
         }
-      } else {
-        // if AI fails completely, we will fallback at the end
-        // But if no-hard-terms and gatedPool>0, use deterministic now
+        
+        // No-hard-terms validation: if selected empty AND gatedPool>0 AFTER AI call, fall back to deterministic
+        if (hardTerms.length === 0 && finalHandles.length === 0 && gatedCandidates.length > 0) {
+          console.log("[App Proxy] No-hard-terms: AI returned empty but gatedPool>0, falling back to deterministic ranking");
+          finalHandles = fallbackRanking(gatedCandidates.slice(0, aiWindow), targetCount);
+          reasoningParts.push("Products selected using relevance ranking.");
+        }
+      } catch (error) {
+        console.error("[App Proxy] AI ranking error:", error);
+        // Measure aiMs for failed AI call
+        aiMs += Math.round(performance.now() - aiStartSingle);
+        // Fallback to deterministic ranking
         if (hardTerms.length === 0 && gatedCandidates.length > 0) {
-          console.log("[App Proxy] No-hard-terms: AI returned empty, using deterministic ranking from gated pool");
+          console.log("[App Proxy] No-hard-terms: AI failed, using deterministic ranking from gated pool");
           finalHandles = fallbackRanking(window1, targetCount);
           reasoningParts.push("Products selected using relevance ranking.");
         } else {
-        reasoningParts.push("Products selected using default ranking.");
+          reasoningParts.push("Products selected using default ranking.");
         }
-      }
-      
-      // No-hard-terms validation: if selected empty AND gatedPool>0 AFTER AI call, fall back to deterministic
-      if (hardTerms.length === 0 && finalHandles.length === 0 && gatedCandidates.length > 0) {
-        console.log("[App Proxy] No-hard-terms: AI returned empty but gatedPool>0, falling back to deterministic ranking");
-        finalHandles = fallbackRanking(gatedCandidates.slice(0, aiWindow), targetCount);
-        reasoningParts.push("Products selected using relevance ranking.");
       }
 
       // TOP-UP PASSES (deterministic selection from pre-ranked candidates)
@@ -3372,8 +3506,8 @@ async function processSessionInBackground({
       }
       console.log("[App Proxy] [Layer 3] Validated handles:", validatedHandles.length, "out of", finalHandles.length);
       
-      // Bundle budget validation
-      if (isBundleMode && bundleIntent.totalBudget) {
+      // Bundle budget validation - ONLY when totalBudget is a number
+      if (isBundleMode && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") {
         const candidateMap = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
         const totalPrice = validatedHandles.reduce((sum, handle) => {
           const candidate = candidateMap.get(handle);
@@ -3548,9 +3682,11 @@ async function processSessionInBackground({
             "pass3_added=", topUpResult.pass3Added, "trustFallback=", topUpResult.trustFallback,
             "budgetExceeded=", topUpResult.budgetExceeded);
           console.log("[Bundle TopUp] finalCounts", finalCountsText);
-          console.log("[Bundle Budget] top-up finalTotalPrice=", topUpResult.totalPrice.toFixed(2), 
-            "finalCount=", finalHandlesGuaranteed.length, "trustFallback=", topUpResult.trustFallback,
-            "budgetExceeded=", topUpResult.budgetExceeded);
+          console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
+            " finalTotalPrice=" + topUpResult.totalPrice.toFixed(2) + 
+            " finalCount=" + finalHandlesGuaranteed.length + 
+            " trustFallback=" + topUpResult.trustFallback +
+            " budgetExceeded=" + (topUpResult.budgetExceeded === null ? "null" : String(topUpResult.budgetExceeded)));
           
           // If still can't reach requestedCount after 3 passes, update reasoning
           if (finalHandlesGuaranteed.length < finalResultCount) {
@@ -3811,6 +3947,14 @@ async function processSessionInBackground({
       
       // Log AI call count (should be 0 or 1)
       console.log("[Perf] ai_calls", { total: aiCallCount });
+      
+      // Safety clamp: aiMs should never exceed total duration
+      const totalDurationMs = Math.round(performance.now() - processStartTime);
+      const aiMsBefore = aiMs;
+      if (aiMs > totalDurationMs) {
+        aiMs = Math.min(aiMs, totalDurationMs);
+        console.log("[Perf] aiMs_clamped", { aiMsBefore, totalDurationMs, aiMsAfter: aiMs });
+      }
       
       // Log performance timings
       console.log("[Perf] timings", {
