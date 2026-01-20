@@ -1378,6 +1378,7 @@
         loading: false,
         error: null,
         stillWorking: false,
+        pollMaxReached: false, // Track when max poll time is reached
         status: 'idle' // 'idle' | 'submitting' | 'stillWorking' | 'done' | 'error'
       };
       
@@ -1909,6 +1910,14 @@
               debugLog('[EditMuse] Option selected', { value: value, currentStep: this.state.current });
             }
           }
+          return;
+        }
+
+        // Keep waiting button (resume polling after max time reached)
+        if (target.matches('[data-editmuse-keep-waiting]') || target.closest('[data-editmuse-keep-waiting]')) {
+          e.preventDefault();
+          e.stopPropagation();
+          this.handleKeepWaiting();
           return;
         }
 
@@ -2752,7 +2761,7 @@
      * Poll session until complete - throws if error status, returns when complete
      */
     async pollSession(sid) {
-      var maxPollTime = 60000; // 60 seconds
+      var maxPollTime = 180000; // 180 seconds (3 minutes)
       var pollInterval = 1200; // 1.2 seconds base
       var startTime = Date.now();
       var attempt = 0;
@@ -2778,9 +2787,10 @@
           // Check max poll time
           if (elapsed >= maxPollTime) {
             // Max time reached - don't reject, just stop polling and keep "Still working..."
-            console.debug('[Concierge] polling sid=', sid, 'attempt=', attempt, 'MAX_TIMEOUT reached - keeping stillWorking state');
+            console.debug("[Concierge] poll max reached; staying in stillWorking", { sid });
             self.state.status = 'stillWorking';
             self.state.stillWorking = true;
+            self.state.pollMaxReached = true;
             self.render();
             // Note: We intentionally don't reject - UI will show "Still working..." with option to continue
             return;
@@ -2826,6 +2836,8 @@
             // Check if complete (has products or status is COMPLETE)
             if (productCount > 0 || status === 'COMPLETE') {
               console.debug('[Concierge] done sid=', sid);
+              // Reset pollMaxReached flag on success
+              self.state.pollMaxReached = false;
               // Release lock before redirect
               window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
               window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
@@ -3129,11 +3141,34 @@
       }
     }
 
+    /**
+     * Handle "Keep waiting" button - resume polling after max time reached
+     */
+    handleKeepWaiting() {
+      var sid = this.state.sessionId || sessionStorage.getItem('editmuse_sid');
+      if (sid) {
+        // Reset the flag and resume polling
+        this.state.pollMaxReached = false;
+        this.state.status = 'stillWorking';
+        this.state.stillWorking = true;
+        this.render();
+        // Resume polling with the same sid
+        this.pollSession(sid).catch(function(error) {
+          // Only set error for real errors (not timeouts/aborts)
+          if (error.name !== 'AbortError' && !error.message.includes('aborted') && !error.message.includes('timeout')) {
+            console.debug('[Concierge] Error resuming polling:', error);
+            // Keep stillWorking state even on errors
+          }
+        });
+      }
+    }
+
     // Handle Close
     handleClose() {
       this.stopPolling(); // Clean up polling when closing
       this.state.open = false;
       this.state.error = null;
+      this.state.pollMaxReached = false;
       this.state.status = 'idle';
       this.hideModal();
       this.render();
@@ -3403,7 +3438,12 @@
                   <div class="editmuse-concierge-loading" data-editmuse-concierge-loading>
                     <div class="editmuse-spinner"></div>
                     <div class="editmuse-loading-messages">
-                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>${this.state.stillWorking ? 'Still working... This may take a moment.' : 'Analyzing your preferences...'}</p>
+                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>${this.state.pollMaxReached ? 'Still working… this can take a bit longer for broad searches.' : (this.state.stillWorking ? 'Still working... This may take a moment.' : 'Analyzing your preferences...')}</p>
+                      ${this.state.pollMaxReached ? `
+                        <button type="button" class="editmuse-concierge-keep-waiting" data-editmuse-keep-waiting style="margin-top: 12px; padding: 8px 16px; background: var(--em-accent, #000); color: var(--em-surface, #fff); border: none; border-radius: var(--em-btn-radius, 4px); cursor: pointer; font-size: 14px;">
+                          Keep waiting
+                        </button>
+                      ` : ''}
                     </div>
                   </div>
                 ` : questionHTML}
