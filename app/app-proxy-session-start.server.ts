@@ -110,12 +110,30 @@ function parseConstraintsFromText(text: string): VariantConstraints {
     if (re.test(text)) { color = c[0].toUpperCase() + c.slice(1); break; }
   }
 
-  // Material parsing (conservative)
-  const materials = ["cotton","linen","silk","wool","leather","denim","polyester","viscose","nylon","cashmere"];
+  // Material/Ingredient parsing (industry-agnostic: Fashion, Beauty, Home, Health)
+  // Fashion: fabrics and materials
+  // Beauty: key ingredients
+  // Home: construction materials
+  // Health: active ingredients
+  const materials = [
+    // Fashion/Apparel materials
+    "cotton","linen","silk","wool","leather","denim","polyester","viscose","nylon","cashmere","spandex","elastane",
+    // Beauty/Cosmetics ingredients
+    "retinol","hyaluronic acid","vitamin c","niacinamide","peptide","ceramide","collagen","aloe vera","shea butter",
+    "coconut oil","argan oil","jojoba","glycerin","salicylic acid","benzoyl peroxide","squalane","snail mucin",
+    // Home/Garden materials
+    "wood","metal","glass","ceramic","plastic","bamboo","marble","granite","stainless steel","aluminum","brass","copper",
+    "fabric","upholstery","leather","rattan","wicker","mdf","particle board","solid wood",
+    // Health/Wellness ingredients
+    "protein","fiber","vitamin","mineral","omega","probiotic","prebiotic","antioxidant","turmeric","ginger","echinacea"
+  ];
   let material: string | null = null;
   for (const m of materials) {
-    const re = new RegExp(`\\b${m}\\b`, "i");
-    if (re.test(text)) { material = m[0].toUpperCase() + m.slice(1); break; }
+    const re = new RegExp(`\\b${m.replace(/\s+/g, "\\s+")}\\b`, "i");
+    if (re.test(text)) { 
+      material = m.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" "); 
+      break; 
+    }
   }
 
   return { size, color, material };
@@ -296,38 +314,69 @@ function parseBundleIntentGeneric(userIntent: string): {
 } {
   const lowerText = userIntent.toLowerCase();
   
-  // Category lexicon (reuse from parseIntentGeneric)
+  // Category lexicon (industry-agnostic: Fashion, Beauty, Home & Garden, Health & Wellness, Electronics, etc.)
   const categoryPhrases = [
-    // Apparel
+    // Fashion & Apparel
     "suit", "dress", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "hoodie", "t-shirt", "tshirt",
     "shorts", "skirt", "blouse", "polo", "tank", "blazer", "cardigan", "vest", "jumpsuit", "romper", "trousers",
-    // Home/Garden
+    "chinos", "sweatpants", "leggings", "activewear", "athleisure",
+    // Beauty & Cosmetics
+    "serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner",
+    "perfume", "cologne", "shampoo", "conditioner", "body wash", "soap", "lotion", "cream", "sunscreen",
+    "makeup", "concealer", "blush", "bronzer", "highlighter", "eyeshadow", "lip balm", "nail polish",
+    "skincare", "anti-aging", "exfoliant", "essence", "ampoule", "sheet mask",
+    // Home & Garden
     "sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug",
     "lamp", "vase", "mirror", "shelf", "cabinet", "drawer", "plant", "lawn mower", "mower", "shed",
     "fence", "garden tool", "watering can", "pot", "planter", "outdoor furniture", "coffee table",
-    // Beauty/Fitness
-    "serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner",
-    "perfume", "cologne", "shampoo", "conditioner", "treadmill", "dumbbell", "yoga mat", "resistance band",
-    "exercise bike", "rowing machine", "elliptical",
+    "dining table", "side table", "end table", "bookshelf", "wardrobe", "dresser", "nightstand",
+    "dining chair", "office chair", "armchair", "recliner", "ottoman", "bench", "stool",
+    "throw pillow", "cushion", "comforter", "duvet", "bedding", "bed sheet", "towel", "bath mat",
+    "wall art", "picture frame", "decor", "candle", "diffuser", "plant pot", "garden planter",
+    // Health & Wellness
+    "treadmill", "dumbbell", "yoga mat", "resistance band", "exercise bike", "rowing machine", "elliptical",
+    "supplement", "vitamin", "protein", "probiotic", "omega", "multivitamin", "fish oil", "collagen supplement",
+    "massage gun", "foam roller", "kettlebell", "barbell", "weight", "fitness tracker", "smart scale",
+    "essential oil", "aromatherapy", "meditation cushion", "yoga block", "pilates ball",
     // Electronics
     "phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch",
-    // General
+    "monitor", "keyboard", "mouse", "printer", "router", "charger", "cable",
+    // General/Accessories
     "book", "bag", "backpack", "wallet", "jewelry", "necklace", "ring", "earring", "bracelet",
-    "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper",
+    "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper", "hat", "cap", "scarf", "gloves",
   ];
   
-  // Category synonyms (reuse from parseIntentGeneric)
+  // Category synonyms (industry-agnostic, expanded for all industries)
   const categorySynonyms: Record<string, string[]> = {
-    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit"],
-    "dress": ["dress", "gown", "frock", "ladies dress"],
-    "shirt": ["shirt", "button-up", "button down", "dress shirt"],
-    "sofa": ["sofa", "couch", "settee", "chesterfield"],
-    "treadmill": ["treadmill", "running machine", "running treadmill"],
-    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
+    // Fashion & Apparel
+    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit", "tuxedo"],
+    "dress": ["dress", "gown", "frock", "ladies dress", "evening dress"],
+    "shirt": ["shirt", "button-up", "button down", "dress shirt", "button shirt"],
+    "pants": ["pants", "trousers", "slacks"],
+    "jacket": ["jacket", "coat", "blazer", "outerwear"],
+    // Home & Garden
+    "sofa": ["sofa", "couch", "settee", "chesterfield", "loveseat"],
     "mattress": ["mattress", "bed mattress", "sleep mattress"],
+    "chair": ["chair", "seat", "armchair"],
+    "table": ["table", "desk", "dining table"],
+    "lamp": ["lamp", "light", "lighting"],
+    "rug": ["rug", "carpet", "mat"],
+    // Beauty & Cosmetics
+    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
+    "moisturizer": ["moisturizer", "moisturizing cream", "face cream"],
+    "cleanser": ["cleanser", "face wash", "facial cleanser"],
     "perfume": ["perfume", "fragrance", "cologne", "eau de parfum"],
+    "shampoo": ["shampoo", "hair shampoo"],
+    "conditioner": ["conditioner", "hair conditioner"],
+    // Health & Wellness
+    "treadmill": ["treadmill", "running machine", "running treadmill"],
+    "yoga mat": ["yoga mat", "exercise mat", "fitness mat"],
+    "supplement": ["supplement", "dietary supplement", "nutritional supplement"],
+    "vitamin": ["vitamin", "vitamins", "multivitamin"],
+    // Electronics
     "laptop": ["laptop", "notebook", "laptop computer"],
     "headphone": ["headphone", "headphones", "earphones", "earbuds"],
+    "phone": ["phone", "smartphone", "mobile phone", "cell phone"],
   };
   
   // Soft words that are NOT categories (ignore these)
@@ -1060,16 +1109,19 @@ export async function proxySessionStartAction(
     }, { status: 403 });
   }
 
-  // Calculate dynamic AI window based on finalResultCount and entitlements
-  // bundleWindow: 8->60, 12->90, 16->120
-  // Reduce AI window when no hardTerms (max 60 candidates)
-  const bundleWindow = finalResultCount === 8 ? 60 : finalResultCount === 12 ? 90 : 120;
-  const baseAiWindow = Math.min(entitlements.candidateCap, bundleWindow);
+  // Calculate dynamic AI window - REDUCED for speed
+  // Single-item: max 40 candidates (was 60-120)
+  // Bundle: max 30 per item (was 30, but total could be 90+)
+  // No hard terms: max 30 candidates (was 60)
+  const singleItemWindow = 40;
+  const bundlePerItemWindow = 30; // Max 30 per item
+  const noHardTermsWindow = 30;
+  const baseAiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
   
-  // Parse intent early to check for hardTerms (before actual parsing, we'll adjust after parsing)
+  // Parse intent early to check for hardTerms (before actual parsing, we'll adjust after intent parsing)
   // For now, calculate base window, then adjust after intent parsing
   let aiWindow = baseAiWindow;
-  console.log("[App Proxy] Base AI window:", aiWindow, "(bundleWindow:", bundleWindow, ", candidateCap:", entitlements.candidateCap, ")");
+  console.log("[App Proxy] Base AI window:", aiWindow, "(singleItemWindow:", singleItemWindow, ", candidateCap:", entitlements.candidateCap, ")");
 
   // Store answers as JSON
   const answersJson = Array.isArray(answers) 
@@ -2352,7 +2404,8 @@ export async function proxySessionStartAction(
           });
           
           itemRanked.sort((a, b) => b.score - a.score);
-          const topK = Math.min(30, itemRanked.length);
+          // Reduced from 30 to 20 per item for speed (max 60 total for 3 items)
+          const topK = Math.min(bundlePerItemWindow, itemRanked.length);
           const topCandidatesForItem = itemRanked.slice(0, topK).map(r => r.candidate);
           
           itemGatedPools.push({

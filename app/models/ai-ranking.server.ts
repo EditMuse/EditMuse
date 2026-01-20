@@ -655,23 +655,91 @@ export async function rankProductsWithAI(
     }
   }
   
+  /**
+   * Smart truncation: preserves key information (materials, features, sizing, ingredients) even when truncating
+   * Industry-agnostic: works for Fashion, Beauty, Home & Garden, Health & Wellness, and other industries
+   * Extracts important phrases from full description and includes them even if they're beyond the truncation point
+   */
+  function smartTruncateDescription(fullDesc: string, maxChars: number): string {
+    if (!fullDesc || fullDesc.length <= maxChars) return fullDesc;
+    
+    // Industry-agnostic key patterns to preserve:
+    // 1. Materials/Ingredients/Composition (Fashion: fabric, Beauty: ingredients, Home: materials, Health: ingredients)
+    // 2. Features/Benefits (all industries)
+    // 3. Sizing/Dimensions/Volume (Fashion: size/fit, Home: dimensions, Beauty/Health: volume/weight)
+    // 4. Care/Usage Instructions (all industries)
+    const keyPatterns = [
+      // Materials/Ingredients/Composition (industry-agnostic)
+      /\b(?:made from|material|fabric|composition|contains?|ingredients?|formula|formulated with|made with)\s+[^.]{5,100}/gi,
+      // Specific materials/ingredients (expanded for all industries)
+      /\b(?:cotton|wool|silk|linen|polyester|nylon|leather|denim|cashmere|viscose|spandex|elastane|wood|metal|glass|ceramic|plastic|bamboo|marble|granite|stainless steel|aluminum|brass|copper|retinol|hyaluronic acid|vitamin c|niacinamide|peptide|ceramide|collagen|aloe vera|shea butter|coconut oil|argan oil|jojoba|glycerin|salicylic acid|benzoyl peroxide|mineral|organic|natural|synthetic)[^.]{0,60}/gi,
+      // Features/Benefits (industry-agnostic)
+      /\b(?:waterproof|breathable|stretch|comfort|durable|quality|premium|anti-aging|moisturizing|hydrating|soothing|anti-inflammatory|hypoallergenic|non-comedogenic|cruelty-free|vegan|organic|eco-friendly|sustainable|ergonomic|adjustable|portable|lightweight|heavy-duty|rust-resistant|fade-resistant|stain-resistant|wrinkle-free|shrink-resistant)[^.]{0,80}/gi,
+      // Sizing/Dimensions/Volume (industry-agnostic)
+      /\b(?:size|sizing|fit|measurement|dimension|width|length|height|depth|weight|volume|capacity|ounces?|oz|ml|milliliters?|liters?|grams?|kg|kilograms?|pounds?|lbs|inches?|in|feet|ft|cm|centimeters?|meters?|m|fits? true to size|runs? (?:small|large)|one size|universal)[^.]{5,100}/gi,
+      // Care/Usage Instructions (industry-agnostic)
+      /\b(?:care|washing|cleaning|maintenance|instructions?|usage|how to use|directions?|apply|application|storage|keep|store|avoid|do not|recommended for|suitable for|ideal for)[^.]{5,100}/gi,
+    ];
+    
+    // Extract key phrases from full description
+    const keyPhrases: string[] = [];
+    for (const pattern of keyPatterns) {
+      const matches = fullDesc.match(pattern);
+      if (matches) {
+        keyPhrases.push(...matches.map(m => m.trim()));
+      }
+    }
+    
+    // Remove duplicates and limit
+    const uniquePhrases = Array.from(new Set(keyPhrases)).slice(0, 5);
+    
+    // Truncate description normally
+    const truncated = fullDesc.substring(0, maxChars);
+    
+    // If we found key phrases that aren't in the truncated portion, append them
+    if (uniquePhrases.length > 0) {
+      const truncatedLower = truncated.toLowerCase();
+      const missingPhrases = uniquePhrases.filter(phrase => 
+        !truncatedLower.includes(phrase.toLowerCase().substring(0, 20))
+      );
+      
+      if (missingPhrases.length > 0) {
+        const additionalInfo = missingPhrases.join("; ").substring(0, 100);
+        return truncated + " ... " + additionalInfo;
+      }
+    }
+    
+    return truncated;
+  }
+  
   // Build product list for prompt (limit to 200)
   // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
   // This function can be called with shortened=true to reduce payload for retries
   function buildProductList(shortened: boolean = false, compressed: boolean = false): string {
     if (compressed) {
-      // Compressed mode: only handle, title, productType, tags, available, price, searchText (truncated to 200 chars)
+      // Compressed mode: include key structured fields + smart-truncated description with key info preserved
       return candidates.slice(0, 200).map((p, idx) => {
         const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
-        const searchText = (p as any).searchText ? ((p as any).searchText.substring(0, 200)) : "";
+        const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 10).join(", ") : "none";
+        const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 10).join(", ") : "none";
+        const materials = (p.materials && p.materials.length > 0) ? p.materials.slice(0, 10).join(", ") : "none";
+        
+        // Use smart truncation for description to preserve key info (materials, features, sizing)
+        const fullDesc = (p as any).desc1000 
+          ? (p as any).desc1000
+          : (cleanDescription(p.description) || "");
+        const descText = smartTruncateDescription(fullDesc, 200);
         
         return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
    productType: ${p.productType || "unknown"}
    tags: ${tags}
+   sizes: ${sizes}
+   colors: ${colors}
+   materials: ${materials}
    available: ${p.available ? "yes" : "no"}
    price: ${p.price || "unknown"}
-   searchText: ${searchText}`;
+   description: ${descText}`;
       }).join("\n\n");
     }
     
@@ -700,10 +768,11 @@ export async function rankProductsWithAI(
       optionValuesJson = JSON.stringify(cappedOptionValues);
     }
     
-      // Use desc1000 if available, truncate based on shortened flag
-    const descriptionText = (p as any).desc1000 
-        ? ((p as any).desc1000.substring(0, descLimit))
-        : (cleanDescription(p.description) || "No description available").substring(0, descLimit);
+      // Use desc1000 if available, use smart truncation to preserve key information
+      const fullDesc = (p as any).desc1000 
+        ? (p as any).desc1000
+        : (cleanDescription(p.description) || "No description available");
+      const descriptionText = smartTruncateDescription(fullDesc, descLimit);
     
     return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
@@ -723,13 +792,16 @@ export async function rankProductsWithAI(
   // Build initial product list
   let productList = buildProductList(false);
   
-  // Log payload size
-  const productListJsonChars = productList.length;
+  // Log payload size (actual JSON string length)
+  const productListJsonString = JSON.stringify(productList);
+  const productListJsonChars = productListJsonString.length;
   const candidateCount = candidates.length;
   console.log("[AI Ranking] productListJsonChars=", productListJsonChars, "candidateCount=", candidateCount);
   
   // Adaptive compression: use compressed prompt on first attempt if payload too large
-  const shouldUseCompressedFirst = productListJsonChars > 35000 || candidateCount > 80;
+  // Lowered threshold from 35000 to 15000 for faster processing
+  // Also always use compressed for bundles or large candidate counts
+  const shouldUseCompressedFirst = productListJsonChars > 15000 || candidateCount > 40 || (hardConstraints?.isBundle === true);
   if (shouldUseCompressedFirst) {
     console.log("[AI Ranking] Using compressed prompt on first attempt (productListJsonChars=", productListJsonChars, ", candidateCount=", candidateCount, ")");
     productList = buildProductList(false, true); // Rebuild with compressed mode
@@ -968,9 +1040,11 @@ REQUIREMENTS:
         candidateGroupsText += `\n\n=== Item ${itemIdx} Candidates (${itemHardTerms.join(", ")}) ===\n`;
         candidateGroupsText += itemCandidates.slice(0, 30).map((p, idx) => {
           const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
-          const descText = (p as any).desc1000 
-            ? ((p as any).desc1000.substring(0, 500))
-            : (cleanDescription(p.description) || "No description available").substring(0, 500);
+          // Use smart truncation for bundle descriptions (150 chars in compressed mode, 500 otherwise)
+          const fullDesc = (p as any).desc1000 
+            ? (p as any).desc1000
+            : (cleanDescription(p.description) || "No description available");
+          const descText = smartTruncateDescription(fullDesc, compressed ? 150 : 500);
           
           return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
