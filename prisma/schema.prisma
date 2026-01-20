@@ -120,6 +120,7 @@ model ConciergeSession {
   sessionToken    String?                // Stable token for attribution (set at creation, typically same as publicToken)
   chargedAt       DateTime?              // When billing was charged (on first delivery)
   deliveredAt     DateTime?              // When results were first delivered to storefront
+  chargeLockAt    DateTime?              // Temporary lock to prevent concurrent charging (cleared after charge succeeds or fails)
   createdAt       DateTime               @default(now())
   updatedAt       DateTime               @updatedAt
   messages        ConciergeMessage[]

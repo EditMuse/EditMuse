@@ -960,10 +960,6 @@ OUTPUT SCHEMA (MUST be exactly this structure):
       },
       "reason": "Navy suit matches category and color requirements."
     }
-  ],
-  "selected": [],
-  "rejected_candidates": [
-    { "handle": "some-handle", "why": "Does not match hardTerm 'suit'" }
   ]
 }
 
@@ -981,7 +977,7 @@ REQUIREMENTS:
   * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
   * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
   * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
-- rejected_candidates array is optional but include up to 20 if helpful for debugging`
+`
     : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
 CRITICAL OUTPUT FORMAT:
@@ -1035,9 +1031,6 @@ OUTPUT SCHEMA (MUST be exactly this structure):
       },
       "reason": "Navy blue suit matches category and color requirements."
     }
-  ],
-  "rejected_candidates": [
-    { "handle": "some-handle", "why": "Does not match hardTerm 'suit'" }
   ]
 }
 
@@ -1054,8 +1047,7 @@ REQUIREMENTS:
   * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
   * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
   * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
-  * Each reason should be ONE sentence maximum, engaging, and customer-facing
-- rejected_candidates array is optional but include up to 20 if helpful for debugging`;
+  * Each reason should be ONE sentence maximum, engaging, and customer-facing`;
 
   // Build hard constraints object for prompt
   const hardConstraintsJson = JSON.stringify({
@@ -1199,8 +1191,6 @@ ${matchingRequirements}
    - Evidence: Which hardTerms matched, which facets matched, which fields were used
    - Reason: Write a natural, professional, conversational 1-sentence explanation as if you're a knowledgeable sales associate speaking directly to the customer. Be specific about benefits, style, occasion, or use case. Example: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look" (NOT "Matches suit category and navy color")
 
-4. Optionally include up to 20 rejected candidates with brief "why" explanations.
-
 Return ONLY the JSON object matching the schema - no markdown, no prose outside JSON.`;
   }
   
@@ -1241,21 +1231,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       additionalProperties: false,
     };
     
-    const rejectedCandidateSchema = {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          handle: { type: "string" },
-          why: { type: "string" },
-        },
-        required: ["handle", "why"],
-        additionalProperties: false,
-      },
-    };
-    
     if (isBundle) {
-      // Bundle schema: requires selected_by_item, selected and rejected_candidates are optional
+      // Bundle schema: strict - only trustFallback and selected_by_item
       return {
         type: "object",
         properties: {
@@ -1276,17 +1253,12 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
               additionalProperties: false,
             },
           },
-          selected: {
-            type: "array",
-            items: selectedItemSchema,
-          },
-          rejected_candidates: rejectedCandidateSchema,
         },
         required: ["trustFallback", "selected_by_item"],
         additionalProperties: false,
       };
     } else {
-      // Single-item schema: rejected_candidates is optional
+      // Single-item schema: strict - only trustFallback and selected
       return {
         type: "object",
         properties: {
@@ -1295,7 +1267,6 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             type: "array",
             items: selectedItemSchema,
           },
-          rejected_candidates: rejectedCandidateSchema,
         },
         required: ["trustFallback", "selected"],
         additionalProperties: false,
@@ -1334,7 +1305,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
         ],
         temperature: 0, // Set to 0 for more deterministic output
-        max_tokens: 700, // Reduced from 1500 to prevent truncation (rejected_candidates is now optional)
+        max_tokens: 700, // Optimized for compact output (rejected_candidates removed from schema)
       };
       
       // Always use strict structured outputs (JSON schema with strict: true)
@@ -1415,23 +1386,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      // Handle missing optional fields safely (default to empty arrays)
-      if (isBundle && "selected_by_item" in structuredResult) {
-        const bundleResult = structuredResult as StructuredBundleResult;
-        // Ensure optional fields exist with defaults
-        if (!bundleResult.rejected_candidates) {
-          bundleResult.rejected_candidates = [];
-        }
-        if (!bundleResult.selected) {
-          bundleResult.selected = [];
-        }
-      } else {
-        const singleItemResult = structuredResult as StructuredRankingResult;
-        // Ensure optional fields exist with defaults
-        if (!singleItemResult.rejected_candidates) {
-          singleItemResult.rejected_candidates = [];
-        }
-      }
+      // Strict schema ensures only required fields are present
+      // No need to set defaults for removed fields (rejected_candidates, selected in bundle)
 
       // Validate bundle response if in bundle mode
       if (isBundle && "selected_by_item" in structuredResult) {

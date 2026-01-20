@@ -3,12 +3,13 @@ import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.serv
 import { getConciergeSessionByToken } from "~/models/concierge.server";
 import {
   getOfflineAccessTokenForShop,
-  fetchShopifyProductsGraphQL,
   fetchShopifyProductsByHandlesGraphQL,
 } from "~/shopify-admin.server";
-import { rankProductsWithAI, isAIRankingEnabled, getOpenAIModel, fallbackRanking } from "~/models/ai-ranking.server";
 import { ConciergeSessionStatus } from "@prisma/client";
 import prisma from "~/db.server";
+import { computeCreditsBurned, creditsToX2, trackUsageEvent } from "~/models/billing.server";
+
+type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   console.log("[App Proxy] GET /session (app proxy stripped path)");
@@ -56,21 +57,205 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     console.log("[App Proxy] No signature in query - allowing request (storefront direct call)");
   }
 
-  // Get offline access token
-  const accessToken = await getOfflineAccessTokenForShop(shopDomain);
-  if (!accessToken) {
-    console.log("[App Proxy] Offline access token not found for shop:", shopDomain);
-    return Response.json({ 
-      error: "App not properly installed. Please reinstall the app to continue." 
-    }, { status: 401 });
+  // Check session status and result existence
+  const hasResult = !!session.result;
+  const status = session.status;
+  
+  console.log("[Session Poll] status=", status, "hasResult=", hasResult);
+
+  // Handle FAILED status
+  if (status === ConciergeSessionStatus.FAILED) {
+    return Response.json({
+      ok: false,
+      sid: sessionId,
+      status: "FAILED",
+      error: "Session processing failed. Please try again.",
+    });
   }
 
-  // ✅ If results are already saved, fetch those exact products by handle and return.
-  // This prevents "0 products" when the candidate pool is small/filtered.
-  // Pure path: no experience filters, no candidate fetching, no inStockOnly filtering.
-  if (session.result) {
+  // Handle PROCESSING/COLLECTING status - return early without fetching or ranking
+  if (status === ConciergeSessionStatus.PROCESSING || 
+      status === ConciergeSessionStatus.COLLECTING) {
+    if (!hasResult) {
+      // No result yet - return PROCESSING/COLLECTING status
+      const statusStr = status === ConciergeSessionStatus.PROCESSING ? "PROCESSING" : "COLLECTING";
+      return Response.json({
+        ok: true,
+        sid: sessionId,
+        status: statusStr,
+      });
+    }
+    // If result exists but status is still PROCESSING/COLLECTING, fall through to return it
+  }
+
+  // Only return products when status is COMPLETE and result exists
+  if (status === ConciergeSessionStatus.COMPLETE && hasResult && session.result) {
+    // Reload session to get deliveredAt, chargedAt, and chargeLockAt fields
+    const sessionWithBilling = await prisma.conciergeSession.findUnique({
+      where: { id: session.id },
+    });
+
+    if (!sessionWithBilling) {
+      return Response.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    // Compute deliveredCount from actual handles being returned
     const raw = session.result.productHandles;
     const savedHandles = Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string") : [];
+    const deliveredCount = savedHandles.length;
+
+    const now = new Date();
+    const deliveredAt = (sessionWithBilling as any).deliveredAt;
+    const chargedAt = (sessionWithBilling as any).chargedAt;
+    const chargeLockAt = (sessionWithBilling as any).chargeLockAt;
+
+    // Set deliveredAt on first delivery (idempotent using updateMany)
+    if (!deliveredAt) {
+      await prisma.conciergeSession.updateMany({
+        where: { id: session.id, deliveredAt: null } as any,
+        data: { deliveredAt: now } as any,
+      });
+    }
+
+    // Charge on first delivery with lock-based concurrency safety
+    // Only attempt billing when: status === COMPLETE, result exists, deliveredCount > 0
+    if (!chargedAt && deliveredCount > 0) {
+      // Acquire lock atomically using updateMany
+      const lockNow = new Date();
+      const locked = await prisma.conciergeSession.updateMany({
+        where: { 
+          id: session.id, 
+          chargedAt: null, 
+          chargeLockAt: null 
+        } as any,
+        data: { chargeLockAt: lockNow } as any,
+      });
+
+      if (locked.count === 0) {
+        // Lock acquisition failed
+        if (chargedAt) {
+          // Already charged (race condition - another request charged between our check and lock attempt)
+          console.log("[Billing] Already charged", { sid: sessionId });
+        } else if (chargeLockAt) {
+          // Another request is currently charging
+          // Skip charging (do not charge)
+        }
+      } else if (locked.count === 1) {
+        // Lock acquired - perform billing
+        try {
+          // Use computeCreditsBurned as canonical source of truth
+          const creditsBurned = computeCreditsBurned(deliveredCount);
+          // Derive burnX2 from canonical credits value
+          const burnX2 = creditsToX2(creditsBurned);
+
+          // Dev-only assertion to verify consistency (can be removed in production)
+          if (process.env.NODE_ENV !== "production") {
+            const oldBurnX2 = (await import("~/models/billing.server")).burnX2FromResultCount(deliveredCount);
+            if (oldBurnX2 !== burnX2) {
+              console.warn("[Billing] Credit calculation mismatch detected", {
+                deliveredCount,
+                canonical: burnX2,
+                old: oldBurnX2,
+              });
+            }
+          }
+
+          console.log("[Billing] Charging on delivery", { 
+            sid: sessionId, 
+            deliveredCount, 
+            credits: creditsBurned 
+          });
+
+          // Update subscription credits in a transaction
+          const subscription = await prisma.$transaction(async (tx) => {
+            // Load subscription with lock
+            const sub = await tx.subscription.findUnique({
+              where: { shopId: sessionWithBilling.shopId },
+            });
+
+            if (!sub) {
+              throw new Error(`Subscription not found for shop: ${sessionWithBilling.shopId}`);
+            }
+
+            // Block access if subscription is cancelled
+            if (sub.status === "cancelled") {
+              throw new Error("Subscription has been cancelled. Please subscribe to continue using EditMuse.");
+            }
+
+            const totalCreditsX2 = (sub.creditsIncludedX2 || 0) + (sub.creditsAddonX2 || 0);
+            const prevUsed = sub.creditsUsedX2 || 0;
+            const newUsed = prevUsed + burnX2;
+
+            // Calculate overage delta
+            const prevOver = Math.max(0, prevUsed - totalCreditsX2);
+            const newOver = Math.max(0, newUsed - totalCreditsX2);
+            const deltaOverX2 = newOver - prevOver;
+
+            // Update subscription
+            await tx.subscription.update({
+              where: { shopId: sessionWithBilling.shopId },
+              data: {
+                creditsUsedX2: newUsed,
+              },
+            });
+
+            return {
+              ...sub,
+              creditsUsedX2: newUsed,
+              deltaOverX2,
+            };
+          });
+
+          // Create ONE billable UsageEvent (using canonical credits value)
+          await trackUsageEvent(
+            sessionWithBilling.shopId,
+            "AI_RANKING_EXECUTED" as UsageEventType,
+            {
+              sessionToken: sessionId,
+              experienceId: sessionWithBilling.experienceId || undefined,
+              resultCount: deliveredCount,
+            },
+            creditsBurned
+          );
+
+          // On SUCCESS: set chargedAt and clear chargeLockAt
+          await prisma.conciergeSession.update({
+            where: { id: session.id },
+            data: {
+              chargedAt: now,
+              chargeLockAt: null,
+            } as any,
+          });
+
+          console.log("[Billing] Charged session", sessionId, "for", deliveredCount, "results =", creditsBurned, "credits, overage delta =", subscription.deltaOverX2);
+        } catch (billingError) {
+          // On FAILURE: clear chargeLockAt so a later poll can retry
+          await prisma.conciergeSession.update({
+            where: { id: session.id },
+            data: { chargeLockAt: null } as any,
+          });
+
+          console.error("[Billing] Charge failed, lock released", { 
+            sid: sessionId, 
+            error: billingError instanceof Error ? billingError.message : String(billingError)
+          });
+          // Do not block delivering results to the client even if billing fails
+        }
+      }
+    } else if (chargedAt) {
+      console.log("[Billing] Already charged", { sid: sessionId });
+    }
+
+    // Get offline access token for fetching products by handles
+    const accessToken = await getOfflineAccessTokenForShop(shopDomain);
+    if (!accessToken) {
+      console.log("[App Proxy] Offline access token not found for shop:", shopDomain);
+      return Response.json({ 
+        error: "App not properly installed. Please reinstall the app to continue." 
+      }, { status: 401 });
+    }
+
+    // Fetch products by handles from saved result (savedHandles already computed above)
 
     console.log("[App Proxy] Using saved ConciergeResult with", savedHandles.length, "handles - fetching by handles");
     console.log("[App Proxy] Saved handles:", savedHandles);
@@ -113,312 +298,29 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         warning: ordered.length === 0 ? "Saved results could not be loaded (products missing/unpublished)" : null,
         mode: "saved",
       });
-    }
-  }
-
-  // Load Experience if available
-  let experience = null;
-  if (session.experienceId) {
-    experience = await prisma.experience.findUnique({
-      where: { id: session.experienceId },
-    });
-    console.log("[App Proxy] Loaded experience:", experience?.name || "not found");
-  }
-
-  // Parse Experience filters
-  const includedCollections = experience
-    ? (JSON.parse(experience.includedCollections || "[]") as string[])
-    : [];
-  const excludedTags = experience
-    ? (JSON.parse(experience.excludedTags || "[]") as string[])
-    : [];
-  const inStockOnly = experience?.inStockOnly || false;
-  const resultCount = session.resultCount || 8;
-
-  console.log("[App Proxy] Experience filters:", {
-    includedCollections: includedCollections.length,
-    excludedTags: excludedTags.length,
-    inStockOnly,
-    resultCount,
-  });
-
-  // Build candidate product pool
-  try {
-    console.log("[App Proxy] Fetching candidate products from Shopify");
-    
-    // Fetch products based on collection filter
-    let candidates = await fetchShopifyProductsGraphQL({
-      shopDomain,
-      accessToken,
-      limit: 200, // Cap at 200 for speed
-      collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-    });
-
-    console.log("[App Proxy] Fetched", candidates.length, "candidate products");
-
-    // Filter out ARCHIVED and DRAFT products
-    const beforeStatusFilter = candidates.length;
-    candidates = candidates.filter(p => {
-      const status = (p as any).status;
-      return status !== "ARCHIVED" && status !== "DRAFT";
-    });
-    console.log("[App Proxy] After status filter (excluding ARCHIVED/DRAFT):", candidates.length, "products (filtered from", beforeStatusFilter, ")");
-
-    // Apply excludedTags filter
-    if (excludedTags.length > 0) {
-      candidates = candidates.filter((p) => {
-        const productTags = p.tags || [];
-        return !excludedTags.some((excludedTag) =>
-          productTags.some((tag) => tag.toLowerCase() === excludedTag.toLowerCase())
-        );
-      });
-      console.log("[App Proxy] After excludedTags filter:", candidates.length, "products");
-    }
-
-    // Apply inStockOnly filter
-    if (inStockOnly) {
-      candidates = candidates.filter((p) => p.available);
-      console.log("[App Proxy] After inStockOnly filter:", candidates.length, "products");
-    }
-
-    // Check if session has saved result (ConciergeResult)
-    let rankedHandles: string[] = [];
-    let reasoning: string | null = null;
-    let usedFallback = false;
-
-    if (session.result) {
-      // ConciergeResult exists - use saved handles in exact order, skip AI ranking
-      const productHandlesRaw = session.result.productHandles;
-      const savedHandles = Array.isArray(productHandlesRaw)
-        ? (productHandlesRaw as any[]).filter((h): h is string => typeof h === "string")
-        : [];
-      
-      console.log("[App Proxy] Using saved ConciergeResult with", savedHandles.length, "handles - skipping AI ranking");
-      rankedHandles = savedHandles;
-      reasoning = session.result.reasoning || null;
-      usedFallback = false; // Using saved results, not fallback
     } else {
-      // No ConciergeResult - proceed with AI ranking
-      console.log("[App Proxy] No ConciergeResult found - proceeding with AI ranking");
-
-      // Parse answers to extract price/budget range if present
-      let priceMin: number | null = null;
-      let priceMax: number | null = null;
-      
-      try {
-        const answersJson = (session as any).answersJson || "[]";
-        const answers = JSON.parse(answersJson);
-        
-        if (Array.isArray(answers)) {
-          // Look for budget/price range answers - check if any answer matches common budget patterns
-          for (const answer of answers) {
-            const answerStr = String(answer).toLowerCase().trim();
-            
-            // Parse budget range patterns like "under-50", "50-100", "100-200", "200-500", "500-plus"
-            // Also handle formats like "under $50", "$50 - $100", etc.
-            
-            // Handle "under-50" or "under 50" format
-            if (answerStr.startsWith("under")) {
-              const match = answerStr.match(/under[-\s]*\$?(\d+)/);
-              if (match) {
-                priceMax = parseFloat(match[1]) - 0.01; // Under $50 means < $50, so max is 49.99
-                console.log("[App Proxy] Detected budget: under", match[1], "-> max:", priceMax);
-              }
-            } 
-            // Handle "500-plus" or "500+" format
-            else if (answerStr.includes("-plus") || answerStr.match(/\d+[\s]*\+/)) {
-              const match = answerStr.match(/(\d+)[-\s]*plus|(\d+)[\s]*\+/i);
-              const amount = match ? parseFloat(match[1] || match[2]) : null;
-              if (amount) {
-                priceMin = amount;
-                console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin);
-              }
-            } 
-            // Handle range like "50-100" or "$50 - $100"
-            else if (answerStr.match(/\d+[-\s]+\d+/)) {
-              const match = answerStr.match(/\$?(\d+)[-\s]+\$?(\d+)/);
-              if (match) {
-                priceMin = parseFloat(match[1]);
-                priceMax = parseFloat(match[2]);
-                console.log("[App Proxy] Detected budget range:", priceMin, "-", priceMax);
-              }
-            }
-            // Handle "plus" or "+" with amount before it (e.g., "$500+", "500 and above")
-            else if (answerStr.includes("plus") || answerStr.includes("+") || answerStr.includes("and above")) {
-              const match = answerStr.match(/\$?(\d+)[-\s]*plus|\$?(\d+)[-\s]*\+|\$?(\d+)[-\s]*and\s*above/i);
-              const amount = match ? parseFloat(match[1] || match[2] || match[3]) : null;
-              if (amount) {
-                priceMin = amount;
-                console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin);
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.error("[App Proxy] Failed to parse answersJson for price filtering:", e);
-      }
-
-      // Apply price/budget range filter if specified
-      if (priceMin !== null || priceMax !== null) {
-        const beforeCount = candidates.length;
-        candidates = candidates.filter((p) => {
-          if (!p.priceAmount && !p.price) return false; // Exclude products without price
-          const productPrice = parseFloat(p.priceAmount || p.price || "0");
-          if (isNaN(productPrice)) return false;
-          
-          if (priceMin !== null && productPrice < priceMin) return false;
-          if (priceMax !== null && productPrice > priceMax) return false;
-          return true;
-        });
-        console.log("[App Proxy] After price filter (", priceMin || "any", "-", priceMax || "any", "):", candidates.length, "products (filtered from", beforeCount, ")");
-      }
-
-      // If no candidates after filtering, return empty results without calling AI
-      if (candidates.length === 0) {
-        console.log("[App Proxy] No candidates after filtering - returning empty results");
-        return Response.json({
-          ok: true,
-          sid: sessionId,
-          status: session.status === ConciergeSessionStatus.COMPLETE ? "COMPLETE" : 
-                  session.status === ConciergeSessionStatus.PROCESSING ? "PROCESSING" : "COLLECTING",
-          products: [],
-          reasoning: "No products match your criteria. Please try adjusting your filters.",
-          mode: "empty",
-        });
-      }
-
-      // Build user intent from answers
-      let userIntent = "";
-      try {
-        const answersJson = (session as any).answersJson || "[]";
-        console.log("[App Proxy] answersJson from session:", answersJson.substring(0, 200));
-        const answers = JSON.parse(answersJson);
-        console.log("[App Proxy] Parsed answers:", Array.isArray(answers) ? answers.length + " items" : "not an array", answers);
-        
-        if (Array.isArray(answers) && answers.length > 0) {
-          userIntent = answers
-            .map((a: any) => {
-              if (typeof a === "string") return a;
-              if (a.question && a.answer) return `Q: ${a.question}\nA: ${a.answer}`;
-              if (a.text) return a.text;
-              return JSON.stringify(a);
-            })
-            .join("\n\n");
-          console.log("[App Proxy] Built user intent, length:", userIntent.length);
-        } else {
-          console.warn("[App Proxy] No answers found or answers is not an array");
-        }
-      } catch (e) {
-        console.error("[App Proxy] Failed to parse answersJson:", e);
-      }
-      
-      console.log("[App Proxy] Final user intent length:", userIntent.length);
-
-      // Use AI ranking if enabled
-      reasoning = "MVP: default selection";
-
-      // Log AI status check
-      const aiEnabled = isAIRankingEnabled();
-      const aiModel = getOpenAIModel();
-      console.log("[App Proxy] AI Ranking check - Enabled:", aiEnabled, "Model:", aiModel, "Candidates:", candidates.length);
-
-      if (aiEnabled && candidates.length > 0) {
-        console.log("[AI Ranking] Starting AI ranking with model:", aiModel);
-        console.log("[AI Ranking] Candidates:", candidates.length, "User intent length:", userIntent.length);
-
-        const aiResult = await rankProductsWithAI(
-          userIntent || "No specific intent",
-          candidates.map((p) => ({
-            handle: p.handle,
-            title: p.title,
-            tags: p.tags || [],
-            productType: p.productType || null,
-            vendor: p.vendor || null,
-            price: p.price || null,
-            description: p.description || null,
-            available: p.available,
-          })),
-          resultCount,
-          session.shopId, // Pass shopId for usage tracking
-          sessionId // Pass sessionToken for charge prevention
-        );
-
-        if (aiResult) {
-          rankedHandles = aiResult.rankedHandles;
-          reasoning = aiResult.reasoning;
-          console.log("[AI Ranking] AI ranking successful, returned", rankedHandles.length, "products");
-        } else {
-          usedFallback = true;
-          console.log("[AI Ranking] AI ranking failed, using fallback");
-          rankedHandles = fallbackRanking(
-            candidates.map((p) => ({
-              handle: p.handle,
-              title: p.title,
-              tags: p.tags || [],
-              productType: p.productType || null,
-              vendor: p.vendor || null,
-              price: p.price || null,
-              description: p.description || null,
-              available: p.available,
-            })),
-            resultCount
-          );
-        }
-      } else {
-        usedFallback = true;
-        console.log("[AI Ranking] AI ranking disabled, using fallback");
-        rankedHandles = fallbackRanking(
-          candidates.map((p) => ({
-            handle: p.handle,
-            title: p.title,
-            tags: p.tags || [],
-            productType: p.productType || null,
-            vendor: p.vendor || null,
-            price: p.price || null,
-            description: p.description || null,
-            available: p.available,
-          })),
-          resultCount
-        );
-      }
+      // Result exists but no handles - return empty
+      return Response.json({
+        ok: true,
+        sid: sessionId,
+        status: "COMPLETE",
+        products: [],
+        reasoning: session.result.reasoning || null,
+        mode: "saved",
+      });
     }
-
-    // Map handles back to products in the exact order of rankedHandles
-    const handleMap = new Map(candidates.map(p => [p.handle, p]));
-    const products = rankedHandles
-      .map(handle => handleMap.get(handle))
-      .filter((p): p is NonNullable<typeof p> => p !== undefined)
-      .map((p) => ({
-        handle: p.handle,
-        title: p.title,
-        image: p.image,
-        price: p.price, // Keep for backwards compatibility
-        priceAmount: p.priceAmount || p.price, // Use priceAmount if available, fallback to price
-        currencyCode: p.currencyCode || null,
-        url: p.url,
-      }));
-
-    console.log("[App Proxy] Returning", products.length, "products (requested:", resultCount, ")", session.result ? "(saved)" : (usedFallback ? "(fallback)" : "(AI-ranked)"));
-
-    return Response.json({
-      ok: true,
-      sid: sessionId,
-      status: session.status === ConciergeSessionStatus.COMPLETE ? "COMPLETE" : 
-              session.status === ConciergeSessionStatus.PROCESSING ? "PROCESSING" : "COLLECTING",
-      products,
-      reasoning: reasoning || session.result?.reasoning || null,
-      mode: session.result ? "saved" : (usedFallback ? "fallback" : "ai"),
-    });
-  } catch (error) {
-    console.error("[App Proxy] Error fetching products:", error);
-    return Response.json({
-      ok: true,
-      sid: sessionId,
-      status: session.status === ConciergeSessionStatus.COMPLETE ? "COMPLETE" : 
-              session.status === ConciergeSessionStatus.PROCESSING ? "PROCESSING" : "COLLECTING",
-      products: [],
-      reasoning: null,
-    });
   }
+
+  // If we reach here, status is not COMPLETE or result doesn't exist
+  // Return appropriate status without fetching or ranking
+  const statusStr = status === ConciergeSessionStatus.PROCESSING ? "PROCESSING" : 
+                    status === ConciergeSessionStatus.COLLECTING ? "COLLECTING" : 
+                    "COLLECTING"; // Default to COLLECTING if status is unknown
+  
+  return Response.json({
+    ok: true,
+    sid: sessionId,
+    status: statusStr,
+  });
 };
 
