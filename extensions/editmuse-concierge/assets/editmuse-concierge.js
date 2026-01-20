@@ -1379,6 +1379,7 @@
         error: null,
         stillWorking: false,
         pollMaxReached: false, // Track when max poll time is reached
+        longRunningMessage: null, // Progressive message for long-running requests
         status: 'idle' // 'idle' | 'submitting' | 'stillWorking' | 'done' | 'error'
       };
       
@@ -2702,11 +2703,13 @@
         }
 
         var data = await response.json();
-        if (data.ok && data.sessionId) {
-          return data.sessionId;
-        } else if (data.sid) {
-          // Support both sessionId and sid
-          return data.sid;
+        if (data.ok && data.sid) {
+          console.debug('[Concierge] start ok sid=', data.sid, 'status=', data.status);
+          return { sid: data.sid, status: data.status || 'PENDING' };
+        } else if (data.ok && data.sessionId) {
+          // Support legacy sessionId format
+          console.debug('[Concierge] start ok sid=', data.sessionId, 'status=', data.status);
+          return { sid: data.sessionId, status: data.status || 'PENDING' };
         } else {
           throw new Error(data.error || 'Invalid response from server');
         }
@@ -2739,7 +2742,12 @@
         }
 
         var data = await response.json();
-        if (data.ok && data.sessionId) {
+        if (data.ok && data.sid) {
+          console.debug('[Concierge] resume ok sid=', data.sid, 'status=', data.status);
+          return data.sid;
+        } else if (data.ok && data.sessionId) {
+          // Support legacy sessionId format
+          console.debug('[Concierge] resume ok sid=', data.sessionId, 'status=', data.status);
           return data.sessionId;
         } else if (data.sid) {
           return data.sid;
@@ -2758,11 +2766,10 @@
     }
 
     /**
-     * Poll session until complete - throws if error status, returns when complete
+     * Poll session until complete - handles PENDING, COMPLETE, and ERROR statuses
      */
     async pollSession(sid) {
-      var maxPollTime = 180000; // 180 seconds (3 minutes)
-      var pollInterval = 1200; // 1.2 seconds base
+      var pollInterval = 1500; // 1.5 seconds base
       var startTime = Date.now();
       var attempt = 0;
       
@@ -2784,17 +2791,20 @@
           attempt++;
           var elapsed = Date.now() - startTime;
           
-          // Check max poll time
-          if (elapsed >= maxPollTime) {
-            // Max time reached - resolve (don't reject) so handleSubmit doesn't treat as error
-            console.debug("[Concierge] poll max reached; staying in stillWorking", { sid });
-            self.state.status = 'stillWorking';
-            self.state.stillWorking = true;
-            self.state.pollMaxReached = true;
+          // Progressive messaging (no hard error on timeout)
+          var messageChanged = false;
+          if (elapsed >= 60000 && self.state.longRunningMessage !== 'Taking longer than usual...') {
+            // After 60s, show "Taking longer than usual..."
+            self.state.longRunningMessage = 'Taking longer than usual...';
+            messageChanged = true;
+          } else if (elapsed >= 15000 && !self.state.longRunningMessage) {
+            // After 15s, show "Still working..."
+            self.state.longRunningMessage = 'Still working...';
+            messageChanged = true;
+          }
+          
+          if (messageChanged) {
             self.render();
-            // Resolve (not reject) so handleSubmit continues normally without error state
-            resolve();
-            return;
           }
 
           // Add jitter to poll interval (0.8x to 1.2x)
@@ -2824,21 +2834,31 @@
           })
           .then(function(data) {
             var status = data.status;
-            var products = data.products || (data.result && data.result.products) || [];
+            var products = data.products || [];
             var productCount = Array.isArray(products) ? products.length : 0;
 
-            console.debug('[Concierge] polling sid=', sid, 'attempt=', attempt, 'status=', status, 'products=', productCount);
+            console.debug('[Concierge] poll status=', status, 'products=', productCount);
 
             // Check for error status
-            if (status === 'ERROR' || (data.ok === false && !status)) {
-              throw new Error(data.error || 'Session error occurred');
+            if (status === 'ERROR' || status === 'FAILED' || (data.ok === false && !status)) {
+              self.state.status = 'error';
+              self.state.error = data.errorMessage || data.error || 'Session error occurred';
+              self.state.loading = false;
+              self.state.stillWorking = false;
+              self.stopConciergeLoadingAnimation();
+              self.render();
+              window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+              window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+              reject(new Error(self.state.error));
+              return;
             }
 
             // Check if complete (has products or status is COMPLETE)
-            if (productCount > 0 || status === 'COMPLETE') {
+            if (status === 'COMPLETE' && productCount > 0) {
               console.debug('[Concierge] done sid=', sid);
               // Reset pollMaxReached flag on success
               self.state.pollMaxReached = false;
+              self.state.longRunningMessage = null;
               // Release lock before redirect
               window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
               window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
@@ -2871,7 +2891,15 @@
               return;
             }
 
-            // Still processing - continue polling
+            // Still PENDING or processing - continue polling
+            if (status === 'PENDING' || status === 'PROCESSING' || status === 'COLLECTING' || (!status && productCount === 0)) {
+              if (self.pollingController && !self.pollingController.signal.aborted) {
+                self.pollingTimeout = setTimeout(poll, currentInterval);
+              }
+              return;
+            }
+
+            // Unknown status or unexpected state - continue polling
             if (self.pollingController && !self.pollingController.signal.aborted) {
               self.pollingTimeout = setTimeout(poll, currentInterval);
             }
@@ -3057,11 +3085,16 @@
         this.render();
 
         try {
-          // Step 1: Try to start session with timeout (25s)
+          // Step 1: Try to start session with short timeout (12s)
+          var sessionResult = null;
           var sid = null;
+          var sessionStatus = null;
+          
           try {
-            sid = await this.startSessionWithTimeout(requestBody, 25000);
-            console.debug('[Concierge] startSessionWithTimeout succeeded sid=', sid);
+            sessionResult = await this.startSessionWithTimeout(requestBody, 12000);
+            sid = sessionResult.sid;
+            sessionStatus = sessionResult.status;
+            console.debug('[Concierge] start ok sid=', sid, 'status=', sessionStatus);
           } catch (timeoutError) {
             // Timeout is NOT an error - transition to stillWorking state
             console.debug('[Concierge] submit timeout → stillWorking');
@@ -3069,46 +3102,63 @@
             this.state.stillWorking = true;
             this.render();
             
-            // Step 2: Resume session (idempotent - server returns existing sid)
+            // Step 2: Resume session (idempotent - backend returns immediately with PENDING/COMPLETE)
             try {
               sid = await this.resumeSession(requestBody);
               console.debug('[Concierge] resume sid=', sid);
+              // Resume should return quickly now, but we don't get status from resume
+              // So we'll poll to check status
             } catch (resumeError) {
-              // Resume failed - check if it's a real error or still processing
-              if (resumeError.message && resumeError.message.includes('timeout')) {
-                // Still processing - continue to polling without sid (will need to retry resume)
-                console.debug('[Concierge] resume also timed out, will poll after resume retry');
-              } else {
+              // Resume failed - check if it's a real error
+              if (resumeError.message && !resumeError.message.includes('timeout')) {
                 // Real error from server
                 throw resumeError;
               }
+              // If resume times out, we'll try to poll anyway (session might exist)
+              console.debug('[Concierge] resume timed out, will try polling');
             }
           }
 
-          // Step 3: If we have sid, poll for completion; otherwise try one more resume then poll
-          if (!sid) {
-            // One final resume attempt
+          // Step 3: Handle response based on status
+          if (sessionResult) {
+            if (sessionStatus === 'COMPLETE') {
+              // Already complete - poll once to get products
+              if (sid) {
+                await this.pollSession(sid);
+              }
+            } else if (sessionStatus === 'PENDING' || !sessionStatus) {
+              // PENDING or unknown - set stillWorking and poll
+              this.state.status = 'stillWorking';
+              this.state.stillWorking = true;
+              this.render();
+              if (sid) {
+                await this.pollSession(sid);
+              }
+            }
+          } else if (sid) {
+            // Got sid from resume - poll for status
+            this.state.status = 'stillWorking';
+            this.state.stillWorking = true;
+            this.render();
+            await this.pollSession(sid);
+          } else {
+            // No sid yet - try one more resume then poll
             try {
               sid = await this.resumeSession(requestBody);
               console.debug('[Concierge] final resume attempt sid=', sid);
+              if (sid) {
+                this.state.status = 'stillWorking';
+                this.state.stillWorking = true;
+                this.render();
+                await this.pollSession(sid);
+              }
             } catch (finalResumeError) {
-              // If still no sid, we'll need to keep retrying resume in polling
-              console.debug('[Concierge] final resume failed, will retry during polling');
+              // If still no sid, show stillWorking and let user retry
+              console.debug('[Concierge] final resume failed, showing stillWorking state');
+              this.state.status = 'stillWorking';
+              this.state.stillWorking = true;
+              this.render();
             }
-          }
-
-          if (sid) {
-            // Step 4: Poll until complete
-            await this.pollSession(sid);
-            // After polling completes (or times out), check if we're still in stillWorking state
-            // If pollMaxReached is true, we've already set the UI correctly - don't change state
-            if (this.state.pollMaxReached) {
-              // Polling reached max time - state is already set to stillWorking, just return
-              return;
-            }
-          } else {
-            // No sid yet - keep polling with resume attempts
-            await this.pollSessionWithResume(requestBody);
           }
 
         } catch (error) {
@@ -3120,12 +3170,12 @@
             this.state.stillWorking = false;
             this.stopConciergeLoadingAnimation();
             this.render();
-            
+
             // Release lock on error
-            window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-            window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
             console.debug('Error in handleSubmit:', error);
-          } else {
+            } else {
             // Timeout - keep in stillWorking state
             this.state.status = 'stillWorking';
             this.state.stillWorking = true;
@@ -3150,9 +3200,9 @@
           this.stopConciergeLoadingAnimation();
           this.render();
           
-          // Release lock on error
-          window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
-          window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+        // Release lock on error
+        window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+        window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
         }
         console.debug('Error in handleSubmit:', outerError);
       }
@@ -3166,6 +3216,7 @@
       if (sid) {
         // Reset the flag and resume polling
         this.state.pollMaxReached = false;
+        this.state.longRunningMessage = null;
         this.state.status = 'stillWorking';
         this.state.stillWorking = true;
         this.render();
@@ -3186,6 +3237,7 @@
       this.state.open = false;
       this.state.error = null;
       this.state.pollMaxReached = false;
+      this.state.longRunningMessage = null;
       this.state.status = 'idle';
       this.hideModal();
       this.render();
@@ -3455,7 +3507,7 @@
                   <div class="editmuse-concierge-loading" data-editmuse-concierge-loading>
                     <div class="editmuse-spinner"></div>
                     <div class="editmuse-loading-messages">
-                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>${this.state.pollMaxReached ? 'Still working… this can take a bit longer for broad searches.' : (this.state.stillWorking ? 'Still working... This may take a moment.' : 'Analyzing your preferences...')}</p>
+                      <p class="editmuse-loading-text" data-editmuse-concierge-loading-text>${this.state.longRunningMessage || (this.state.pollMaxReached ? 'Still working… this can take a bit longer for broad searches.' : (this.state.stillWorking ? 'Still working... This may take a moment.' : 'Analyzing your preferences...'))}</p>
                       ${this.state.pollMaxReached ? `
                         <button type="button" class="editmuse-concierge-keep-waiting" data-editmuse-keep-waiting style="margin-top: 12px; padding: 8px 16px; background: var(--em-accent, #000); color: var(--em-surface, #fff); border: none; border-radius: var(--em-btn-radius, 4px); cursor: pointer; font-size: 14px;">
                           Keep waiting

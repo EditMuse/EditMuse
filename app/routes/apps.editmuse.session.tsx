@@ -6,6 +6,7 @@ import {
   fetchShopifyProductsByHandlesGraphQL,
 } from "~/shopify-admin.server";
 import { getOrCreateRequestId } from "~/utils/request-id.server";
+import { ConciergeSessionStatus } from "@prisma/client";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   console.log("[App Proxy] GET /apps/editmuse/session");
@@ -102,17 +103,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     });
   }
 
-  // ✅ If results are already saved, fetch those exact products by handle and return.
-  // This prevents "0 products" when the candidate pool is small/filtered.
-  // Pure path: no experience filters, no candidate fetching, no inStockOnly filtering.
-  // NEVER re-rank when ConciergeResult exists - return immediately.
-  // NEVER run AI ranking from /session - only /session/start does AI.
-  if (session.result) {
+  // Return session status and products based on current state
+  const status = session.status;
+  
+  // If COMPLETE and result exists, fetch products
+  if (status === ConciergeSessionStatus.COMPLETE && session.result) {
     const raw = session.result.productHandles;
     const savedHandles = Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string") : [];
 
     if (savedHandles.length > 0) {
-      console.log("[App Proxy] /session served saved result", { sid: sessionId, requestId, count: savedHandles.length });
+      console.log("[App Proxy] /session served COMPLETE result", { sid: sessionId, requestId, count: savedHandles.length });
       
       const savedProducts = await fetchShopifyProductsByHandlesGraphQL({
         shopDomain,
@@ -143,14 +143,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         products: ordered,
         reasoning: session.result.reasoning || null,
         warning: ordered.length === 0 ? "Saved results could not be loaded (products missing/unpublished)" : null,
-        mode: "saved",
         requestId,
       }, {
         headers: { "Content-Type": "application/json", "x-request-id": requestId },
       });
     } else {
-      // ConciergeResult exists but has no handles - return empty but don't re-rank
-      console.log("[App Proxy] /session served saved result", { sid: sessionId, requestId, count: 0 });
+      // COMPLETE but no handles
+      console.log("[App Proxy] /session served COMPLETE result", { sid: sessionId, requestId, count: 0 });
       return Response.json({
         ok: true,
         sid: sessionId,
@@ -158,7 +157,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         products: [],
         reasoning: session.result.reasoning || null,
         warning: "Saved result exists but contains no product handles",
-        mode: "saved",
         requestId,
       }, {
         headers: { "Content-Type": "application/json", "x-request-id": requestId },
@@ -166,12 +164,42 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
   
-  // ConciergeResult is missing - return pending status (do NOT run AI ranking here)
-  console.log("[App Proxy] /session pending", { sid: sessionId, requestId });
+  // If COLLECTING or PROCESSING, return pending status
+  if (status === ConciergeSessionStatus.COLLECTING || status === ConciergeSessionStatus.PROCESSING) {
+    console.log("[App Proxy] /session", status, { sid: sessionId, requestId });
+    return Response.json({
+      ok: true,
+      sid: sessionId,
+      status: status === ConciergeSessionStatus.COLLECTING ? "PENDING" : "PROCESSING",
+      products: [],
+      requestId,
+    }, {
+      headers: { "Content-Type": "application/json", "x-request-id": requestId },
+    });
+  }
+  
+  // If FAILED, return error status
+  if (status === ConciergeSessionStatus.FAILED) {
+    console.log("[App Proxy] /session", status, { sid: sessionId, requestId });
+    return Response.json({
+      ok: true,
+      sid: sessionId,
+      status: "ERROR",
+      products: [],
+      errorMessage: session.result?.reasoning || "Session processing failed",
+      requestId,
+    }, {
+      headers: { "Content-Type": "application/json", "x-request-id": requestId },
+    });
+  }
+  
+  // Default: return pending
+  console.log("[App Proxy] /session unknown status", { sid: sessionId, status, requestId });
   return Response.json({
-    ok: false,
-    status: "pending",
-    retryAfterMs: 1500,
+    ok: true,
+    sid: sessionId,
+    status: "PENDING",
+    products: [],
     requestId,
   }, {
     headers: { "Content-Type": "application/json", "x-request-id": requestId },

@@ -100,7 +100,7 @@ export async function createConciergeSession({
       publicToken,
       shopId,
       experienceId: experienceId || null,
-      status: ConciergeSessionStatus.COLLECTING,
+      status: ConciergeSessionStatus.PENDING,
       resultCount,
       answersJson: answersJson || "[]",
       queryRaw: queryData?.raw || null,
