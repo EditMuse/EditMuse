@@ -84,13 +84,14 @@ interface BundleSelectedItem extends SelectedItem {
 interface StructuredBundleResult {
   trustFallback: boolean;
   selected_by_item: BundleSelectedItem[];
+  selected?: SelectedItem[]; // Optional fallback for backward compatibility
   rejected_candidates?: RejectedCandidate[];
 }
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-4o-mini";
-const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "60000"); // Configurable timeout, default 60 seconds
-const MAX_RETRIES = 2; // Max 2 retries, so at most 3 attempts total (initial attempt + 2 retries)
+const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "20000"); // Configurable timeout, default 20 seconds
+const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total (initial attempt + 1 retry)
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
 
@@ -1254,7 +1255,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     };
     
     if (isBundle) {
-      // Bundle schema: requires selected_by_item, selected is optional fallback
+      // Bundle schema: requires selected_by_item, selected and rejected_candidates are optional
       return {
         type: "object",
         properties: {
@@ -1281,11 +1282,11 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           },
           rejected_candidates: rejectedCandidateSchema,
         },
-        required: ["trustFallback", "selected_by_item", "selected", "rejected_candidates"],
+        required: ["trustFallback", "selected_by_item"],
         additionalProperties: false,
       };
     } else {
-      // Single-item schema
+      // Single-item schema: rejected_candidates is optional
       return {
         type: "object",
         properties: {
@@ -1296,7 +1297,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           },
           rejected_candidates: rejectedCandidateSchema,
         },
-        required: ["trustFallback", "selected", "rejected_candidates"],
+        required: ["trustFallback", "selected"],
         additionalProperties: false,
       };
     }
@@ -1306,6 +1307,9 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let lastError: any = null;
   let lastParseFailReason: string | undefined = undefined;
   const candidateHandles = new Set(candidates.map(p => p.handle));
+  
+  // Log time budget for AI ranking
+  console.log("[AI Ranking] time_budget", { timeoutMs: TIMEOUT_MS, maxRetries: MAX_RETRIES });
   
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -1330,7 +1334,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
         ],
         temperature: 0, // Set to 0 for more deterministic output
-        max_tokens: 1500,
+        max_tokens: 700, // Reduced from 1500 to prevent truncation (rejected_candidates is now optional)
       };
       
       // Always use strict structured outputs (JSON schema with strict: true)
@@ -1409,6 +1413,24 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
         // This triggers compressed retry
         continue; // Try again if retries remaining
+      }
+
+      // Handle missing optional fields safely (default to empty arrays)
+      if (isBundle && "selected_by_item" in structuredResult) {
+        const bundleResult = structuredResult as StructuredBundleResult;
+        // Ensure optional fields exist with defaults
+        if (!bundleResult.rejected_candidates) {
+          bundleResult.rejected_candidates = [];
+        }
+        if (!bundleResult.selected) {
+          bundleResult.selected = [];
+        }
+      } else {
+        const singleItemResult = structuredResult as StructuredRankingResult;
+        // Ensure optional fields exist with defaults
+        if (!singleItemResult.rejected_candidates) {
+          singleItemResult.rejected_candidates = [];
+        }
       }
 
       // Validate bundle response if in bundle mode

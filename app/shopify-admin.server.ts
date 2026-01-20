@@ -329,7 +329,7 @@ export async function fetchShopifyProducts({
       url: p.url,
       productType: p.productType,
       vendor: p.vendor,
-      description: p.description,
+      description: null, // Not fetched in initial query - fetched separately for AI candidates
     } as any));
   } catch (error) {
     // Fallback to REST on GraphQL error
@@ -338,8 +338,8 @@ export async function fetchShopifyProducts({
     
     // REST fallback implementation
     const apiVersion = "2025-01";
-    // Include richer fields to match GraphQL output
-    const fields = "id,title,handle,images,variants,options,tags,status,product_type,vendor,body_html";
+    // Include richer fields to match GraphQL output (body_html removed for speed - descriptions fetched separately for AI candidates)
+    const fields = "id,title,handle,images,variants,options,tags,status,product_type,vendor";
     
     // If collectionIds provided, fetch from collections, otherwise fetch all products
     let products: any[] = [];
@@ -408,9 +408,7 @@ export async function fetchShopifyProducts({
         available = product.status === "ACTIVE";
       }
       
-      // Clean description from body_html
-      const description = product.body_html ? cleanDescription(product.body_html) : null;
-      
+      // Description not fetched in initial query (will be fetched separately for AI candidates)
       // Extract optionValues and facet arrays from variants (REST fallback)
       const facets = extractVariantFacetValues(product);
       const optionValues = extractOptionValues(product);
@@ -427,7 +425,7 @@ export async function fetchShopifyProducts({
         available: available,
         productType: product.product_type || null,
         vendor: product.vendor || null,
-        description: description,
+        description: null, // Not fetched in initial query - fetched separately for AI candidates
         status: product.status || null,
         // Extract option intelligence from variants (REST fallback)
         optionValues: optionValues,
@@ -441,15 +439,14 @@ export async function fetchShopifyProducts({
     
     // Log REST fallback mapping stats
     const totalVariants = mapped.reduce((sum, p) => sum + ((p as any).variants?.length || 0), 0);
-    const withDescription = mapped.filter(p => p.description).length;
     const withProductType = mapped.filter(p => p.productType).length;
     const withVendor = mapped.filter(p => p.vendor).length;
     console.log("[Shopify Fetch] REST fallback products mapped", {
       count: mapped.length,
-      withDescription,
       withProductType,
       withVendor,
       totalVariants,
+      note: "Descriptions not fetched in initial query (will be fetched separately for AI candidates)",
     });
     
     return mapped;
@@ -544,7 +541,6 @@ export async function fetchShopifyProductsGraphQL({
                       totalInventory
                       productType
                       vendor
-                      description
                       status
                       options {
                         name
@@ -660,7 +656,6 @@ export async function fetchShopifyProductsGraphQL({
                 totalInventory
                 productType
                 vendor
-                description
                 status
                 options {
                   name
@@ -806,7 +801,7 @@ export async function fetchShopifyProductsGraphQL({
       available: available,
       productType: node.productType || null,
       vendor: node.vendor || null,
-      description: node.description || null,
+      description: null, // Not fetched in initial query - fetched separately for AI candidates
       status: node.status || null,
       // Add option intelligence
       optionValues: optionValues,
@@ -982,9 +977,112 @@ export async function fetchShopifyProductsByHandlesGraphQL({
       available: (node.totalInventory ?? 0) > 0,
       productType: node.productType || null,
       vendor: node.vendor || null,
-      description: node.description || null,
+      description: node.description || null, // This function is used for fetching by handles, so description is included
       status: node.status || null,
     };
   });
+}
+
+/**
+ * Lightweight helper to fetch descriptions only for specific handles
+ * Used to populate descriptions for AI candidate window after initial product fetch
+ */
+export async function fetchShopifyProductDescriptionsByHandles({
+  shopDomain,
+  accessToken,
+  handles,
+}: {
+  shopDomain: string;
+  accessToken: string;
+  handles: string[];
+}): Promise<Map<string, string | null>> {
+  const apiVersion = "2025-01";
+  const url = `https://${shopDomain}/admin/api/${apiVersion}/graphql.json`;
+
+  const safeHandles = (handles || []).filter(Boolean);
+  if (safeHandles.length === 0) return new Map();
+
+  const CHUNK_SIZE = 25;
+
+  function chunk<T>(arr: T[], size: number) {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  const query = `
+    query getProductDescriptions($first: Int!, $query: String!) {
+      products(first: $first, query: $query) {
+        edges {
+          node {
+            handle
+            description
+          }
+        }
+      }
+    }
+  `;
+
+  const descriptionMap = new Map<string, string | null>();
+  
+  for (const group of chunk(safeHandles, CHUNK_SIZE)) {
+    const queryString = group
+      .map((h) => `handle:"${String(h).replaceAll('"', '\\"')}"`)
+      .join(" OR ");
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { first: Math.min(group.length, 250), query: queryString },
+      }),
+      redirect: "manual",
+    });
+
+    // Check for redirect to password page
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (location && location.includes("/password")) {
+        throw new Error(
+          `Request redirected to password page. This usually means:\n` +
+          `1. The access token is invalid or expired\n` +
+          `2. The shopDomain "${shopDomain}" is incorrect\n` +
+          `3. The app needs to be reinstalled. Admin API should not require storefront password.`
+        );
+      }
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(
+        `Shopify GraphQL API error: ${response.status} ${response.statusText}\n` +
+        `URL: ${url}\n` +
+        `Response: ${errorBody.substring(0, 500)}`
+      );
+    }
+
+    const data = await response.json();
+    if (data.errors) {
+      throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+    }
+
+    const products = data.data?.products?.edges?.map((edge: any) => edge.node) || [];
+    for (const product of products) {
+      descriptionMap.set(product.handle, product.description || null);
+    }
+  }
+
+  // Ensure all requested handles are in the map (even if null)
+  for (const handle of safeHandles) {
+    if (!descriptionMap.has(handle)) {
+      descriptionMap.set(handle, null);
+    }
+  }
+
+  return descriptionMap;
 }
 

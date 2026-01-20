@@ -2,7 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
 import prisma from "~/db.server";
 import { createConciergeSession, saveConciergeResult } from "~/models/concierge.server";
-import { getAccessTokenForShop, fetchShopifyProducts } from "~/shopify-admin.server";
+import { getAccessTokenForShop, fetchShopifyProducts, fetchShopifyProductDescriptionsByHandles } from "~/shopify-admin.server";
 import { rankProductsWithAI, fallbackRanking } from "~/models/ai-ranking.server";
 import { ConciergeSessionStatus } from "@prisma/client";
 import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/models/billing.server";
@@ -32,7 +32,8 @@ function creditsForDeliveredCount(n: number): number {
   return 2; // 13-16 (clamp for now, extend if >16 supported)
 }
 
-const PRODUCT_POOL_LIMIT = 500;       // how many products we pull from Shopify
+const PRODUCT_POOL_LIMIT_FIRST = 200; // First fetch: 200 products
+const PRODUCT_POOL_LIMIT_MAX = 500;    // Maximum total products (if second fetch needed)
 // CANDIDATE_WINDOW_SIZE is now dynamic based on entitlements (calculated per request)
 const MAX_AI_PASSES = 3;              // first pass + up to 2 top-up passes
 const MIN_CANDIDATES_FOR_AI = 50;     // enough variety for AI
@@ -1298,36 +1299,42 @@ async function processSessionInBackground({
   const accessToken = await getAccessTokenForShop(shopDomain);
   
   let productHandles: string[] = [];
+  let aiCallCount = 0; // Track AI calls per session (should be 0 or 1)
+  
+  // Performance timing variables
+  let shopifyFetchMs = 0;
+  let enrichmentMs = 0;
+  let gatingMs = 0;
+  let bm25Ms = 0;
+  let aiMs = 0;
+  let saveMs = 0;
   
   try {
     if (accessToken) {
-      console.log("[App Proxy] Fetching products from Shopify Admin API");
+      const shopifyFetchStart = performance.now();
+      console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
       
-      // Fetch products
+      // STAGE 1: First fetch (200 products)
       let products = await fetchShopifyProducts({
         shopDomain,
         accessToken,
-        limit: PRODUCT_POOL_LIMIT,
+        limit: PRODUCT_POOL_LIMIT_FIRST,
         collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
       });
 
-      console.log("[App Proxy] Fetched", products.length, "products");
+      const firstFetchCount = products.length;
+      const mightHaveMorePages = firstFetchCount === PRODUCT_POOL_LIMIT_FIRST;
+      console.log("[App Proxy] First fetch:", firstFetchCount, "products", mightHaveMorePages ? "(might have more pages)" : "");
 
-      // Debug log: Product/Variant counts
-      const totalProducts = products.length;
-      const totalVariants = products.reduce((sum, p) => sum + ((p as any).variants?.length || 0), 0);
-      const avgVariantsPerProduct = totalProducts > 0 ? totalVariants / totalProducts : 0;
-      console.log("[App Proxy] Product/Variant counts", { totalProducts, totalVariants, avgVariantsPerProduct });
-
+      // Apply initial filters
       // Filter out ARCHIVED and DRAFT products
       const beforeStatusFilter = products.length;
       products = products.filter(p => {
         const status = (p as any).status;
         return status !== "ARCHIVED" && status !== "DRAFT";
       });
-      console.log("[App Proxy] After status filter (excluding ARCHIVED/DRAFT):", products.length, "products (filtered from", beforeStatusFilter, ")");
+      const afterStatusFilter = products.length;
 
-      // Apply filters
       // Filter by excluded tags
       if (excludedTags.length > 0) {
         products = products.filter(p => {
@@ -1336,7 +1343,6 @@ async function processSessionInBackground({
             productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
           );
         });
-        console.log("[App Proxy] After tag filter:", products.length, "products");
       }
 
       // Deduplicate by handle (in case collections overlap)
@@ -1348,7 +1354,7 @@ async function processSessionInBackground({
       });
 
       // Create baseProducts set (filters that should NEVER relax)
-      const baseProducts = products; // after status + excludedTags (+ dedupe) are applied
+      let baseProducts = products; // after status + excludedTags (+ dedupe) are applied
 
       const relaxNotes: string[] = [];
 
@@ -1370,6 +1376,88 @@ async function processSessionInBackground({
           return true;
         });
       }
+
+      const firstStageFilteredCount = filteredProducts.length;
+      const minNeededAfterFilter = finalResultCount * 8;
+
+      // STAGE 2: Fetch additional products if needed
+      if (firstStageFilteredCount < minNeededAfterFilter && mightHaveMorePages && products.length < PRODUCT_POOL_LIMIT_MAX) {
+        console.log("[App Proxy] Filtered candidates", firstStageFilteredCount, "<", minNeededAfterFilter, "- fetching up to", PRODUCT_POOL_LIMIT_MAX, "total products");
+        
+        // Fetch up to max limit (will fetch from beginning, but we'll deduplicate)
+        const allProducts = await fetchShopifyProducts({
+          shopDomain,
+          accessToken,
+          limit: PRODUCT_POOL_LIMIT_MAX,
+          collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+        });
+
+        const secondFetchCount = allProducts.length;
+        console.log("[App Proxy] Second fetch:", secondFetchCount, "total products (will deduplicate)");
+
+        // Merge with existing products (avoid duplicates by handle)
+        const existingHandles = new Set(products.map(p => p.handle));
+        const newProducts = allProducts.filter(p => !existingHandles.has(p.handle));
+        products = [...products, ...newProducts];
+
+        // Re-apply all filters to merged products
+        // Filter out ARCHIVED and DRAFT products
+        products = products.filter(p => {
+          const status = (p as any).status;
+          return status !== "ARCHIVED" && status !== "DRAFT";
+        });
+
+        // Filter by excluded tags
+        if (excludedTags.length > 0) {
+          products = products.filter(p => {
+            const productTags = p.tags || [];
+            return !excludedTags.some(excludedTag => 
+              productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
+            );
+          });
+        }
+
+        // Deduplicate by handle
+        const seen2 = new Set<string>();
+        products = products.filter(p => {
+          if (seen2.has(p.handle)) return false;
+          seen2.add(p.handle);
+          return true;
+        });
+
+        // Update baseProducts with merged and filtered products
+        baseProducts = products;
+
+        // Re-apply inStockOnly and budget filters
+        filteredProducts = [...baseProducts];
+
+        if (experience.inStockOnly) {
+          filteredProducts = filteredProducts.filter(p => p.available);
+        }
+
+        if (hadBudget) {
+          filteredProducts = filteredProducts.filter(p => {
+            const price = p.priceAmount ? parseFloat(String(p.priceAmount)) : (p.price ? parseFloat(String(p.price)) : NaN);
+            if (!Number.isFinite(price)) return true;
+            if (typeof priceMin === "number" && price < priceMin) return false;
+            if (typeof priceMax === "number" && price > priceMax) return false;
+            return true;
+          });
+        }
+      }
+
+      // Performance logging
+      const totalFetched = products.length;
+      const totalFiltered = filteredProducts.length;
+      
+      console.log("[Perf] product_pool", {
+        firstFetch: firstFetchCount,
+        secondFetch: totalFetched > firstFetchCount ? totalFetched - firstFetchCount : 0,
+        totalFetched,
+        filtered: totalFiltered,
+      });
+
+      shopifyFetchMs = Math.round(performance.now() - shopifyFetchStart);
 
       // ---- COUNT-AWARE RELAXATION LADDER ----
       // Relax if results are less than minimum needed (not just zero)
@@ -1502,13 +1590,11 @@ async function processSessionInBackground({
       // 3-LAYER RECOMMENDATION PIPELINE
       // ============================================
       
-      // LAYER 1: Description Enrichment
-      // Build enriched candidates with normalized text and search tokens
-      console.log("[App Proxy] [Layer 1] Building enriched candidates with description data");
+      // LAYER 1: Initial candidate building (without descriptions for speed)
+      // Descriptions will be fetched later only for AI candidate window
+      const enrichmentStart = performance.now();
+      console.log("[App Proxy] [Layer 1] Building initial candidates (descriptions deferred for speed)");
       let allCandidates = filteredProducts.map(p => {
-        const descPlain = cleanDescription((p as any).description || null);
-        const desc1000 = descPlain.substring(0, 1000);
-        
         return {
         handle: p.handle,
         title: p.title,
@@ -1516,9 +1602,9 @@ async function processSessionInBackground({
         tags: p.tags || [],
         vendor: (p as any).vendor || null,
         price: p.priceAmount || p.price || null,
-        description: (p as any).description || null,
-          descPlain,
-          desc1000,
+        description: null as string | null, // Not fetched in initial query
+          descPlain: "", // Will be populated later for AI candidates
+          desc1000: "", // Will be populated later for AI candidates
         available: p.available,
         sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
         colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
@@ -1527,7 +1613,7 @@ async function processSessionInBackground({
         };
       });
       
-      // Build searchText for each candidate
+      // Build searchText for each candidate (without description for now)
       type EnrichedCandidate = typeof allCandidates[0] & { searchText: string };
       const enrichedCandidates: EnrichedCandidate[] = allCandidates.map(c => {
         const searchText = buildSearchText({
@@ -1539,7 +1625,7 @@ async function processSessionInBackground({
           sizes: c.sizes,
           colors: c.colors,
           materials: c.materials,
-          desc1000: c.desc1000,
+          desc1000: undefined, // No description yet - will be added for AI candidates only
         });
         return {
           ...c,
@@ -1556,9 +1642,11 @@ async function processSessionInBackground({
       }));
       
       console.log("[App Proxy] [Layer 1] Enriched", candidateDocs.length, "candidates");
+      enrichmentMs = Math.round(performance.now() - enrichmentStart);
       
       // LAYER 2: Intent Parsing + Local Indexing + Gating
       // Parse intent into hard/soft/avoid terms and facets
+      const gatingStart = performance.now();
       console.log("[App Proxy] [Layer 2] Parsing intent and building local index");
       
       // Get variant constraints for intent parsing
@@ -2298,6 +2386,7 @@ async function processSessionInBackground({
       }
       
       // Pre-rank gated candidates with BM25 + boosts
+      const bm25StartSingle = performance.now();
       console.log("[App Proxy] [Layer 2] Pre-ranking candidates with BM25");
       const rankedCandidates = gatedCandidates.map(c => {
         const docTokens = tokenize(c.searchText);
@@ -2359,6 +2448,8 @@ async function processSessionInBackground({
       const topCandidates = rankedCandidates.slice(0, aiWindow).map(r => r.candidate);
       
       console.log("[App Proxy] [Layer 2] Pre-ranked top", topCandidates.length, "candidates for AI");
+      const bm25EndSingle = performance.now();
+      const bm25MsSingle = Math.round(bm25EndSingle - bm25StartSingle);
       
       // Update allCandidates to use gated pool for AI ranking
       // Store full pool for top-up, but AI only sees gated candidates
@@ -2415,6 +2506,9 @@ async function processSessionInBackground({
       // Branch: Bundle handling vs single-item handling
       let sortedCandidates: EnrichedCandidate[];
       let isBundleMode = false;
+      
+      // BM25 timing: start before bundle/single-item split (bundle path does its own BM25)
+      let bm25Start = performance.now();
       
       if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
         // BUNDLE PATH: Handle multi-item queries
@@ -2525,6 +2619,8 @@ async function processSessionInBackground({
         ) as any[];
         
         console.log("[Bundle] total candidates for AI:", allBundleCandidates.length);
+        // Update BM25 timing (includes bundle BM25 ranking)
+        bm25Ms = Math.round(performance.now() - bm25Start);
       
       // Use pre-ranked top candidates (already sorted by BM25 + boosts)
         sortedCandidates = allBundleCandidates;
@@ -2534,11 +2630,13 @@ async function processSessionInBackground({
         // SINGLE-ITEM PATH: Existing logic (unchanged)
         // Use pre-ranked top candidates (already sorted by BM25 + boosts)
         sortedCandidates = topCandidates;
+        // Update BM25 timing (single-item path - BM25 was done earlier)
+        bm25Ms = bm25MsSingle;
       
       console.log("[App Proxy] [Layer 3] Sending", sortedCandidates.length, "pre-ranked candidates to AI");
       }
 
-      // AI pass #1 + Top-up passes (no extra charge)
+      // AI pass #1 + Top-up passes (deterministic)
       const targetCount = Math.min(finalResultCount, sortedCandidates.length);
 
       let finalHandles: string[] = [];
@@ -2563,13 +2661,52 @@ async function processSessionInBackground({
         const bundleCandidatesForAI = sortedCandidates.filter(c => !used.has(c.handle));
         console.log("[Bundle] aiCandidatesSent=", bundleCandidatesForAI.length);
         
+        // Fetch descriptions only for AI candidate window
+        if (bundleCandidatesForAI.length > 0 && accessToken) {
+          console.log("[App Proxy] [Layer 1] Fetching descriptions for", bundleCandidatesForAI.length, "bundle AI candidates");
+          const aiHandles = bundleCandidatesForAI.map(c => c.handle);
+          const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+            shopDomain,
+            accessToken,
+            handles: aiHandles,
+          });
+          
+          // Enrich AI candidates with descriptions
+          for (const candidate of bundleCandidatesForAI) {
+            const description = descriptionMap.get(candidate.handle) || null;
+            const descPlain = cleanDescription(description);
+            const desc1000 = descPlain.substring(0, 1000);
+            
+            // Update candidate with description data
+            candidate.description = description;
+            candidate.descPlain = descPlain;
+            candidate.desc1000 = desc1000;
+            
+            // Rebuild searchText with description
+            candidate.searchText = buildSearchText({
+              title: candidate.title,
+              productType: candidate.productType,
+              vendor: candidate.vendor,
+              tags: candidate.tags,
+              optionValues: candidate.optionValues,
+              sizes: candidate.sizes,
+              colors: candidate.colors,
+              materials: candidate.materials,
+              desc1000: desc1000,
+            });
+          }
+          console.log("[App Proxy] [Layer 1] Enriched", bundleCandidatesForAI.length, "bundle candidates with descriptions");
+        }
+        
         // Convert hardFacets to array format for AI prompt
         const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
         if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
         if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
         if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
         
+        const aiStartBundle = performance.now();
         try {
+          aiCallCount++; // Track AI call
           const aiBundle = await rankProductsWithAI(
             userIntent,
             bundleCandidatesForAI,
@@ -2606,6 +2743,7 @@ async function processSessionInBackground({
                 itemPools.get(itemIdx)!.push(c);
               }
             }
+            aiMs += Math.round(performance.now() - aiStartBundle);
             
             // Build ranked candidates by itemIndex from AI handles
             const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
@@ -2743,8 +2881,10 @@ async function processSessionInBackground({
             
             reasoningParts.push(reasoningText);
           }
+          aiMs += Math.round(performance.now() - aiStartBundle);
         } catch (error) {
           console.error("[Bundle] AI ranking error:", error);
+          aiMs += Math.round(performance.now() - aiStartBundle);
           // Fallback to deterministic selection with budget-aware helper
           const itemPools = new Map<number, EnrichedCandidate[]>();
           for (const c of sortedCandidates) {
@@ -2805,12 +2945,51 @@ async function processSessionInBackground({
         // SINGLE-ITEM PATH: Existing AI ranking logic
       const window1 = buildWindow(offset, used);
       
+      // Fetch descriptions only for AI candidate window
+      if (window1.length > 0 && accessToken) {
+        console.log("[App Proxy] [Layer 1] Fetching descriptions for", window1.length, "AI candidates");
+        const aiHandles = window1.map(c => c.handle);
+        const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+          shopDomain,
+          accessToken,
+          handles: aiHandles,
+        });
+        
+        // Enrich AI candidates with descriptions
+        for (const candidate of window1) {
+          const description = descriptionMap.get(candidate.handle) || null;
+          const descPlain = cleanDescription(description);
+          const desc1000 = descPlain.substring(0, 1000);
+          
+          // Update candidate with description data
+          candidate.description = description;
+          candidate.descPlain = descPlain;
+          candidate.desc1000 = desc1000;
+          
+          // Rebuild searchText with description
+          candidate.searchText = buildSearchText({
+            title: candidate.title,
+            productType: candidate.productType,
+            vendor: candidate.vendor,
+            tags: candidate.tags,
+            optionValues: candidate.optionValues,
+            sizes: candidate.sizes,
+            colors: candidate.colors,
+            materials: candidate.materials,
+            desc1000: desc1000,
+          });
+        }
+        console.log("[App Proxy] [Layer 1] Enriched", window1.length, "candidates with descriptions");
+      }
+      
       // Convert hardFacets to array format for AI prompt
       const hardFacetsForAI: { size?: string[]; color?: string[]; material?: string[] } = {};
       if (hardFacets.size) hardFacetsForAI.size = [hardFacets.size];
       if (hardFacets.color) hardFacetsForAI.color = [hardFacets.color];
       if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
       
+      const aiStartSingle = performance.now();
+      aiCallCount++; // Track AI call
       const ai1 = await rankProductsWithAI(
         userIntent,
         window1,
@@ -2882,58 +3061,34 @@ async function processSessionInBackground({
         reasoningParts.push("Products selected using relevance ranking.");
       }
 
-      // TOP-UP PASSES (skip for bundle mode - handled separately)
+      // TOP-UP PASSES (deterministic selection from pre-ranked candidates)
       if (!isBundleMode) {
-      let pass = 2;
-      while (finalHandles.length < targetCount && pass <= MAX_AI_PASSES) {
-        offset += aiWindow;
+      // Select remaining products deterministically from sortedCandidates (already BM25-ranked)
+      while (finalHandles.length < targetCount) {
+        // Get next candidates from sorted list (already ranked by BM25 + boosts)
+        const remainingCandidates = sortedCandidates.filter(c => !used.has(c.handle));
+        
+        if (remainingCandidates.length === 0) break;
+        
         const missing = targetCount - finalHandles.length;
-        const window = buildWindow(offset, used);
-
-        if (window.length === 0) break;
-
-        const aiTopUp = await rankProductsWithAI(
-          userIntent,
-          window,
-          missing,
-          shop.id,
-          sessionToken, // IMPORTANT: prevents double charge within 5 minutes
-          variantConstraints2,
-          variantPreferences,
-          includeTerms,
-          avoidTerms,
-          {
-            hardTerms,
-            hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
-            avoidTerms,
-            trustFallback,
-          }
-        );
-
-        if (aiTopUp.rankedHandles?.length) {
-          // Filter cached handles against current product availability
-          const validTopUpHandles = aiTopUp.rankedHandles.filter((handle: string) => {
-            const candidate = sortedCandidates.find(c => c.handle === handle);
-            if (!candidate) return false;
-            // If inStockOnly is enabled, filter out unavailable products
-            if (experience.inStockOnly && !candidate.available) return false;
-            return true;
-          });
-          
-          let added = 0;
-          for (const h of validTopUpHandles) {
-            if (!used.has(h) && finalHandles.length < targetCount) {
-              used.add(h);
-              finalHandles.push(h);
-              added++;
-            }
-          }
-          if (added > 0) {
-            reasoningParts.push("Expanded search to find additional close matches.");
+        const toAdd = remainingCandidates.slice(0, missing);
+        
+        for (const candidate of toAdd) {
+          if (!used.has(candidate.handle) && finalHandles.length < targetCount) {
+            // Validate availability if inStockOnly is enabled
+            if (experience.inStockOnly && !candidate.available) continue;
+            
+            used.add(candidate.handle);
+            finalHandles.push(candidate.handle);
           }
         }
-
-        pass++;
+        
+        if (toAdd.length > 0) {
+          reasoningParts.push("Expanded search to find additional close matches.");
+        } else {
+          // No more valid candidates available
+          break;
+        }
       }
       } else if (isBundleMode && finalHandles.length < finalResultCount) {
         // BUNDLE-SAFE TOP-UP: Only from bundle item pools
@@ -3577,6 +3732,7 @@ async function processSessionInBackground({
       console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "handlesPreview=", handlesToSave.slice(0, 5));
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
+      const saveStart = performance.now();
       await saveConciergeResult({
         sessionToken,
         productHandles: handlesToSave,
@@ -3585,11 +3741,26 @@ async function processSessionInBackground({
           ? reasoning
           : finalReasoning,
       });
+      saveMs = Math.round(performance.now() - saveStart);
 
       console.log("[App Proxy] Results saved, session marked COMPLETE. deliveredCount=", deliveredCount);
 
       // Log 3-layer pipeline metrics
       console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
+      
+      // Log AI call count (should be 0 or 1)
+      console.log("[Perf] ai_calls", { total: aiCallCount });
+      
+      // Log performance timings
+      console.log("[Perf] timings", {
+        sid: sessionToken,
+        shopifyFetchMs,
+        enrichmentMs,
+        gatingMs,
+        bm25Ms,
+        aiMs,
+        saveMs,
+      });
 
       // NOTE: Billing is NOT performed here - will be handled separately when results are delivered
     } else {
@@ -3608,6 +3779,9 @@ async function processSessionInBackground({
         where: { publicToken: sessionToken },
         data: { status: ConciergeSessionStatus.FAILED },
       }).catch(() => {});
+      
+      // Log AI call count (should be 0)
+      console.log("[Perf] ai_calls", { total: aiCallCount });
     }
   } catch (error: any) {
       console.error("[App Proxy] Background processing failed:", error);
