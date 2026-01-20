@@ -88,7 +88,8 @@ interface StructuredBundleResult {
   rejected_candidates?: RejectedCandidate[];
 }
 
-const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "20000"); // Configurable timeout, default 20 seconds
 const TIMEOUT_MS_BUNDLE = Number(process.env.OPENAI_TIMEOUT_MS_BUNDLE ?? "12000"); // Stricter timeout for bundle mode, default 12 seconds
@@ -541,7 +542,7 @@ function deterministicRanking(
   
   return {
     selectedHandles,
-    reasoning: "AI ranking unavailable; selected products based on availability, preferences, and product information quality.",
+    reasoning: "Selected the best matches based on your preferences and product quality.",
     trustFallback: true,
     source: "fallback",
     parseFailReason: parseFailReason || null,
@@ -1338,9 +1339,18 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         max_tokens: 700, // Optimized for compact output (rejected_candidates removed from schema)
       };
       
+      // Determine API endpoint based on structured outputs support
+      // When using json_schema with strict: true, we use Responses API structure
+      // Note: OpenAI's Responses API fields (output_parsed, output[]) are returned 
+      // even when calling /v1/chat/completions with json_schema strict mode
+      let apiUsed: "responses" | "chat";
+      
       // Always use strict structured outputs (JSON schema with strict: true)
       // This guarantees valid JSON output that matches the schema exactly
       if (supportsJsonSchema) {
+        // Using Responses API structure (json_schema with strict: true)
+        // Still call /v1/chat/completions but response includes Responses API fields
+        apiUsed = "responses";
         requestBody.response_format = {
           type: "json_schema",
           json_schema: {
@@ -1349,14 +1359,17 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             schema: buildJsonSchema(isBundle),
           },
         };
-        console.log("[AI Ranking] structured_outputs=true");
+        console.log("[AI Ranking] structured_outputs=true using Responses API structure");
       } else {
-        // Fallback for models that don't support json_schema (shouldn't happen with current models)
-        console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
+        // Fallback for models that don't support json_schema - use chat.completions only
+        apiUsed = "chat";
+        console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode (chat.completions)");
         requestBody.response_format = { type: "json_object" };
       }
 
-      const response = await fetch(OPENAI_API_URL, {
+      // Always use /v1/chat/completions endpoint
+      // Responses API fields (output_parsed, output[]) are included in response when using json_schema strict
+      const response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -1379,52 +1392,86 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       const responseStatus = response.status; // Store status before consuming response body
       const data = await response.json();
       
-      // With strict structured outputs, check for refusal (model refused to generate structured output)
-      if (data.choices?.[0]?.message?.refusal) {
-        console.error("[AI Ranking] Model refused to generate structured output:", data.choices[0].message.refusal);
-        lastError = new Error("Model refused to generate structured output");
-        lastParseFailReason = "Model refusal";
-        continue; // Try again if retries remaining
+      // Strict runtime assertion: verify structured output contract is active
+      // When using Responses API structure (json_schema strict), we must receive Responses API fields
+      if (apiUsed === "responses") {
+        const hasOutput = Array.isArray(data.output);
+        const hasOutputParsed = Boolean(data.output_parsed && typeof data.output_parsed === "object");
+        if (!hasOutput && !hasOutputParsed) {
+          const responseKeys = Object.keys(data);
+          console.log("[AI Ranking] structured_outputs_contract_missing", {
+            model,
+            apiUsed,
+            keys: responseKeys.join(","),
+            note: "response_format not applied or wrong SDK method"
+          });
+          lastError = new Error("Structured outputs contract missing - no output or output_parsed fields");
+          lastParseFailReason = "Structured outputs contract missing - response_format not applied or wrong SDK method";
+          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+          continue; // Try again if retries remaining
+        }
       }
-
-      // When using response_format json_schema strict, read the parsed object from the SDK response only
-      // Do NOT JSON.parse raw content - only use pre-parsed output from the response
+      
+      // Extract text content for debug log (if available)
+      const extractedText = data.choices?.[0]?.message?.content || (typeof data.output?.[0] === "string" ? data.output[0] : null);
+      
+      // When using Responses API structure (json_schema strict), prioritize Responses API fields
+      // When using chat.completions only, read from choices[0].message structure
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      // Extract parsed output from Responses API structure (json_schema strict mode)
-      // Check multiple locations where the SDK might place the parsed output
-      
-      // 1. Check for SDK's parsed accessor (preferred location)
-      const message = data.choices?.[0]?.message;
-      if (message) {
-        // Check for parsed field (OpenAI SDK may provide this when using structured outputs)
-        if (message.parsed && typeof message.parsed === "object") {
-          structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
+      if (apiUsed === "responses") {
+        // Responses API structure: check output_parsed first (top-level parsed accessor)
+        if (data.output_parsed && typeof data.output_parsed === "object") {
+          structuredResult = data.output_parsed as StructuredRankingResult | StructuredBundleResult;
+        } 
+        // Then check output[] array (Responses API structure)
+        else if (Array.isArray(data.output)) {
+          for (const outputItem of data.output) {
+            // Check for parsed output in output item
+            if (outputItem.parsed && typeof outputItem.parsed === "object") {
+              structuredResult = outputItem.parsed as StructuredRankingResult | StructuredBundleResult;
+              break;
+            }
+            // Check if output item itself is the structured result
+            if (outputItem && typeof outputItem === "object" && !Array.isArray(outputItem) && 
+                ("selected" in outputItem || "selected_by_item" in outputItem)) {
+              structuredResult = outputItem as StructuredRankingResult | StructuredBundleResult;
+              break;
+            }
+          }
         }
-        // Check if content is already an object (parsed) rather than a string
-        else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
-          structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
+        // If Responses API fields not found but choices present, check choices[0].message.parsed
+        // (some SDK versions may place parsed output there even with Responses API)
+        if (!structuredResult) {
+          const message = data.choices?.[0]?.message;
+          if (message?.parsed && typeof message.parsed === "object") {
+            structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
+          }
+        }
+      } else {
+        // Chat.completions API only: check choices[0].message structure
+        const message = data.choices?.[0]?.message;
+        if (message) {
+          // Check for refusal
+          if (message.refusal) {
+            console.error("[AI Ranking] Model refused to generate structured output:", message.refusal);
+            lastError = new Error("Model refused to generate structured output");
+            lastParseFailReason = "Model refusal";
+            continue; // Try again if retries remaining
+          }
+          
+          // Check for parsed field (may be present in some SDK versions)
+          if (message.parsed && typeof message.parsed === "object") {
+            structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
+          }
+          // Check if content is already an object (parsed) rather than a string
+          else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
+            structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
+          }
         }
       }
       
-      // 2. Check response.output[] array (Responses API structure)
-      if (!structuredResult && Array.isArray(data.output)) {
-        for (const outputItem of data.output) {
-          // Check for parsed output in output item
-          if (outputItem.parsed && typeof outputItem.parsed === "object") {
-            structuredResult = outputItem.parsed as StructuredRankingResult | StructuredBundleResult;
-            break;
-          }
-          // Check if output item itself is the structured result
-          if (outputItem && typeof outputItem === "object" && !Array.isArray(outputItem) && 
-              ("selected" in outputItem || "selected_by_item" in outputItem)) {
-            structuredResult = outputItem as StructuredRankingResult | StructuredBundleResult;
-            break;
-          }
-        }
-      }
-      
-      // 3. Check top-level parsed field
+      // Check top-level parsed field (fallback for either API structure)
       if (!structuredResult && data.parsed && typeof data.parsed === "object") {
         structuredResult = data.parsed as StructuredRankingResult | StructuredBundleResult;
       }
@@ -1432,17 +1479,15 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // If parsed output is missing, log diagnostic and treat as AI failure
       // Do NOT attempt JSON.parse on raw content - strict mode requires pre-parsed output
       if (!structuredResult) {
-        // Collect diagnostic information
-        const hasOutput = Array.isArray(data.output);
-        const outputTypes = hasOutput ? data.output.map((item: any) => typeof item).join(",") : "none";
-        const hasText = message?.content && typeof message.content === "string";
-        
-        console.log("[AI Ranking] structured_outputs missing parsed output", {
-          model,
-          hasOutput,
-          outputTypes,
-          hasText,
-          status: responseStatus
+        // Guard log before fallback (one line, compact)
+        const responseKeys = Object.keys(data);
+        console.log("[AI Ranking] structured_outputs_debug", {
+          apiUsed,
+          keys: responseKeys.join(","),
+          hasOutput: Array.isArray(data.output),
+          hasOutputParsed: Boolean(data.output_parsed),
+          hasChoices: Boolean(data.choices),
+          hasText: Boolean(extractedText)
         });
         
         lastError = new Error("Structured outputs missing parsed output");

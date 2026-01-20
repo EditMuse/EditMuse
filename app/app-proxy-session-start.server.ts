@@ -43,6 +43,7 @@ type VariantConstraints = {
   size: string | null;
   color: string | null;
   material: string | null;
+  allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values (case-normalized)
 };
 
 function pickString(obj: any, keys: string[]): string | null {
@@ -71,8 +72,50 @@ function parseConstraintsFromAnswers(answersJson: any): VariantConstraints {
   };
 }
 
+/**
+ * Extract OR allow-list values from text (e.g., "Navy or Blue", "either A or B", "A / B")
+ * Returns array of normalized values or null if no OR pattern found
+ */
+function extractAllowList(text: string, validValues: string[]): string[] | null {
+  const t = text.toLowerCase();
+  
+  // Patterns for OR: "A or B", "either A or B", "A / B", "A, B, or C"
+  // Match words around "or", "either...or", or "/"
+  const orPatterns = [
+    /\b(\w+)\s+or\s+(\w+)\b/gi,
+    /\beither\s+(\w+)\s+or\s+(\w+)\b/gi,
+    /\b(\w+)\s*\/\s*(\w+)\b/gi,
+    /\b(\w+),\s*(\w+)(?:,\s*or\s+(\w+))?/gi,
+  ];
+  
+  for (const pattern of orPatterns) {
+    const match = pattern.exec(text);
+    if (match) {
+      const values: string[] = [];
+      // Extract all matched groups (skip full match at index 0)
+      for (let i = 1; i < match.length; i++) {
+        if (match[i]) {
+          const value = match[i].trim().toLowerCase();
+          // Check if value is in the valid values list (case-insensitive)
+          const normalized = validValues.find(v => v.toLowerCase() === value);
+          if (normalized) {
+            values.push(normalized);
+          }
+        }
+      }
+      if (values.length >= 2) {
+        // Normalize values (capitalize first letter)
+        return values.map(v => v.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" "));
+      }
+    }
+  }
+  
+  return null;
+}
+
 function parseConstraintsFromText(text: string): VariantConstraints {
   const t = (text || "").toLowerCase();
+  const allowValues: Record<string, string[]> = {};
 
   // Size parsing (keep conservative)
   const sizeMap: Record<string, string> = {
@@ -87,10 +130,22 @@ function parseConstraintsFromText(text: string): VariantConstraints {
     "xl": "XL",
     "xxl": "XXL",
   };
+  
+  const sizeValues = Object.keys(sizeMap);
 
   // Common "UK 10" style sizes (fashion)
   const ukDress = t.match(/\buk\s?(\d{1,2})\b/);
   const numericSize = t.match(/\bsize\s?(\d{1,2})\b/);
+
+  // Try to extract OR allow-list for size first
+  const sizeAllowList = extractAllowList(text, sizeValues);
+  if (sizeAllowList) {
+    allowValues.size = sizeAllowList;
+    const sourceMatch = text.match(/\b(?:size\s+)?(?:either\s+)?\w+\s+(?:or|\/)\s+\w+/i);
+    if (sourceMatch) {
+      console.log("[Constraints] allow_list", { attribute: "size", values: sizeAllowList, sourceTextSnippet: sourceMatch[0] });
+    }
+  }
 
   let size: string | null = null;
   for (const key of Object.keys(sizeMap)) {
@@ -105,6 +160,17 @@ function parseConstraintsFromText(text: string): VariantConstraints {
     "black","white","grey","gray","navy","blue","green","red","pink","purple",
     "beige","cream","brown","tan","orange","yellow","gold","silver","khaki",
   ];
+  
+  // Try to extract OR allow-list for color first
+  const colorAllowList = extractAllowList(text, colors);
+  if (colorAllowList) {
+    allowValues.color = colorAllowList;
+    const sourceMatch = text.match(/\b(?:color|colour)?\s*(?:in\s+)?(?:either\s+)?\w+\s+(?:or|\/)\s+\w+/i);
+    if (sourceMatch) {
+      console.log("[Constraints] allow_list", { attribute: "color", values: colorAllowList, sourceTextSnippet: sourceMatch[0] });
+    }
+  }
+  
   let color: string | null = null;
   for (const c of colors) {
     const re = new RegExp(`\\b${c}\\b`, "i");
@@ -128,6 +194,17 @@ function parseConstraintsFromText(text: string): VariantConstraints {
     // Health/Wellness ingredients
     "protein","fiber","vitamin","mineral","omega","probiotic","prebiotic","antioxidant","turmeric","ginger","echinacea"
   ];
+  
+  // Try to extract OR allow-list for material first
+  const materialAllowList = extractAllowList(text, materials);
+  if (materialAllowList) {
+    allowValues.material = materialAllowList;
+    const sourceMatch = text.match(/\b(?:material|fabric)?\s*(?:in\s+)?(?:either\s+)?\w+(?:\s+\w+)?\s+(?:or|\/)\s+\w+/i);
+    if (sourceMatch) {
+      console.log("[Constraints] allow_list", { attribute: "material", values: materialAllowList, sourceTextSnippet: sourceMatch[0] });
+    }
+  }
+  
   let material: string | null = null;
   for (const m of materials) {
     const re = new RegExp(`\\b${m.replace(/\s+/g, "\\s+")}\\b`, "i");
@@ -137,7 +214,11 @@ function parseConstraintsFromText(text: string): VariantConstraints {
     }
   }
 
-  return { size, color, material };
+  const result: VariantConstraints = { size, color, material };
+  if (Object.keys(allowValues).length > 0) {
+    result.allowValues = allowValues;
+  }
+  return result;
 }
 
 /**
@@ -405,7 +486,12 @@ function parseBundleIntentGeneric(userIntent: string): {
     hardTerms: string[]; 
     quantity: number;
     constraints?: {
-      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      optionConstraints?: { 
+        size?: string | null; 
+        color?: string | null; 
+        material?: string | null;
+        allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
+      };
       priceCeiling?: number | null;
       includeTerms?: string[];
       excludeTerms?: string[];
@@ -565,7 +651,12 @@ function parseBundleIntentGeneric(userIntent: string): {
     hardTerms: string[]; 
     quantity: number;
     constraints?: {
-      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      optionConstraints?: { 
+        size?: string | null; 
+        color?: string | null; 
+        material?: string | null;
+        allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
+      };
       priceCeiling?: number | null;
       includeTerms?: string[];
       excludeTerms?: string[];
@@ -598,66 +689,140 @@ function parseBundleIntentGeneric(userIntent: string): {
     // Extract option constraints (size, color, material) scoped to this item
     // Patterns: "suit in size 42", "suit color blue", "suit material cotton"
     const itemConstraints: {
-      optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+      optionConstraints?: { 
+        size?: string | null; 
+        color?: string | null; 
+        material?: string | null;
+        allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
+      };
       priceCeiling?: number | null;
       includeTerms?: string[];
       excludeTerms?: string[];
     } = {};
     
-    // Extract size constraint scoped to this item
+    // Extract size constraint scoped to this item (with OR allow-list support)
     const sizePatterns = [
-      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?size\\s+(\\w+|\\d+)`, "i"),
-      new RegExp(`size\\s+(\\w+|\\d+)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?size\\s+(.+?)(?:\\s|,|$|\\b)`, "i"),
+      new RegExp(`size\\s+(.+?)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
     ];
-    let itemSize: string | null = null;
-    for (const pattern of sizePatterns) {
-      const match = itemContextLower.match(pattern);
-      if (match && match[1]) {
-        const sizeValue = match[1].trim();
-        // Map common size values
-        const sizeMap: Record<string, string> = {
-          "xxs": "XXS", "xs": "XS", "small": "Small", "s": "S",
-          "medium": "Medium", "m": "M", "large": "Large", "l": "L",
-          "xl": "XL", "xxl": "XXL",
-        };
-        itemSize = sizeMap[sizeValue.toLowerCase()] || `Size ${sizeValue}`;
-        break;
-      }
-    }
     
-    // Extract color constraint scoped to this item
-    const colorPatterns = [
-      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:color|colour)\\s+(\\w+)`, "i"),
-      new RegExp(`(?:color|colour)\\s+(\\w+)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
-    ];
-    const colors = ["black", "white", "grey", "gray", "navy", "blue", "green", "red", "pink", "purple",
-      "beige", "cream", "brown", "tan", "orange", "yellow", "gold", "silver", "khaki"];
-    let itemColor: string | null = null;
-    for (const pattern of colorPatterns) {
-      const match = itemContextLower.match(pattern);
-      if (match && match[1]) {
-        const colorValue = match[1].toLowerCase();
-        if (colors.includes(colorValue)) {
-          itemColor = colorValue[0].toUpperCase() + colorValue.slice(1);
+    const sizeMap: Record<string, string> = {
+      "xxs": "XXS", "xs": "XS", "small": "Small", "s": "S",
+      "medium": "Medium", "m": "M", "large": "Large", "l": "L",
+      "xl": "XL", "xxl": "XXL",
+    };
+    const sizeValues = Object.keys(sizeMap);
+    
+    // Try to extract OR allow-list for size first
+    const sizeAllowList = extractAllowList(itemContext, sizeValues);
+    let itemSize: string | null = null;
+    if (sizeAllowList && sizeAllowList.length > 0) {
+      // Store allow-list in constraints (convert to mapped values)
+      const mappedSizeAllowList = sizeAllowList.map(s => {
+        const key = s.toLowerCase();
+        return sizeMap[key] || s;
+      });
+      if (!itemConstraints.optionConstraints) {
+        itemConstraints.optionConstraints = {};
+      }
+      if (!itemConstraints.optionConstraints.allowValues) {
+        itemConstraints.optionConstraints.allowValues = {};
+      }
+      itemConstraints.optionConstraints.allowValues.size = mappedSizeAllowList;
+      const sourceMatch = itemContext.match(/\b(?:size)?\s*(?:in\s+)?(?:either\s+)?\w+\s+(?:or|\/)\s+\w+/i);
+      if (sourceMatch) {
+        console.log("[Constraints] allow_list", { attribute: "size", values: mappedSizeAllowList, sourceTextSnippet: sourceMatch[0] });
+      }
+    } else {
+      // Fall back to single value extraction
+      for (const pattern of sizePatterns) {
+        const match = itemContextLower.match(pattern);
+        if (match && match[1]) {
+          const sizeValue = match[1].trim();
+          // Check for single size value (before "or" or "/")
+          const singleSize = sizeValue.split(/\s+(?:or|\/)\s+/i)[0].trim();
+          itemSize = sizeMap[singleSize.toLowerCase()] || `Size ${singleSize}`;
           break;
         }
       }
     }
     
-    // Extract material constraint scoped to this item
-    const materialPatterns = [
-      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:material|fabric)\\s+(\\w+(?:\\s+\\w+)?)`, "i"),
-      new RegExp(`(?:material|fabric)\\s+(\\w+(?:\\s+\\w+)?)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+    // Extract color constraint scoped to this item (with OR allow-list support)
+    const colorPatterns = [
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:color|colour)\\s+(.+?)(?:\\s|,|$|\\b)`, "i"),
+      new RegExp(`(?:color|colour)\\s+(.+?)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
     ];
-    const materials = ["cotton", "linen", "silk", "wool", "leather", "denim", "polyester", "viscose", "nylon"];
+    const colors = ["black", "white", "grey", "gray", "navy", "blue", "green", "red", "pink", "purple",
+      "beige", "cream", "brown", "tan", "orange", "yellow", "gold", "silver", "khaki"];
+    
+    // Try to extract OR allow-list for color first
+    const colorAllowList = extractAllowList(itemContext, colors);
+    let itemColor: string | null = null;
+    if (colorAllowList && colorAllowList.length > 0) {
+      // Store allow-list in constraints
+      if (!itemConstraints.optionConstraints) {
+        itemConstraints.optionConstraints = {};
+      }
+      if (!itemConstraints.optionConstraints.allowValues) {
+        itemConstraints.optionConstraints.allowValues = {};
+      }
+      itemConstraints.optionConstraints.allowValues.color = colorAllowList;
+      const sourceMatch = itemContext.match(/\b(?:color|colour)?\s*(?:in\s+)?(?:either\s+)?\w+\s+(?:or|\/)\s+\w+/i);
+      if (sourceMatch) {
+        console.log("[Constraints] allow_list", { attribute: "color", values: colorAllowList, sourceTextSnippet: sourceMatch[0] });
+      }
+    } else {
+      // Fall back to single value extraction
+      for (const pattern of colorPatterns) {
+        const match = itemContextLower.match(pattern);
+        if (match && match[1]) {
+          const colorValue = match[1].trim().toLowerCase();
+          // Check for single color value (before "or" or "/")
+          const singleColor = colorValue.split(/\s+(?:or|\/)\s+/i)[0].trim();
+          if (colors.includes(singleColor)) {
+            itemColor = singleColor[0].toUpperCase() + singleColor.slice(1);
+            break;
+          }
+        }
+      }
+    }
+    
+    // Extract material constraint scoped to this item (with OR allow-list support)
+    const materialPatterns = [
+      new RegExp(`${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(?:in\\s+)?(?:material|fabric)\\s+(.+?)(?:\\s|,|$|\\b)`, "i"),
+      new RegExp(`(?:material|fabric)\\s+(.+?)\\s+${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"),
+    ];
+    const materials = ["cotton", "linen", "silk", "wool", "leather", "denim", "polyester", "viscose", "nylon", "cashmere",
+      "spandex", "elastane", "retinol", "hyaluronic acid", "vitamin c", "wood", "metal", "glass", "ceramic", "plastic"];
+    
+    // Try to extract OR allow-list for material first
+    const materialAllowList = extractAllowList(itemContext, materials);
     let itemMaterial: string | null = null;
-    for (const pattern of materialPatterns) {
-      const match = itemContextLower.match(pattern);
-      if (match && match[1]) {
-        const materialValue = match[1].toLowerCase();
-        if (materials.some(m => materialValue.includes(m))) {
-          itemMaterial = materialValue.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
-          break;
+    if (materialAllowList && materialAllowList.length > 0) {
+      // Store allow-list in constraints
+      if (!itemConstraints.optionConstraints) {
+        itemConstraints.optionConstraints = {};
+      }
+      if (!itemConstraints.optionConstraints.allowValues) {
+        itemConstraints.optionConstraints.allowValues = {};
+      }
+      itemConstraints.optionConstraints.allowValues.material = materialAllowList;
+      const sourceMatch = itemContext.match(/\b(?:material|fabric)?\s*(?:in\s+)?(?:either\s+)?\w+(?:\s+\w+)?\s+(?:or|\/)\s+\w+/i);
+      if (sourceMatch) {
+        console.log("[Constraints] allow_list", { attribute: "material", values: materialAllowList, sourceTextSnippet: sourceMatch[0] });
+      }
+    } else {
+      // Fall back to single value extraction
+      for (const pattern of materialPatterns) {
+        const match = itemContextLower.match(pattern);
+        if (match && match[1]) {
+          const materialValue = match[1].trim().toLowerCase();
+          // Check for single material value (before "or" or "/")
+          const singleMaterial = materialValue.split(/\s+(?:or|\/)\s+/i)[0].trim();
+          if (materials.some(m => singleMaterial.includes(m))) {
+            itemMaterial = singleMaterial.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
+            break;
+          }
         }
       }
     }
@@ -733,11 +898,30 @@ function parseBundleIntentGeneric(userIntent: string): {
 
 function mergeConstraints(a: VariantConstraints, b: VariantConstraints): VariantConstraints {
   // a has priority over b
-  return {
+  // Merge allowValues: a's allowValues take priority, but merge if both exist for same attribute
+  const allowValues: Record<string, string[]> = {};
+  if (a.allowValues) {
+    Object.assign(allowValues, a.allowValues);
+  }
+  if (b.allowValues) {
+    for (const [key, values] of Object.entries(b.allowValues)) {
+      if (!allowValues[key]) {
+        allowValues[key] = values;
+      }
+    }
+  }
+  
+  const result: VariantConstraints = {
     size: a.size ?? b.size,
     color: a.color ?? b.color,
     material: a.material ?? b.material,
   };
+  
+  if (Object.keys(allowValues).length > 0) {
+    result.allowValues = allowValues;
+  }
+  
+  return result;
 }
 
 type VariantPreferences = Record<string, string>;
@@ -1927,7 +2111,12 @@ async function processSessionInBackground({
         budgetMin?: number; 
         budgetMax?: number;
         constraints?: {
-          optionConstraints?: { size?: string | null; color?: string | null; material?: string | null };
+          optionConstraints?: { 
+        size?: string | null; 
+        color?: string | null; 
+        material?: string | null;
+        allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
+      };
           priceCeiling?: number | null;
           includeTerms?: string[];
           excludeTerms?: string[];
@@ -2528,9 +2717,21 @@ async function processSessionInBackground({
       // Calculate BM25 scores and apply gating
       console.log("[App Proxy] [Layer 2] Applying hard gating");
       
-      // Gate 1: Hard facets (size/color/material must match)
+      // Gate 1: Hard facets (size/color/material must match) - with OR allow-list support
       let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
-        if (hardFacets.size && c.sizes.length > 0) {
+        const allowValues = variantConstraints2.allowValues;
+        
+        // Size constraint: check allowValues first (OR logic - match any), then single value
+        if (allowValues?.size && allowValues.size.length > 0 && c.sizes.length > 0) {
+          const sizeMatch = c.sizes.some((s: string) => 
+            allowValues.size.some(allowedSize => 
+              normalizeText(s) === normalizeText(allowedSize) ||
+              normalizeText(s).includes(normalizeText(allowedSize)) ||
+              normalizeText(allowedSize).includes(normalizeText(s))
+            )
+          );
+          if (!sizeMatch) return false;
+        } else if (hardFacets.size && c.sizes.length > 0) {
           const sizeMatch = c.sizes.some((s: string) => 
             normalizeText(s) === normalizeText(hardFacets.size) ||
             normalizeText(s).includes(normalizeText(hardFacets.size)) ||
@@ -2538,7 +2739,18 @@ async function processSessionInBackground({
           );
           if (!sizeMatch) return false;
         }
-        if (hardFacets.color && c.colors.length > 0) {
+        
+        // Color constraint: check allowValues first (OR logic - match any), then single value
+        if (allowValues?.color && allowValues.color.length > 0 && c.colors.length > 0) {
+          const colorMatch = c.colors.some((col: string) => 
+            allowValues.color.some(allowedColor => 
+              normalizeText(col) === normalizeText(allowedColor) ||
+              normalizeText(col).includes(normalizeText(allowedColor)) ||
+              normalizeText(allowedColor).includes(normalizeText(col))
+            )
+          );
+          if (!colorMatch) return false;
+        } else if (hardFacets.color && c.colors.length > 0) {
           const colorMatch = c.colors.some((col: string) => 
             normalizeText(col) === normalizeText(hardFacets.color) ||
             normalizeText(col).includes(normalizeText(hardFacets.color)) ||
@@ -2546,7 +2758,18 @@ async function processSessionInBackground({
           );
           if (!colorMatch) return false;
         }
-        if (hardFacets.material && c.materials.length > 0) {
+        
+        // Material constraint: check allowValues first (OR logic - match any), then single value
+        if (allowValues?.material && allowValues.material.length > 0 && c.materials.length > 0) {
+          const materialMatch = c.materials.some((m: string) => 
+            allowValues.material.some(allowedMaterial => 
+              normalizeText(m) === normalizeText(allowedMaterial) ||
+              normalizeText(m).includes(normalizeText(allowedMaterial)) ||
+              normalizeText(allowedMaterial).includes(normalizeText(m))
+            )
+          );
+          if (!materialMatch) return false;
+        } else if (hardFacets.material && c.materials.length > 0) {
           const materialMatch = c.materials.some((m: string) => 
             normalizeText(m) === normalizeText(hardFacets.material) ||
             normalizeText(m).includes(normalizeText(hardFacets.material)) ||
@@ -2554,6 +2777,7 @@ async function processSessionInBackground({
           );
           if (!materialMatch) return false;
         }
+        
         return true;
       });
       
@@ -2687,7 +2911,8 @@ async function processSessionInBackground({
           
           if (broadGate.length >= MIN_CANDIDATES_FOR_AI) {
             gatedCandidates = broadGate;
-            relaxNotes.push(`Broadened category matching to find ${broadGate.length} candidates.`);
+            // Don't add technical note - this is internal optimization
+            // relaxNotes.push(`Broadened category matching to find ${broadGate.length} candidates.`);
             console.log("[App Proxy] [Layer 2] Using broad gate (word-boundary matching):", broadGate.length);
           } else {
             // Last resort: trust fallback (allow cross-catalog)
@@ -2867,37 +3092,80 @@ async function processSessionInBackground({
           // First pass: item-specific facet + hard term matching (no budget filter)
           const itemConstraints = bundleItem.constraints;
           const itemOptionConstraints = itemConstraints?.optionConstraints;
+          const allowValues = itemOptionConstraints?.allowValues;
           
           const itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
             // Apply item-specific option constraints (size, color, material) if present
             // Otherwise fall back to global hardFacets
-            const sizeConstraint = itemOptionConstraints?.size || hardFacets.size;
-            const colorConstraint = itemOptionConstraints?.color || hardFacets.color;
-            const materialConstraint = itemOptionConstraints?.material || hardFacets.material;
+            // Check allowValues first (OR logic - match any), then single constraints
             
-            if (sizeConstraint && c.sizes.length > 0) {
+            // Size constraint: check allowValues first, then single value
+            if (allowValues?.size && allowValues.size.length > 0 && c.sizes.length > 0) {
+              // OR logic: match any value in the allow-list
               const sizeMatch = c.sizes.some((s: string) => 
-                normalizeText(s) === normalizeText(sizeConstraint) ||
-                normalizeText(s).includes(normalizeText(sizeConstraint)) ||
-                normalizeText(sizeConstraint).includes(normalizeText(s))
+                allowValues.size.some(allowedSize => 
+                  normalizeText(s) === normalizeText(allowedSize) ||
+                  normalizeText(s).includes(normalizeText(allowedSize)) ||
+                  normalizeText(allowedSize).includes(normalizeText(s))
+                )
               );
               if (!sizeMatch) return false;
+            } else {
+              const sizeConstraint = itemOptionConstraints?.size || hardFacets.size;
+              if (sizeConstraint && c.sizes.length > 0) {
+                const sizeMatch = c.sizes.some((s: string) => 
+                  normalizeText(s) === normalizeText(sizeConstraint) ||
+                  normalizeText(s).includes(normalizeText(sizeConstraint)) ||
+                  normalizeText(sizeConstraint).includes(normalizeText(s))
+                );
+                if (!sizeMatch) return false;
+              }
             }
-            if (colorConstraint && c.colors.length > 0) {
+            
+            // Color constraint: check allowValues first, then single value
+            if (allowValues?.color && allowValues.color.length > 0 && c.colors.length > 0) {
+              // OR logic: match any value in the allow-list
               const colorMatch = c.colors.some((col: string) => 
-                normalizeText(col) === normalizeText(colorConstraint) ||
-                normalizeText(col).includes(normalizeText(colorConstraint)) ||
-                normalizeText(colorConstraint).includes(normalizeText(col))
+                allowValues.color.some(allowedColor => 
+                  normalizeText(col) === normalizeText(allowedColor) ||
+                  normalizeText(col).includes(normalizeText(allowedColor)) ||
+                  normalizeText(allowedColor).includes(normalizeText(col))
+                )
               );
               if (!colorMatch) return false;
+            } else {
+              const colorConstraint = itemOptionConstraints?.color || hardFacets.color;
+              if (colorConstraint && c.colors.length > 0) {
+                const colorMatch = c.colors.some((col: string) => 
+                  normalizeText(col) === normalizeText(colorConstraint) ||
+                  normalizeText(col).includes(normalizeText(colorConstraint)) ||
+                  normalizeText(colorConstraint).includes(normalizeText(col))
+                );
+                if (!colorMatch) return false;
+              }
             }
-            if (materialConstraint && c.materials.length > 0) {
+            
+            // Material constraint: check allowValues first, then single value
+            if (allowValues?.material && allowValues.material.length > 0 && c.materials.length > 0) {
+              // OR logic: match any value in the allow-list
               const materialMatch = c.materials.some((m: string) => 
-                normalizeText(m) === normalizeText(materialConstraint) ||
-                normalizeText(m).includes(normalizeText(materialConstraint)) ||
-                normalizeText(materialConstraint).includes(normalizeText(m))
+                allowValues.material.some(allowedMaterial => 
+                  normalizeText(m) === normalizeText(allowedMaterial) ||
+                  normalizeText(m).includes(normalizeText(allowedMaterial)) ||
+                  normalizeText(allowedMaterial).includes(normalizeText(m))
+                )
               );
               if (!materialMatch) return false;
+            } else {
+              const materialConstraint = itemOptionConstraints?.material || hardFacets.material;
+              if (materialConstraint && c.materials.length > 0) {
+                const materialMatch = c.materials.some((m: string) => 
+                  normalizeText(m) === normalizeText(materialConstraint) ||
+                  normalizeText(m).includes(normalizeText(materialConstraint)) ||
+                  normalizeText(materialConstraint).includes(normalizeText(m))
+                );
+                if (!materialMatch) return false;
+              }
             }
             
             // Apply hard term matching for this item
@@ -4086,41 +4354,10 @@ async function processSessionInBackground({
 
       finalHandles = finalHandlesGuaranteed;
 
-      // Add trust signals to reasoning
-      if (!trustFallback && (hardTerms.length > 0 || hardFacets.size || hardFacets.color || hardFacets.material)) {
-        const matchParts: string[] = [];
-        if (hardTerms.length > 0) {
-          matchParts.push(`category: ${hardTerms.join(", ")}`);
-        }
-        if (hardFacets.size) matchParts.push(`size: ${hardFacets.size}`);
-        if (hardFacets.color) matchParts.push(`color: ${hardFacets.color}`);
-        if (hardFacets.material) matchParts.push(`material: ${hardFacets.material}`);
-        if (matchParts.length > 0) {
-          reasoningParts.unshift(`Matched: ${matchParts.join(", ")}.`);
-        }
-      } else if (trustFallback) {
-        const fallbackNote = hardTerms.length > 0
-          ? `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`
-          : "No exact matches found; showing closest alternatives.";
-        reasoningParts.unshift(fallbackNote);
-      }
-
-      // Reasoning header (generic, all industries)
-      const prefPairs = Object.entries(variantPreferences).filter(([,v]) => !!v);
-      if (prefPairs.length) {
-        const text = prefPairs.map(([k,v]) => `${k}=${v}`).join(", ");
-        reasoningParts.unshift(`Variant preferences: ${text}.`);
-      }
-      
-      // Add include/avoid terms to reasoning header
-      if (includeTerms.length > 0 || avoidTerms.length > 0) {
-        const includeText = includeTerms.length > 0 ? `Include: ${includeTerms.join(", ")}` : "";
-        const avoidText = avoidTerms.length > 0 ? `Avoid: ${avoidTerms.join(", ")}` : "";
-        const keywordText = [includeText, avoidText].filter(Boolean).join(". ");
-        if (keywordText) {
-          reasoningParts.unshift(keywordText + ".");
-        }
-      }
+      // Prioritize AI reasoning over technical matching details
+      // Only add trust signals if AI didn't provide reasoning (fallback case)
+      // Skip technical "Matched:", "Include:", "Variant preferences:" prefixes
+      // Note: AI reasoning check happens later when building final reasoning string
 
       // Ensure result diversity (vendor, type, price variety)
       // This improves user experience by avoiding too many similar products
@@ -4146,9 +4383,96 @@ async function processSessionInBackground({
       );
       console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandlesGuaranteed.slice(0, targetCount).length, ")");
 
-      // Final reasoning string (include relaxation notes)
-      const notes = [...relaxNotes];
-      let reasoning = [...notes, ...reasoningParts].filter(Boolean).join(" ");
+      // Final reasoning string (prioritize AI reasoning, make notes customer-friendly)
+      // Check if reasoningParts contains AI-generated reasoning (human-like, professional)
+      // AI reasoning typically doesn't contain technical prefixes like "Include:", "Matched:", etc.
+      const hasAIReasoning = reasoningParts.some(part => 
+        part && 
+        part.trim() && 
+        !part.includes("Include:") && 
+        !part.includes("Matched:") && 
+        !part.includes("Variant preferences:") &&
+        !part.includes("Broadened category") &&
+        part.length > 20 // AI reasoning is usually longer than technical notes
+      );
+      
+      let reasoning = "";
+      
+      if (hasAIReasoning) {
+        // Use AI reasoning as primary source (most human-like)
+        // Filter out technical parts and keep only customer-facing reasoning
+        const aiReasoningParts = reasoningParts.filter(part => 
+          part && 
+          !part.includes("Include:") && 
+          !part.includes("Matched:") && 
+          !part.includes("Variant preferences:") &&
+          !part.includes("Broadened category")
+        );
+        reasoning = aiReasoningParts.filter(Boolean).join(" ");
+        
+        // Only add customer-friendly context if needed
+        if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+          reasoning = "Showing the best matches we found within your budget. " + reasoning;
+        }
+      } else {
+        // Fallback: build reasoning from parts, but make it customer-friendly
+        // Remove all technical prefixes and convert to natural language
+        const customerFriendlyParts = reasoningParts
+          .filter(part => part && part.trim())
+          .map(part => {
+            // Remove technical prefixes
+            if (part.includes("Include:")) {
+              const terms = part.replace(/Include:\s*/i, "").replace(/\.$/, "");
+              return `Looking for ${terms}.`;
+            }
+            if (part.includes("Matched:")) {
+              const matches = part.replace(/Matched:\s*/i, "").replace(/\.$/, "");
+              // Extract category and attributes in customer-friendly way
+              const categoryMatch = matches.match(/category:\s*([^,]+)/i);
+              const colorMatch = matches.match(/color:\s*([^,]+)/i);
+              if (categoryMatch && colorMatch) {
+                return `Found ${categoryMatch[1].trim()} in ${colorMatch[1].trim()}.`;
+              }
+              if (categoryMatch) {
+                return `Found ${categoryMatch[1].trim()}.`;
+              }
+              return null; // Skip if can't parse nicely
+            }
+            if (part.includes("Variant preferences:")) {
+              return null; // Skip technical preferences
+            }
+            if (part.includes("Broadened category matching")) {
+              return null; // Skip technical matching notes
+            }
+            return part;
+          })
+          .filter(Boolean) as string[];
+        
+        const customerFriendlyNotes = relaxNotes.map(note => {
+          // Convert technical notes to customer-friendly language
+          if (note.includes("Broadened category matching")) {
+            return null; // Skip technical matching notes
+          }
+          if (note.includes("Budget filter relaxed")) {
+            return "Showing the closest matches within your budget.";
+          }
+          if (note.includes("out-of-stock")) {
+            return "Including some options that may have limited availability.";
+          }
+          if (note.includes("closest matches across")) {
+            return "Showing the best matches we found.";
+          }
+          return note;
+        }).filter(Boolean) as string[];
+        
+        reasoning = [...customerFriendlyNotes, ...customerFriendlyParts].filter(Boolean).join(" ");
+        
+        // If still empty or too technical, provide a default friendly message
+        if (!reasoning || reasoning.length < 10) {
+          const categoryNames = hardTerms.length > 0 ? hardTerms.join(", ") : "your preferences";
+          reasoning = `Selected the best matches for ${categoryNames}.`;
+        }
+      }
       const finalHandlesArray = Array.isArray(finalHandlesGuaranteed) ? finalHandlesGuaranteed : [];
       productHandles = (Array.isArray(diverseHandles) ? diverseHandles : finalHandlesArray).slice(0, targetCount);
       
@@ -4216,6 +4540,47 @@ async function processSessionInBackground({
       const deliveredCount = handlesToSave.length;
       const requestedCount = finalResultCount;
       const billedCount = handlesToSave.length;
+      
+      // Layer 3 final handle validation: track rejection reasons
+      const candidateMapForValidation = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+      let notFound = 0;
+      let unavailable = 0;
+      let filteredByConstraints = 0; // Note: constraints filtering happens earlier, this would be additional filtering
+      const seenHandles = new Set<string>();
+      let duplicates = 0;
+      
+      for (const handle of handlesToSave) {
+        // Check for duplicates
+        if (seenHandles.has(handle)) {
+          duplicates++;
+          continue;
+        }
+        seenHandles.add(handle);
+        
+        // Check if handle exists in candidate map
+        const candidate = candidateMapForValidation.get(handle);
+        if (!candidate) {
+          notFound++;
+          continue;
+        }
+        
+        // Check if handle is unavailable / not active
+        if (candidate.available !== true) {
+          unavailable++;
+          continue;
+        }
+      }
+      
+      // Log validation rejection reasons
+      const valid = handlesToSave.length - notFound - unavailable - duplicates;
+      console.log("[Validation] handle_rejections", {
+        requested: requestedCount,
+        valid,
+        notFound,
+        unavailable,
+        filteredByConstraints,
+        duplicates
+      });
       
       // Final invariant check: if maxPriceCeiling exists, verify finalTotalPrice doesn't exceed it
       let constraintExceeded = false;

@@ -60,15 +60,37 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       experienceLimit: entitlements.experiencesLimit,
     };
   } catch (error) {
+    // If error is a redirect Response (300-399 status or has Location header), rethrow it
+    // This allows authentication redirects (e.g., to /auth/session-token) to work normally
+    if (error instanceof Response) {
+      const status = error.status;
+      const hasLocation = error.headers.has("Location");
+      if ((status >= 300 && status < 400) || hasLocation) {
+        throw error; // Rethrow redirects immediately - don't log as error
+      }
+    }
+    
     console.error("[ExperiencesIndex] Loader error:", error);
-    const { session } = await authenticate.admin(request);
-    return {
-      shopDomain: session.shop,
-      experiences: [],
-      error: error instanceof Error ? error.message : "Failed to load experiences",
-      experienceUsed: 0,
-      experienceLimit: null,
-    };
+    try {
+      const { session } = await authenticate.admin(request);
+      return {
+        shopDomain: session.shop,
+        experiences: [],
+        error: error instanceof Error ? error.message : "Failed to load experiences",
+        experienceUsed: 0,
+        experienceLimit: null,
+      };
+    } catch (authError) {
+      // If authenticate.admin throws a redirect, rethrow it
+      if (authError instanceof Response) {
+        const status = authError.status;
+        const hasLocation = authError.headers.has("Location");
+        if ((status >= 300 && status < 400) || hasLocation) {
+          throw authError;
+        }
+      }
+      throw authError;
+    }
   }
 };
 
@@ -193,6 +215,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return { error: "Invalid action" };
     }
   } catch (error) {
+    // If error is a redirect Response (300-399 status or has Location header), rethrow it
+    // This allows authentication redirects (e.g., to /auth/session-token) to work normally
+    if (error instanceof Response) {
+      const status = error.status;
+      const hasLocation = error.headers.has("Location");
+      if ((status >= 300 && status < 400) || hasLocation) {
+        throw error; // Rethrow redirects immediately - don't log as error
+      }
+    }
+    
     console.error("[ExperiencesIndex] Action error:", error);
     return { error: error instanceof Error ? error.message : "Action failed" };
   }
