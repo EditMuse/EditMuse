@@ -1299,8 +1299,8 @@ async function processSessionInBackground({
   
   let productHandles: string[] = [];
   
-    try {
-      if (accessToken) {
+  try {
+    if (accessToken) {
       console.log("[App Proxy] Fetching products from Shopify Admin API");
       
       // Fetch products
@@ -1436,7 +1436,7 @@ async function processSessionInBackground({
           // This helps AI understand the full context better
         }
       } else if (typeof answers === "string") {
-        userIntent = answers.trim();
+        userIntent = String(answers).trim();
       }
 
       console.log("[App Proxy] User intent length:", userIntent.length);
@@ -1573,6 +1573,15 @@ async function processSessionInBackground({
       // Parse bundle intent
       const bundleIntent = parseBundleIntentGeneric(userIntent);
       console.log("[Bundle] detected:", bundleIntent.isBundle, "items:", bundleIntent.items.length, "totalBudget:", bundleIntent.totalBudget);
+      
+      // Calculate dynamic AI window - REDUCED for speed
+      // Single-item: max 40 candidates (was 60-120)
+      // Bundle: max 30 per item (was 30, but total could be 90+)
+      // No hard terms: max 30 candidates (was 60)
+      const singleItemWindow = 40;
+      const bundlePerItemWindow = 30; // Max 30 per item
+      const noHardTermsWindow = 30;
+      let aiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
       
       // For bundle/hard-term queries that require AI ranking, process asynchronously to avoid timeouts
       // Check if we need async processing (bundle queries or queries with hard terms that will use AI)
@@ -2282,10 +2291,10 @@ async function processSessionInBackground({
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
       
       // BUNDLE/HARD-TERM PATH: Continue processing
-      // Reduce AI window when no hardTerms (max 60 candidates)
-      if (hardTerms.length === 0 && aiWindow > 60) {
-        aiWindow = 60;
-        console.log("[App Proxy] AI window reduced to 60 (no hardTerms)");
+      // Reduce AI window when no hardTerms (max 30 candidates for speed)
+      if (hardTerms.length === 0 && aiWindow > noHardTermsWindow) {
+        aiWindow = noHardTermsWindow;
+        console.log("[App Proxy] AI window reduced to", noHardTermsWindow, "(no hardTerms)");
       }
       
       // Pre-rank gated candidates with BM25 + boosts
@@ -3583,25 +3592,24 @@ async function processSessionInBackground({
       console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
 
       // NOTE: Billing is NOT performed here - will be handled separately when results are delivered
-    }
-  } else {
-    console.log("[App Proxy] No access token available - skipping product fetch");
+    } else {
+      console.log("[App Proxy] No access token available - skipping product fetch");
 
-    // Save empty results if no access token
-  await saveConciergeResult({
-    sessionToken,
-      productHandles: [],
-    productIds: null,
-      reasoning: "No products available. Please ensure the app is installed and products exist.",
-  });
-        
-        // Mark session as ERROR
-        await prisma.conciergeSession.update({
-          where: { publicToken: sessionToken },
-          data: { status: ConciergeSessionStatus.FAILED },
-        }).catch(() => {});
-      }
-    } catch (error: any) {
+      // Save empty results if no access token
+      await saveConciergeResult({
+        sessionToken,
+        productHandles: [],
+        productIds: null,
+        reasoning: "No products available. Please ensure the app is installed and products exist.",
+      });
+      
+      // Mark session as FAILED
+      await prisma.conciergeSession.update({
+        where: { publicToken: sessionToken },
+        data: { status: ConciergeSessionStatus.FAILED },
+      }).catch(() => {});
+    }
+  } catch (error: any) {
       console.error("[App Proxy] Background processing failed:", error);
       // Mark session as FAILED
       await prisma.conciergeSession.update({
