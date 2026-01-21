@@ -815,13 +815,13 @@ function parseBundleIntentGeneric(userIntent: string): {
       // Fall back to single value extraction
       for (const pattern of materialPatterns) {
         const match = itemContextLower.match(pattern);
-        if (match && match[1]) {
+    if (match && match[1]) {
           const materialValue = match[1].trim().toLowerCase();
           // Check for single material value (before "or" or "/")
           const singleMaterial = materialValue.split(/\s+(?:or|\/)\s+/i)[0].trim();
           if (materials.some(m => singleMaterial.includes(m))) {
             itemMaterial = singleMaterial.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
-            break;
+        break;
           }
         }
       }
@@ -2716,6 +2716,29 @@ async function processSessionInBackground({
       const idf = calculateIDF(candidateDocs.map(d => ({ tokens: d.tokens })));
       const avgDocLen = candidateDocs.reduce((sum, d) => sum + d.tokens.length, 0) / candidateDocs.length || 1;
       
+      // Initialize variantConstraints2 BEFORE gating (needed in filter callback)
+      // Build variantPreferences with priority (Answers > Text) - needed for constraints
+      const prefsFromAnswers = parsePreferencesFromAnswers(answersJson, knownOptionNames);
+      const prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
+      const variantPreferences = mergePreferences(prefsFromAnswers, prefsFromText);
+      
+      // Build variant constraints for gating (with OR allow-list support)
+      const sizeKey = knownOptionNames.find(n => n.toLowerCase() === "size") ?? null;
+      const colorKey = knownOptionNames.find(n => ["color","colour","shade"].includes(n.toLowerCase())) ?? null;
+      const materialKey = knownOptionNames.find(n => ["material","fabric"].includes(n.toLowerCase())) ?? null;
+
+      const derived = {
+        size: sizeKey ? (variantPreferences[sizeKey] ?? null) : null,
+        color: colorKey ? (variantPreferences[colorKey] ?? null) : null,
+        material: materialKey ? (variantPreferences[materialKey] ?? null) : null,
+      };
+
+      const fromAnswersForVariant = parseConstraintsFromAnswers(answersJson);
+      const fromTextForVariant = parseConstraintsFromText(userIntent);
+      const variantConstraints = mergeConstraints(fromAnswersForVariant, fromTextForVariant);
+      const variantConstraints2 = mergeConstraints(variantConstraints, derived);
+      console.log("[App Proxy] Variant constraints:", variantConstraints2);
+      
       // Calculate BM25 scores and apply gating
       console.log("[App Proxy] [Layer 2] Applying hard gating");
       
@@ -3025,29 +3048,9 @@ async function processSessionInBackground({
       // Keep includeTerms for backward compatibility (used in existing code)
       const includeTerms = softTerms;
 
-      // Build variantPreferences with priority (Answers > Text) - needed for AI prompt
-      const prefsFromAnswers = parsePreferencesFromAnswers(answersJson, knownOptionNames);
-      const prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
-      const variantPreferences = mergePreferences(prefsFromAnswers, prefsFromText);
+      // variantPreferences and variantConstraints2 are already computed earlier (before gating)
+      // Log variantPreferences for debugging (already computed above)
       console.log("[App Proxy] Variant preferences:", variantPreferences);
-
-      // Back-compat: keep Patch 2 constraints for display/legacy prompt
-      // If you already computed variantConstraints, keep it — but fill blanks from preferences.
-      const sizeKey = knownOptionNames.find(n => n.toLowerCase() === "size") ?? null;
-      const colorKey = knownOptionNames.find(n => ["color","colour","shade"].includes(n.toLowerCase())) ?? null;
-      const materialKey = knownOptionNames.find(n => ["material","fabric"].includes(n.toLowerCase())) ?? null;
-
-      const derived = {
-        size: sizeKey ? (variantPreferences[sizeKey] ?? null) : null,
-        color: colorKey ? (variantPreferences[colorKey] ?? null) : null,
-        material: materialKey ? (variantPreferences[materialKey] ?? null) : null,
-      };
-
-      const fromAnswersForVariant = parseConstraintsFromAnswers(answersJson);
-      const fromTextForVariant = parseConstraintsFromText(userIntent);
-      const variantConstraints = mergeConstraints(fromAnswersForVariant, fromTextForVariant);
-      const variantConstraints2 = mergeConstraints(variantConstraints, derived);
-      console.log("[App Proxy] Variant constraints:", variantConstraints2);
 
       // Boost candidates that match preferences (generic, all industries)
       function getCandidateOptionValues(candidate: any, prefKey: string): string[] {
@@ -3119,9 +3122,9 @@ async function processSessionInBackground({
                   normalizeText(s) === normalizeText(sizeConstraint) ||
                   normalizeText(s).includes(normalizeText(sizeConstraint)) ||
                   normalizeText(sizeConstraint).includes(normalizeText(s))
-                );
-                if (!sizeMatch) return false;
-              }
+              );
+              if (!sizeMatch) return false;
+            }
             }
             
             // Color constraint: check allowValues first, then single value
@@ -3142,9 +3145,9 @@ async function processSessionInBackground({
                   normalizeText(col) === normalizeText(colorConstraint) ||
                   normalizeText(col).includes(normalizeText(colorConstraint)) ||
                   normalizeText(colorConstraint).includes(normalizeText(col))
-                );
-                if (!colorMatch) return false;
-              }
+              );
+              if (!colorMatch) return false;
+            }
             }
             
             // Material constraint: check allowValues first, then single value
@@ -3165,8 +3168,8 @@ async function processSessionInBackground({
                   normalizeText(m) === normalizeText(materialConstraint) ||
                   normalizeText(m).includes(normalizeText(materialConstraint)) ||
                   normalizeText(materialConstraint).includes(normalizeText(m))
-                );
-                if (!materialMatch) return false;
+              );
+              if (!materialMatch) return false;
               }
             }
             
@@ -3800,7 +3803,7 @@ async function processSessionInBackground({
         for (const h of validHandles) used.add(h);
         finalHandles = [...validHandles];
         if (ai1.reasoning) {
-          reasoningParts.push(ai1.reasoning);
+        reasoningParts.push(ai1.reasoning);
         }
         
         // Log if any cached handles were filtered out
@@ -4320,61 +4323,61 @@ async function processSessionInBackground({
         console.log("[Bundle] finalCounts per item:", finalCountsText);
         
         console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-        } else {
-          // SINGLE-ITEM PATH: Existing top-up logic
-          // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
-          if (!trustFallback) {
-            // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
-            if (gatedCandidates.length > 0) {
-              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-            }
-            // If still short after gated top-up, return fewer results (better than drift)
-            console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-          } else {
-            // Trust fallback: can use broader pool, but prefer gated first
-            if (gatedCandidates.length > 0) {
-              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-            }
-            
-            // If still short, use broader pool (allCandidatesForTopUp)
-            if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
-              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
-            }
-            
-            // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-            if (finalHandlesGuaranteed.length < finalResultCount) {
-              const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
-                const descPlain = cleanDescription((p as any).description || null);
-                const desc1000 = descPlain.substring(0, 1000);
-                return {
-                  handle: p.handle,
-                  title: p.title,
-                  productType: (p as any).productType || null,
-                  tags: p.tags || [],
-                  vendor: (p as any).vendor || null,
-                  price: p.priceAmount || p.price || null,
-                  description: (p as any).description || null,
-                  descPlain,
-                  desc1000,
-                  searchText: buildSearchText({
-                    title: p.title,
-                    productType: (p as any).productType || null,
-                    vendor: (p as any).vendor || null,
-                    tags: p.tags || [],
-                    optionValues: (p as any).optionValues ?? {},
-                    sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
-                    colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
-                    materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-                    desc1000,
-                  }),
-                  available: p.available,
-                  sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
-                  colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
-                  materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-                  optionValues: (p as any).optionValues ?? {},
-                } as EnrichedCandidate;
-              });
-              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
+      } else {
+        // SINGLE-ITEM PATH: Existing top-up logic
+      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+      if (!trustFallback) {
+        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+        if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+        }
+        // If still short after gated top-up, return fewer results (better than drift)
+          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
+      } else {
+        // Trust fallback: can use broader pool, but prefer gated first
+        if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+        }
+        
+        // If still short, use broader pool (allCandidatesForTopUp)
+          if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
+        }
+        
+        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+        if (finalHandlesGuaranteed.length < finalResultCount) {
+          const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
+            const descPlain = cleanDescription((p as any).description || null);
+            const desc1000 = descPlain.substring(0, 1000);
+            return {
+              handle: p.handle,
+              title: p.title,
+              productType: (p as any).productType || null,
+              tags: p.tags || [],
+              vendor: (p as any).vendor || null,
+              price: p.priceAmount || p.price || null,
+              description: (p as any).description || null,
+              descPlain,
+              desc1000,
+              searchText: buildSearchText({
+                title: p.title,
+                productType: (p as any).productType || null,
+                vendor: (p as any).vendor || null,
+                tags: p.tags || [],
+                optionValues: (p as any).optionValues ?? {},
+                sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                desc1000,
+              }),
+              available: p.available,
+              sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+              colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+              materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+              optionValues: (p as any).optionValues ?? {},
+            } as EnrichedCandidate;
+          });
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
             }
           }
         }
