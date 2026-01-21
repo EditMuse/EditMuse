@@ -1736,6 +1736,10 @@ async function processSessionInBackground({
   let aiMs = 0; // Reset to 0 at start of each session background processing
   let saveMs = 0;
   
+  // Declare finalHandlesGuaranteed early to ensure it's always in scope
+  // Even if an exception occurs before its normal initialization
+  let finalHandlesGuaranteed: string[] = [];
+  
   try {
     if (accessToken) {
       const shopifyFetchStart = performance.now();
@@ -4149,7 +4153,8 @@ async function processSessionInBackground({
 
       // Hard guarantee: top-up after AI ranking (intent-safe enforcement)
       // Ensure validatedHandles is always an array to prevent errors
-      let finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+      // finalHandlesGuaranteed is already declared above, just initialize it here
+      finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
 
       // Bundle-safe top-up: only from bundle item pools
       if (isBundleMode && bundleIntent.items.length >= 2) {
@@ -4328,8 +4333,8 @@ async function processSessionInBackground({
         // SINGLE-ITEM PATH: Existing top-up logic
         // Ensure finalHandlesGuaranteed is initialized from validatedHandles (which comes from finalHandles)
         // This ensures it's always properly initialized before use in single-item mode
-        // finalHandlesGuaranteed is declared at line 4151, but we ensure it's set from the correct source
-        if (!finalHandlesGuaranteed || finalHandlesGuaranteed.length === 0) {
+        // finalHandlesGuaranteed is already declared at function scope, ensure it's initialized here
+        if (finalHandlesGuaranteed.length === 0) {
           finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
         }
         
