@@ -4325,27 +4325,34 @@ async function processSessionInBackground({
         console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
       } else {
         // SINGLE-ITEM PATH: Existing top-up logic
-      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
-      if (!trustFallback) {
-        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
-        if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-        }
-        // If still short after gated top-up, return fewer results (better than drift)
-          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-      } else {
-        // Trust fallback: can use broader pool, but prefer gated first
-        if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+        // Ensure finalHandlesGuaranteed is initialized from validatedHandles (which comes from finalHandles)
+        // This ensures it's always properly initialized before use in single-item mode
+        // finalHandlesGuaranteed is declared at line 4151, but we ensure it's set from the correct source
+        if (!finalHandlesGuaranteed || finalHandlesGuaranteed.length === 0) {
+          finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
         }
         
-        // If still short, use broader pool (allCandidatesForTopUp)
+        // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+        if (!trustFallback) {
+          // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+          if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+          }
+          // If still short after gated top-up, return fewer results (better than drift)
+          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
+        } else {
+          // Trust fallback: can use broader pool, but prefer gated first
+          if (gatedCandidates.length > 0) {
+            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+          }
+          
+          // If still short, use broader pool (allCandidatesForTopUp)
           if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
             finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
-        }
-        
-        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-        if (finalHandlesGuaranteed.length < finalResultCount) {
+          }
+          
+          // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+          if (finalHandlesGuaranteed.length < finalResultCount) {
           const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
             const descPlain = cleanDescription((p as any).description || null);
             const desc1000 = descPlain.substring(0, 1000);
