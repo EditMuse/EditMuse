@@ -3873,7 +3873,7 @@ async function processSessionInBackground({
           break;
           }
       }
-        } // End of top-up condition check
+        } // End of top-up condition check (closes if (aiSucceeded && ...))
       } else if (isBundleMode) {
         // Bundle mode: Only top-up if AI succeeded AND we need more results
         // Check if AI succeeded (has handles from AI selection)
@@ -4320,61 +4320,62 @@ async function processSessionInBackground({
         console.log("[Bundle] finalCounts per item:", finalCountsText);
         
         console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-      } else {
-        // SINGLE-ITEM PATH: Existing top-up logic
-      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
-      if (!trustFallback) {
-        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
-        if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-        }
-        // If still short after gated top-up, return fewer results (better than drift)
-          console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-      } else {
-        // Trust fallback: can use broader pool, but prefer gated first
-        if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-        }
-        
-        // If still short, use broader pool (allCandidatesForTopUp)
-          if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
-        }
-        
-        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-        if (finalHandlesGuaranteed.length < finalResultCount) {
-          const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
-            const descPlain = cleanDescription((p as any).description || null);
-            const desc1000 = descPlain.substring(0, 1000);
-            return {
-              handle: p.handle,
-              title: p.title,
-              productType: (p as any).productType || null,
-              tags: p.tags || [],
-              vendor: (p as any).vendor || null,
-              price: p.priceAmount || p.price || null,
-              description: (p as any).description || null,
-              descPlain,
-              desc1000,
-              searchText: buildSearchText({
-                title: p.title,
-                productType: (p as any).productType || null,
-                vendor: (p as any).vendor || null,
-                tags: p.tags || [],
-                optionValues: (p as any).optionValues ?? {},
-                sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
-                colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
-                materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-                desc1000,
-              }),
-              available: p.available,
-              sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
-              colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
-              materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
-              optionValues: (p as any).optionValues ?? {},
-            } as EnrichedCandidate;
-          });
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
+        } else {
+          // SINGLE-ITEM PATH: Existing top-up logic
+          // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+          if (!trustFallback) {
+            // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+            if (gatedCandidates.length > 0) {
+              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+            }
+            // If still short after gated top-up, return fewer results (better than drift)
+            console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
+          } else {
+            // Trust fallback: can use broader pool, but prefer gated first
+            if (gatedCandidates.length > 0) {
+              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+            }
+            
+            // If still short, use broader pool (allCandidatesForTopUp)
+            if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
+              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
+            }
+            
+            // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+            if (finalHandlesGuaranteed.length < finalResultCount) {
+              const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
+                const descPlain = cleanDescription((p as any).description || null);
+                const desc1000 = descPlain.substring(0, 1000);
+                return {
+                  handle: p.handle,
+                  title: p.title,
+                  productType: (p as any).productType || null,
+                  tags: p.tags || [],
+                  vendor: (p as any).vendor || null,
+                  price: p.priceAmount || p.price || null,
+                  description: (p as any).description || null,
+                  descPlain,
+                  desc1000,
+                  searchText: buildSearchText({
+                    title: p.title,
+                    productType: (p as any).productType || null,
+                    vendor: (p as any).vendor || null,
+                    tags: p.tags || [],
+                    optionValues: (p as any).optionValues ?? {},
+                    sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                    colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                    materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                    desc1000,
+                  }),
+                  available: p.available,
+                  sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                  colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                  materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                  optionValues: (p as any).optionValues ?? {},
+                } as EnrichedCandidate;
+              });
+              finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
+            }
           }
         }
       }
