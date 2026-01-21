@@ -846,6 +846,10 @@ export async function rankProductsWithAI(
     return truncated;
   }
   
+  // Track candidate set size for retry with smaller set when parsed output missing
+  // Declare currentCandidates early so it can be used in buildProductList and buildUserPrompt
+  let currentCandidates = candidates;
+  
   // Build product list for prompt (limit to 200)
   // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
   // This function can be called with shortened=true to reduce payload for retries
@@ -1358,8 +1362,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let lastParseFailReason: string | undefined = undefined;
   const candidateHandles = new Set(candidates.map(p => p.handle));
   
-  // Track candidate set size for retry with smaller set when parsed output missing
-  let currentCandidates = candidates;
+  // currentCandidates is already declared above (before buildProductList and buildUserPrompt)
   
   // Adaptive timeout function based on candidateCount and productListJsonChars
   function calculateAdaptiveTimeout(candidateCount: number, productListJsonChars: number): number {

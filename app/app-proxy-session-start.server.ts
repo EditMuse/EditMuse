@@ -4148,7 +4148,8 @@ async function processSessionInBackground({
       }
 
       // Hard guarantee: top-up after AI ranking (intent-safe enforcement)
-      let finalHandlesGuaranteed = uniq(validatedHandles);
+      // Ensure validatedHandles is always an array to prevent errors
+      let finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
 
       // Bundle-safe top-up: only from bundle item pools
       if (isBundleMode && bundleIntent.items.length >= 2) {
