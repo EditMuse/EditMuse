@@ -97,6 +97,55 @@ const MAX_RETRIES = 1; // Max 1 retry, so at most 2 attempts total (initial atte
 const CACHE_DURATION_HOURS = 0; // Cache disabled - always use fresh AI ranking
 const MAX_DESCRIPTION_LENGTH = 1000; // Increased from 200 to allow full description analysis
 
+// Service tier configuration for Responses API
+const SERVICE_TIER_VALUES = ["auto", "default", "priority", "flex"] as const;
+type ServiceTier = typeof SERVICE_TIER_VALUES[number];
+const getServiceTier = (): ServiceTier => {
+  const envTier = process.env.OPENAI_SERVICE_TIER?.toLowerCase();
+  if (envTier && SERVICE_TIER_VALUES.includes(envTier as ServiceTier)) {
+    return envTier as ServiceTier;
+  }
+  return "auto"; // Default value
+};
+
+// Prompt cache configuration
+const SCHEMA_VERSION = "1.0"; // Schema version for prompt cache key stability
+const getPromptCacheRetention = (): string => {
+  return process.env.OPENAI_PROMPT_CACHE_RETENTION ?? "24h";
+};
+
+// Generate stable prompt cache key (industry-agnostic)
+function generatePromptCacheKey(
+  schemaVersion: string,
+  experienceId: string | null | undefined,
+  mode: "single" | "bundle",
+  candidateCount: number
+): string {
+  // Bucket candidate count for stability (0-20, 21-40, 41-60, etc.)
+  const candidateCountBucket = Math.floor(candidateCount / 20) * 20;
+  
+  // Create stable cache key components
+  const keyData = {
+    schemaVersion,
+    experienceId: experienceId || "default",
+    mode,
+    candidateCountBucket,
+  };
+  
+  // Hash the key data for stable cache key
+  // Using a simple hash since we want deterministic keys
+  const keyString = JSON.stringify(keyData);
+  let hash = 0;
+  for (let i = 0; i < keyString.length; i++) {
+    const char = keyString.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  
+  // Return positive hash as hex string
+  return `editmuse_${Math.abs(hash).toString(16)}`;
+}
+
 // Models that support JSON mode (response_format: { type: "json_object" })
 const JSON_MODE_SUPPORTED_MODELS = new Set([
   "gpt-4o",
@@ -632,6 +681,7 @@ async function setCachedRanking(
  * @param includeTerms - Keywords to include in results
  * @param avoidTerms - Keywords to avoid in results
  * @param hardConstraints - Hard constraints (hardTerms, hardFacets, avoidTerms, trustFallback)
+ * @param experienceId - Experience ID for prompt cache key (optional)
  * @returns Ranked product handles and reasoning (always returns a result, falls back to deterministic ranking if AI fails)
  */
 export async function rankProductsWithAI(
@@ -644,7 +694,8 @@ export async function rankProductsWithAI(
   variantPreferences?: Record<string, string>,
   includeTerms?: string[],
   avoidTerms?: string[],
-  hardConstraints?: HardConstraints
+  hardConstraints?: HardConstraints,
+  experienceId?: string | null
 ): Promise<{ 
   selectedHandles: string[];
   reasoning?: string | null;
@@ -798,10 +849,13 @@ export async function rankProductsWithAI(
   // Build product list for prompt (limit to 200)
   // Reduced payload: truncate descriptions, cap arrays, remove searchText, cap optionValues
   // This function can be called with shortened=true to reduce payload for retries
+  // Uses currentCandidates (may be reduced on retry) instead of original candidates
   function buildProductList(shortened: boolean = false, compressed: boolean = false): string {
+    const candidatesToUse = currentCandidates;
+    const maxCandidates = 200;
     if (compressed) {
       // Compressed mode: include key structured fields + smart-truncated description with key info preserved
-      return candidates.slice(0, 200).map((p, idx) => {
+      return candidatesToUse.slice(0, maxCandidates).map((p, idx) => {
         const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
         const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 10).join(", ") : "none";
         const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 10).join(", ") : "none";
@@ -828,7 +882,7 @@ export async function rankProductsWithAI(
     
     const descLimit = shortened ? 400 : 500;
     
-    return candidates.slice(0, 200).map((p, idx) => {
+    return candidatesToUse.slice(0, maxCandidates).map((p, idx) => {
     // Cap tags to max 20
     const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
     
@@ -1082,11 +1136,12 @@ REQUIREMENTS:
   }, null, 2);
 
   // Build user prompt (can be shortened or compressed for retries)
+  // Uses currentCandidates (may be reduced on retry) instead of original candidates
   function buildUserPrompt(shortened: boolean = false, compressed: boolean = false): string {
     if (isBundle && bundleItems.length >= 2) {
       // BUNDLE MODE: Group candidates by itemIndex
       const candidatesByItem = new Map<number, ProductCandidate[]>();
-      for (const c of candidates) {
+      for (const c of currentCandidates) {
         const itemIdx = (c as any)._bundleItemIndex;
         if (typeof itemIdx === "number") {
           if (!candidatesByItem.has(itemIdx)) {
@@ -1303,21 +1358,64 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let lastParseFailReason: string | undefined = undefined;
   const candidateHandles = new Set(candidates.map(p => p.handle));
   
-  // Determine timeout based on mode (bundle uses stricter timeout)
-  const timeoutMs = isBundle ? TIMEOUT_MS_BUNDLE : TIMEOUT_MS;
+  // Track candidate set size for retry with smaller set when parsed output missing
+  let currentCandidates = candidates;
   
-  // Log time budget for AI ranking
-  if (isBundle) {
-    console.log("[AI Ranking] time_budget_bundle", { timeoutMsBundle: TIMEOUT_MS_BUNDLE, maxRetries: MAX_RETRIES });
-  } else {
-    console.log("[AI Ranking] time_budget", { timeoutMs: TIMEOUT_MS, maxRetries: MAX_RETRIES });
+  // Adaptive timeout function based on candidateCount and productListJsonChars
+  function calculateAdaptiveTimeout(candidateCount: number, productListJsonChars: number): number {
+    // <= 20 candidates and <= 12k chars: 15s
+    if (candidateCount <= 20 && productListJsonChars <= 12000) {
+      return 15000;
+    }
+    // <= 40 candidates or <= 25k chars: 25s
+    if (candidateCount <= 40 || productListJsonChars <= 25000) {
+      return 25000;
+    }
+    // else: 40s (hard cap)
+    return 40000;
   }
   
+  // Response metadata variables (declared outside loop for catch block access)
+  let responseStatus: number | null = null;
+  let responseId: string | null = null;
+  let bodyResponseId: string | null = null;
+  
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Calculate timeout for this attempt (needed in catch block)
+    let timeoutMs = 40000; // Default to hard cap
+    
+    // Reset response metadata for each attempt
+    responseStatus = null;
+    responseId = null;
+    bodyResponseId = null;
+    
     try {
       const isRetry = attempt > 0;
       // Use compressed prompt if: retry with parse failure OR adaptive compression triggered on first attempt
       const useCompressedPrompt = (isRetry && lastParseFailReason !== undefined) || (attempt === 0 && shouldUseCompressedFirst);
+      
+      // On retry after missing parsed output, use smaller candidate set (reduce by 30-50%)
+      if (isRetry && lastParseFailReason === "Missing parsed output in SDK response" && currentCandidates.length === candidates.length) {
+        // Reduce by 30-50% (using 30% reduction as existing logic)
+        const reductionFactor = 0.7; // 30% reduction (keeps 70%)
+        currentCandidates = candidates.slice(0, Math.floor(candidates.length * reductionFactor));
+        console.log("[AI Ranking] Retrying with smaller candidate set", { 
+          original: candidates.length, 
+          retry: currentCandidates.length,
+          reduction: `${Math.round((1 - reductionFactor) * 100)}%`
+        });
+      }
+      
+      // Calculate current productListJsonChars based on currentCandidates and compression
+      const currentProductList = useCompressedPrompt ? buildProductList(false, true) : (attempt === 0 ? productList : buildProductList(false));
+      const currentProductListJsonChars = JSON.stringify(currentProductList).length;
+      const currentCandidateCount = currentCandidates.length;
+      
+      // Calculate adaptive timeout based on current state
+      timeoutMs = calculateAdaptiveTimeout(currentCandidateCount, currentProductListJsonChars);
+      
+      // Log timeout decision
+      console.log("[AI Ranking] timeoutMs=", timeoutMs, "candidateCount=", currentCandidateCount, "productListJsonChars=", currentProductListJsonChars);
       
       if (isRetry) {
         console.log(`[AI Ranking] Retry attempt ${attempt} of ${MAX_RETRIES}${useCompressedPrompt ? " (using compressed prompt)" : ""}`);
@@ -1345,12 +1443,12 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // even when calling /v1/chat/completions with json_schema strict mode
       let apiUsed: "responses" | "chat";
       
-      // Always use strict structured outputs (JSON schema with strict: true)
+      // Use Responses API Structured Outputs with strict JSON schema
       // This guarantees valid JSON output that matches the schema exactly
       if (supportsJsonSchema) {
-        // Using Responses API structure (json_schema with strict: true)
-        // Still call /v1/chat/completions but response includes Responses API fields
+        // Responses API Structured Outputs: use json_schema with strict: true
         apiUsed = "responses";
+        const serviceTier = getServiceTier();
         requestBody.response_format = {
           type: "json_schema",
           json_schema: {
@@ -1359,7 +1457,22 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             schema: buildJsonSchema(isBundle),
           },
         };
-        console.log("[AI Ranking] structured_outputs=true using Responses API structure");
+        // Add service_tier for Responses API
+        requestBody.service_tier = serviceTier;
+        
+        // Add prompt cache for Responses API
+        const promptCacheKey = generatePromptCacheKey(
+          SCHEMA_VERSION,
+          experienceId,
+          isBundle ? "bundle" : "single",
+          currentCandidateCount
+        );
+        const promptCacheRetention = getPromptCacheRetention();
+        requestBody.prompt_cache_key = promptCacheKey;
+        requestBody.prompt_cache_retention = promptCacheRetention;
+        console.log("[AI Ranking] structured_outputs=true");
+        console.log("[AI Ranking] service_tier=", serviceTier);
+        console.log("[AI Ranking] prompt_cache_key_set=true retention=", promptCacheRetention);
       } else {
         // Fallback for models that don't support json_schema - use chat.completions only
         apiUsed = "chat";
@@ -1381,85 +1494,98 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
 
       clearTimeout(timeoutId);
 
+      // Extract response metadata before consuming body
+      responseStatus = response.status;
+      responseId = response.headers.get("x-request-id") || response.headers.get("openai-request-id") || null;
+      
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[AI Ranking] OpenAI API error:", response.status, errorText);
-        lastError = new Error(`OpenAI API error: ${response.status}`);
-        lastParseFailReason = `API error: ${response.status}`;
+        let errorData: any = null;
+        try {
+          const errorText = await response.text();
+          // Try to parse error JSON if possible (no PII expected)
+          try {
+            errorData = JSON.parse(errorText);
+          } catch {
+            // Keep as text if not JSON
+            errorData = { raw: errorText.substring(0, 200) }; // Truncate for safety
+          }
+        } catch {
+          // Ignore errors reading response body
+        }
+        
+        // Extract error type/code from response if available
+        const errorType = errorData?.error?.type || errorData?.type || null;
+        const errorCode = errorData?.error?.code || errorData?.code || null;
+        
+        // Determine fail reason (short description, no PII)
+        let failReason = `HTTP ${responseStatus}`;
+        if (errorType) failReason += ` ${errorType}`;
+        if (errorCode) failReason += ` (${errorCode})`;
+        
+        // Structured error log
+        const logData: any = {
+          attempt: attempt + 1,
+          status: responseStatus,
+          fail_type: "http",
+          fail_reason: failReason,
+        };
+        if (responseId) logData.response_id = responseId;
+        if (errorType) logData.error_type = errorType;
+        if (errorCode) logData.error_code = errorCode;
+        console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, responseId ? `response_id=${responseId}` : "");
+        
+        lastError = new Error(`OpenAI API error: ${responseStatus}`);
+        lastParseFailReason = failReason;
         continue; // Try again if retries remaining
       }
 
-      const responseStatus = response.status; // Store status before consuming response body
       const data = await response.json();
       
-      // Strict runtime assertion: verify structured output contract is active
-      // When using Responses API structure (json_schema strict), we must receive Responses API fields
-      if (apiUsed === "responses") {
-        const hasOutput = Array.isArray(data.output);
-        const hasOutputParsed = Boolean(data.output_parsed && typeof data.output_parsed === "object");
-        if (!hasOutput && !hasOutputParsed) {
-          const responseKeys = Object.keys(data);
-          console.log("[AI Ranking] structured_outputs_contract_missing", {
-            model,
-            apiUsed,
-            keys: responseKeys.join(","),
-            note: "response_format not applied or wrong SDK method"
-          });
-          lastError = new Error("Structured outputs contract missing - no output or output_parsed fields");
-          lastParseFailReason = "Structured outputs contract missing - response_format not applied or wrong SDK method";
-          console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-          continue; // Try again if retries remaining
-        }
+      // Extract response ID from response body if present (OpenAI sometimes includes this)
+      bodyResponseId = data.id || data.request_id || null;
+      
+      // Log service tier from response if available (Responses API)
+      if (apiUsed === "responses" && data.service_tier) {
+        console.log("[AI Ranking] service_tier_response=", data.service_tier);
       }
       
-      // Extract text content for debug log (if available)
-      const extractedText = data.choices?.[0]?.message?.content || (typeof data.output?.[0] === "string" ? data.output[0] : null);
-      
-      // When using Responses API structure (json_schema strict), prioritize Responses API fields
-      // When using chat.completions only, read from choices[0].message structure
+      // Read parsed output from SDK's documented location (Responses API Structured Outputs)
+      // Official SDK location: response.output_parsed (top-level parsed accessor)
+      // Do NOT inspect text content or check other locations - only use documented parsed field
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
       if (apiUsed === "responses") {
-        // Responses API structure: check output_parsed first (top-level parsed accessor)
+        // Responses API Structured Outputs: read from official SDK parsed location
+        // The SDK provides parsed output in output_parsed field when using json_schema strict
         if (data.output_parsed && typeof data.output_parsed === "object") {
           structuredResult = data.output_parsed as StructuredRankingResult | StructuredBundleResult;
-        } 
-        // Then check output[] array (Responses API structure)
-        else if (Array.isArray(data.output)) {
-          for (const outputItem of data.output) {
-            // Check for parsed output in output item
-            if (outputItem.parsed && typeof outputItem.parsed === "object") {
-              structuredResult = outputItem.parsed as StructuredRankingResult | StructuredBundleResult;
-              break;
-            }
-            // Check if output item itself is the structured result
-            if (outputItem && typeof outputItem === "object" && !Array.isArray(outputItem) && 
-                ("selected" in outputItem || "selected_by_item" in outputItem)) {
-              structuredResult = outputItem as StructuredRankingResult | StructuredBundleResult;
-              break;
-            }
-          }
-        }
-        // If Responses API fields not found but choices present, check choices[0].message.parsed
-        // (some SDK versions may place parsed output there even with Responses API)
-        if (!structuredResult) {
-          const message = data.choices?.[0]?.message;
-          if (message?.parsed && typeof message.parsed === "object") {
-            structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
-          }
         }
       } else {
-        // Chat.completions API only: check choices[0].message structure
+        // Chat.completions API (json_object mode): check choices[0].message structure
         const message = data.choices?.[0]?.message;
         if (message) {
           // Check for refusal
           if (message.refusal) {
-            console.error("[AI Ranking] Model refused to generate structured output:", message.refusal);
+            const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+            
+            // Structured error log for model refusal
+            const logData: any = {
+              attempt: attempt + 1,
+              status: responseStatus || "unknown",
+              fail_type: "parse",
+              fail_reason: "Model refusal",
+            };
+            if (refusalResponseId) logData.response_id = refusalResponseId;
+            console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, refusalResponseId ? `response_id=${refusalResponseId}` : "");
+            
+            // Also log refusal details (safe, no PII)
+            console.log("[AI Ranking] Model refused to generate structured output");
+            
             lastError = new Error("Model refused to generate structured output");
             lastParseFailReason = "Model refusal";
             continue; // Try again if retries remaining
           }
-          
+
           // Check for parsed field (may be present in some SDK versions)
           if (message.parsed && typeof message.parsed === "object") {
             structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
@@ -1470,31 +1596,46 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           }
         }
       }
-      
-      // Check top-level parsed field (fallback for either API structure)
-      if (!structuredResult && data.parsed && typeof data.parsed === "object") {
-        structuredResult = data.parsed as StructuredRankingResult | StructuredBundleResult;
-      }
 
-      // If parsed output is missing, log diagnostic and treat as AI failure
-      // Do NOT attempt JSON.parse on raw content - strict mode requires pre-parsed output
+      // If parsed output is missing from SDK's documented location, treat as hard failure
+      // Retry once with smaller candidate set if this is first attempt
       if (!structuredResult) {
-        // Guard log before fallback (one line, compact)
+        // Log response shape for debugging (no PII)
         const responseKeys = Object.keys(data);
-        console.log("[AI Ranking] structured_outputs_debug", {
+        
+        // Extract response/request ID from response if present
+        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        
+        // Structured error log for parse failure
+        const logData: any = {
+          attempt: attempt + 1,
+          status: responseStatus || "unknown",
+          fail_type: "parse",
+          fail_reason: "Missing parsed output in SDK response",
+        };
+        if (parseResponseId) logData.response_id = parseResponseId;
+        console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, parseResponseId ? `response_id=${parseResponseId}` : "");
+        
+        // Also log detailed debug info (separate log line)
+        console.log("[AI Ranking] structured_outputs missing parsed output", {
+          model,
           apiUsed,
           keys: responseKeys.join(","),
-          hasOutput: Array.isArray(data.output),
-          hasOutputParsed: Boolean(data.output_parsed),
-          hasChoices: Boolean(data.choices),
-          hasText: Boolean(extractedText)
+          attempt
         });
         
-        lastError = new Error("Structured outputs missing parsed output");
-        lastParseFailReason = "Missing parsed output in structured response";
-        console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
-        // This triggers compressed retry or fallback (no JSON.parse fallback)
-        continue; // Try again if retries remaining
+        lastError = new Error("Structured outputs missing parsed output from SDK");
+        lastParseFailReason = "Missing parsed output in SDK response";
+        
+        // If first attempt and we have many candidates, retry with smaller set
+        // (currentCandidates will be updated at start of next iteration)
+        if (attempt === 0 && currentCandidates.length > 20) {
+          // Continue to retry - currentCandidates will be reduced in next iteration
+          continue;
+        }
+        
+        // If retry already attempted or too few candidates, proceed to fallback
+        continue; // This will eventually fallback after MAX_RETRIES
       }
 
       console.log("[AI Ranking] Successfully parsed structured output (strict mode)");
@@ -1823,14 +1964,61 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
     } catch (error: any) {
       lastError = error;
+      
+      // Determine fail type and reason
+      // Use responseStatus/responseId from try block if available (response was received)
+      let failType: "timeout" | "parse" | "http" | "unknown";
+      let failReason: string;
+      let httpStatus: number | null = responseStatus;
+      let errorResponseId: string | null = responseId || bodyResponseId;
+      
       if (error.name === "AbortError") {
-        console.error("[AI Ranking] Request timeout after", timeoutMs, "ms", attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
-        lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
+        failType = "timeout";
+        failReason = `Request timeout after ${timeoutMs}ms`;
+        // Timeout means no response was received
+        httpStatus = null;
+        errorResponseId = null;
+      } else if (error.response) {
+        // HTTP error caught in fetch (response object exists but indicates error)
+        failType = "http";
+        httpStatus = error.response.status || responseStatus || null;
+        errorResponseId = error.response.headers?.["x-request-id"] || error.response.headers?.["openai-request-id"] || responseId || null;
+        failReason = httpStatus ? `HTTP ${httpStatus}` : "HTTP error";
+        if (error.message) {
+          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        }
+      } else if (httpStatus !== null) {
+        // We got a response but parsing or processing failed
+        failType = "parse";
+        failReason = "Response processing error";
+        if (error.message) {
+          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        }
+      } else if (error.message && (error.message.includes("JSON") || error.message.includes("parse"))) {
+        // Parse error before response received
+        failType = "parse";
+        failReason = "Parse error";
+        if (error.message) {
+          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        }
       } else {
-        console.error("[AI Ranking] Error:", error.message || error, attempt < MAX_RETRIES ? "- will retry" : "- max retries reached");
-        lastParseFailReason = `Exception: ${error.message || String(error)}`;
+        // Unknown error (network, etc.)
+        failType = "unknown";
+        failReason = error.message ? error.message.substring(0, 100) : String(error).substring(0, 100); // Truncate for safety
       }
-      console.log("[AI Ranking] parse_fail_reason=", lastParseFailReason);
+      
+      // Structured error log
+      const logData: any = {
+        attempt: attempt + 1,
+        status: httpStatus || "unknown",
+        fail_type: failType,
+        fail_reason: failReason,
+      };
+      if (errorResponseId) logData.response_id = errorResponseId;
+      console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, errorResponseId ? `response_id=${errorResponseId}` : "");
+      
+      lastParseFailReason = failReason;
+      
       // Continue to next attempt if retries remaining
       if (attempt < MAX_RETRIES) {
         continue;

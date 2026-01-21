@@ -1522,14 +1522,15 @@ export async function proxySessionStartAction(
     }, { status: 403 });
   }
 
-  // Calculate dynamic AI window - REDUCED for speed
-  // Single-item: max 40 candidates (was 60-120)
-  // Bundle: max 60 per item (MAX_BUNDLE_PRE_AI_PER_ITEM) for pre-AI gating/ranking
-  // Bundle: max 25 per item (MAX_BUNDLE_AI_PER_ITEM) for AI candidate window
+  // Calculate dynamic AI window - SMALL-FIRST approach
+  // Single-item: 20 candidates for first AI attempt (was 40)
+  // Bundle: 15 per item for first AI attempt (was 25)
+  // Pre-AI gating/ranking still uses larger pools for quality
   // No hard terms: max 30 candidates (was 60)
-  const singleItemWindow = 40;
+  const singleItemWindow = 40; // For top-up and other uses
+  const SINGLE_ITEM_AI_WINDOW = 20; // Small-first: first AI attempt only
   const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
-  const MAX_BUNDLE_AI_PER_ITEM = 25; // Max candidates per item sent to bundle AI ranking
+  const MAX_BUNDLE_AI_PER_ITEM = 15; // Small-first: first AI attempt only (was 25)
   const noHardTermsWindow = 30;
   const baseAiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
   
@@ -2089,14 +2090,15 @@ async function processSessionInBackground({
       // Bundle detection already logged in parseBundleIntentGeneric
       // Additional log for reference: bundleIntent.isBundle, items.length, totalBudget
       
-      // Calculate dynamic AI window - REDUCED for speed
-      // Single-item: max 40 candidates (was 60-120)
-      // Bundle: max 60 per item (MAX_BUNDLE_PRE_AI_PER_ITEM) for pre-AI gating/ranking
-      // Bundle: max 25 per item (MAX_BUNDLE_AI_PER_ITEM) for AI candidate window
+      // Calculate dynamic AI window - SMALL-FIRST approach
+      // Single-item: 20 candidates for first AI attempt (was 40)
+      // Bundle: 15 per item for first AI attempt (was 25)
+      // Pre-AI gating/ranking still uses larger pools for quality
       // No hard terms: max 30 candidates (was 60)
-      const singleItemWindow = 40;
+      const singleItemWindow = 40; // For top-up and other uses
+      const SINGLE_ITEM_AI_WINDOW = 20; // Small-first: first AI attempt only
       const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
-      const MAX_BUNDLE_AI_PER_ITEM = 25; // Max candidates per item sent to bundle AI ranking
+      const MAX_BUNDLE_AI_PER_ITEM = 15; // Small-first: first AI attempt only (was 25)
       const noHardTermsWindow = 30;
       let aiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
       
@@ -3303,17 +3305,23 @@ async function processSessionInBackground({
       let used = new Set<string>();
       let offset = 0;
 
+      // Bundle AI tracking variables (declared here to be accessible for top-up logic)
+      let bundleAiSucceeded = false;
+      let parseFailReason: string | undefined = undefined;
+      let bundleFinalHandles: string[] = []; // Store AI results for top-up check
+
       // Bundle handling: use AI bundle ranking
       if (isBundleMode && bundleIntent.items.length >= 2) {
         console.log("[Bundle] Using AI bundle ranking");
         
-        // For bundle mode, take top MAX_BUNDLE_AI_PER_ITEM per item from per-item BM25-ranked lists
+        // Small-first approach: take top MAX_BUNDLE_AI_PER_ITEM (15) per item for first AI attempt
         // itemGatedPools contains BM25-ranked candidates per item (already sorted by score)
+        // On retry, use same small window (do not expand)
         const bundleCandidatesForAI: any[] = [];
         const itemCounts = new Map<number, number>(); // Track counts per item for logging
         
         for (const pool of itemGatedPools) {
-          // Take only top MAX_BUNDLE_AI_PER_ITEM from each item's ranked list
+          // Take only top MAX_BUNDLE_AI_PER_ITEM (15) from each item's ranked list for small-first
           const aiCandidatesForItem = pool.candidates.slice(0, MAX_BUNDLE_AI_PER_ITEM);
           itemCounts.set(pool.itemIndex, aiCandidatesForItem.length);
           
@@ -3345,7 +3353,9 @@ async function processSessionInBackground({
           }
         }
         
-        console.log("[Perf] bundle_ai_window", {
+        // Log AI window used (small-first approach)
+        console.log("[Perf] ai_window_used", {
+          flow: "bundle",
           perItem: MAX_BUNDLE_AI_PER_ITEM,
           suitCount,
           shirtCount,
@@ -3399,8 +3409,10 @@ async function processSessionInBackground({
         if (hardFacets.material) hardFacetsForAI.material = [hardFacets.material];
         
         // Track whether AI returned valid parsed structured output
-        let bundleAiSucceeded = false;
-        let parseFailReason: string | undefined = undefined;
+        // Variables already declared above for top-up access
+        bundleAiSucceeded = false;
+        parseFailReason = undefined;
+        bundleFinalHandles = [];
         
         // Measure aiMs ONLY around the actual AI call
         const aiStartBundle = performance.now();
@@ -3427,7 +3439,8 @@ async function processSessionInBackground({
                 quantity: item.quantity,
                 budgetMax: item.budgetMax,
               })),
-            }
+            },
+            experienceIdUsed
           );
           // Measure aiMs immediately after AI call completes
           aiMs += Math.round(performance.now() - aiStartBundle);
@@ -3485,6 +3498,7 @@ async function processSessionInBackground({
             );
             
             finalHandles = selectionResult.handles;
+            bundleFinalHandles = finalHandles; // Store for top-up check
             if (selectionResult.trustFallback) {
               trustFallback = true;
             }
@@ -3571,6 +3585,7 @@ async function processSessionInBackground({
             );
             
             finalHandles = selectionResult.handles;
+            bundleFinalHandles = finalHandles; // Store for top-up check
             if (selectionResult.trustFallback) {
               trustFallback = true;
             }
@@ -3634,6 +3649,7 @@ async function processSessionInBackground({
           );
           
           finalHandles = selectionResult.handles;
+          bundleFinalHandles = finalHandles; // Store for top-up check
           if (selectionResult.trustFallback) {
             trustFallback = true;
           }
@@ -3670,8 +3686,16 @@ async function processSessionInBackground({
         }
         console.log("[Bundle] trustFallback=", trustFallback);
       } else {
-        // SINGLE-ITEM PATH: Existing AI ranking logic
-      const window1 = buildWindow(offset, used);
+        // SINGLE-ITEM PATH: Small-first approach - use SINGLE_ITEM_AI_WINDOW (20) for first attempt
+        // On retry, use same small window (do not expand)
+        const window1 = sortedCandidates.slice(0, SINGLE_ITEM_AI_WINDOW).filter(c => !used.has(c.handle));
+        
+        // Log AI window used (small-first approach)
+        console.log("[Perf] ai_window_used", {
+          flow: "single_item",
+          windowSize: SINGLE_ITEM_AI_WINDOW,
+          actualCount: window1.length,
+        });
       
       // Fetch descriptions only for AI candidate window
       if (window1.length > 0 && accessToken) {
@@ -3743,7 +3767,8 @@ async function processSessionInBackground({
               budgetMax: item.budgetMax,
             })),
           } : {}),
-        }
+        },
+        experienceIdUsed
       );
         // Measure aiMs immediately after AI call completes
         aiMs += Math.round(performance.now() - aiStartSingle);
@@ -3816,9 +3841,13 @@ async function processSessionInBackground({
       }
 
       // TOP-UP PASSES (deterministic selection from pre-ranked candidates)
+      // Only perform top-up if AI succeeded AND we need more results
       if (!isBundleMode) {
-      // Select remaining products deterministically from sortedCandidates (already BM25-ranked)
-      while (finalHandles.length < targetCount) {
+        // Only top-up if AI succeeded (has handles) AND we need more
+        const aiSucceeded = finalHandles.length > 0;
+        if (aiSucceeded && finalHandles.length < targetCount) {
+          // Select remaining products deterministically from sortedCandidates (already BM25-ranked)
+          while (finalHandles.length < targetCount) {
         // Get next candidates from sorted list (already ranked by BM25 + boosts)
         const remainingCandidates = sortedCandidates.filter(c => !used.has(c.handle));
         
@@ -3844,7 +3873,12 @@ async function processSessionInBackground({
           break;
           }
       }
-      } else if (isBundleMode && finalHandles.length < finalResultCount) {
+        } // End of top-up condition check
+      } else if (isBundleMode) {
+        // Bundle mode: Only top-up if AI succeeded AND we need more results
+        // Check if AI succeeded (has handles from AI selection)
+        const bundleAiHadResults = bundleFinalHandles.length > 0 || (bundleAiSucceeded && finalHandles.length > 0);
+        if (bundleAiHadResults && finalHandles.length < finalResultCount) {
         // BUNDLE-SAFE TOP-UP: Only from bundle item pools
         console.log("[Bundle] Top-up needed: have", finalHandles.length, "need", finalResultCount);
         
@@ -3953,8 +3987,8 @@ async function processSessionInBackground({
         if (rejectedTopUpHandles.length > 0) {
           console.log("[Bundle] rejectedTopUpHandles:", rejectedTopUpHandles.slice(0, 10).join(", "), rejectedTopUpHandles.length > 10 ? `... (${rejectedTopUpHandles.length} total)` : "");
         }
-      }
-      } // End of single-item path else block
+        } // End of bundle top-up condition check
+      } // End of single-item path else block / bundle mode block
 
       // LAYER 3: Post-validation (validate final handles against hard constraints)
       console.log("[App Proxy] [Layer 3] Validating final handles");
