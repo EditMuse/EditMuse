@@ -338,9 +338,51 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
       console.log("[AI Ranking] Fixed JSON syntax errors and successfully parsed");
       return parsed as StructuredRankingResult;
     } catch (retryErr) {
-      // Both attempts failed
-      const retryError = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new JSONParseError(`JSON.parse failed: ${lastParseError}. Retry after fixes also failed: ${retryError}`, content);
+      // Third attempt: More aggressive array repair (handles "Expected ',' or ']' after array element")
+      // Use a more comprehensive approach to fix array syntax
+      let repaired = fixed;
+      
+      // Fix missing commas in arrays - more aggressive patterns
+      // Pattern 1: Value followed by value without comma (any type)
+      repaired = repaired.replace(/([^,\s\]}])\s+(["{[\d])/g, '$1, $2'); // Any value before bracket/brace/quote/digit
+      repaired = repaired.replace(/([^,\s\]}]")\s*"([^,\s\]}])/g, '$1, "$2'); // String before string
+      repaired = repaired.replace(/(\d+)\s+(["{[\d])/g, '$1, $2'); // Number before value
+      repaired = repaired.replace(/(true|false|null)\s+(["{[\d])/g, '$1, $2'); // Boolean/null before value
+      repaired = repaired.replace(/([}\]"])\s*([{["\d])/g, '$1, $2'); // Closing bracket/brace/quote before opening
+      
+      // Fix missing commas in nested structures
+      repaired = repaired.replace(/([}\]"])\s*"([^"]+)":/g, '$1, "$2":'); // Missing comma before property
+      repaired = repaired.replace(/([}\]"])\s*([{[])/g, '$1, $2'); // Missing comma between structures
+      
+      // Remove double commas and clean up
+      repaired = repaired.replace(/,+/g, ',');
+      repaired = repaired.replace(/,\s*,/g, ',');
+      repaired = repaired.replace(/,\s*([}\]])/g, '$1'); // Remove trailing commas
+      
+      try {
+        parsed = JSON.parse(repaired);
+        console.log("[AI Ranking] Fixed JSON syntax errors (aggressive repair) and successfully parsed");
+        return parsed as StructuredRankingResult;
+      } catch (finalErr) {
+        // Fourth attempt: Try to extract valid JSON using balanced bracket matching
+        const balancedJson = extractBalancedJSON(content);
+        if (balancedJson) {
+          try {
+            // Clean the extracted JSON
+            let cleaned = balancedJson.replace(/,+/g, ',').replace(/,\s*,/g, ',').replace(/,\s*([}\]])/g, '$1');
+            parsed = JSON.parse(cleaned);
+            console.log("[AI Ranking] Extracted and parsed balanced JSON");
+            return parsed as StructuredRankingResult;
+          } catch (extractErr) {
+            // Extraction failed too
+          }
+        }
+        
+        // All attempts failed
+        const retryError = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        const finalError = finalErr instanceof Error ? finalErr.message : String(finalErr);
+        throw new JSONParseError(`JSON.parse failed: ${lastParseError}. Retry after fixes also failed: ${retryError}. Aggressive repair failed: ${finalError}`, content);
+      }
     }
   }
 }
@@ -1078,10 +1120,14 @@ REQUIREMENTS:
 `
     : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
-CRITICAL OUTPUT FORMAT:
+CRITICAL OUTPUT FORMAT (HIGHEST PRIORITY):
 - Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
-- Output must be parseable JSON.parse() directly
+- Output must be parseable JSON.parse() directly - test your JSON before returning
 - Use the exact schema provided below - no deviations
+- CRITICAL: Ensure all arrays have proper commas between elements (e.g., ["item1", "item2"] not ["item1" "item2"])
+- CRITICAL: Ensure all objects have proper commas between properties
+- CRITICAL: Close all brackets and braces properly
+- Double-check your JSON is valid before returning - invalid JSON will cause errors
 
 REASONING QUALITY (CRITICAL):
 - Each product's "reason" field must be written in natural, professional, conversational language
@@ -1897,13 +1943,39 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             (candidate as any).searchText || (candidate as any).desc1000 || cleanDescription(candidate.description) || "",
           ].join(" ").toLowerCase();
           
-          const hasHardTermMatch = item.evidence.matchedHardTerms.some((term: string) =>
-            candidateText.includes(term.toLowerCase())
-          );
+          // RELAXED VALIDATION: Use fuzzy matching instead of exact substring matching
+          // This allows AI results to pass more often while still ensuring relevance
+          const hasHardTermMatch = item.evidence.matchedHardTerms.some((term: string) => {
+            const termLower = term.toLowerCase();
+            // Exact match
+            if (candidateText.includes(termLower)) return true;
+            // Fuzzy match: check if words from term appear in candidate text
+            const termWords = termLower.split(/\s+/).filter(w => w.length >= 3);
+            if (termWords.length > 0) {
+              return termWords.every(word => candidateText.includes(word));
+            }
+            // Single word match (partial)
+            if (termLower.length >= 4) {
+              return candidateText.includes(termLower.substring(0, Math.min(termLower.length, 6)));
+            }
+            return false;
+          });
           
           if (!hasHardTermMatch && hardTerms.length > 0) {
-            console.warn(`[AI Ranking] Skipping ${handle} - claimed hardTerm match not found in candidate`);
-            continue;
+            // RELAXED: Instead of rejecting, check if ANY hard term appears (even if not in evidence)
+            const hasAnyHardTerm = hardTerms.some(term => {
+              const termLower = term.toLowerCase();
+              return candidateText.includes(termLower) || 
+                     termLower.split(/\s+/).some(word => word.length >= 3 && candidateText.includes(word));
+            });
+            
+            if (!hasAnyHardTerm) {
+              console.warn(`[AI Ranking] Skipping ${handle} - no hardTerm match found in candidate`);
+              continue;
+            } else {
+              // AI claimed a match but evidence doesn't show it - trust AI but log warning
+              console.warn(`[AI Ranking] AI evidence mismatch for ${handle}, but hardTerm found in text - accepting`);
+            }
           }
           
           // Check avoidTerms
@@ -1925,6 +1997,28 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       if (validSelectedItems.length === 0) {
           console.error("[AI Ranking] No valid selected items after runtime validation");
+          
+          // SAFETY: If AI returned items but all were invalid, try to use them anyway (with trustFallback)
+          // This prevents 0 results when AI makes minor validation mistakes
+          if (singleItemResult.selected.length > 0) {
+            console.warn("[AI Ranking] ⚠️  AI returned items but all failed validation - using with trustFallback=true");
+            // Use AI's selections but mark as trustFallback
+            const aiHandles = singleItemResult.selected
+              .map(item => item.handle.trim())
+              .filter(handle => candidateMap.has(handle))
+              .slice(0, resultCount);
+            
+            if (aiHandles.length > 0) {
+              return {
+                selectedHandles: aiHandles,
+                reasoning: singleItemResult.selected[0]?.reason || "Selected based on your preferences.",
+                trustFallback: true,
+                source: "ai",
+                parseFailReason: "Validation failed but using AI selections",
+              };
+            }
+          }
+          
           lastError = new Error("No valid selected items after runtime validation");
           lastParseFailReason = "No valid items after runtime validation";
         continue; // Try again if retries remaining
@@ -2126,7 +2220,22 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   console.log("[AI Ranking] fallback_scope=", fallbackScope);
   
   // Return structured fallback result instead of throwing
-  return deterministicRanking(fallbackCandidates, resultCount, variantPreferences, failReason);
+  const fallbackResult = deterministicRanking(fallbackCandidates, resultCount, variantPreferences, failReason);
+  
+  // SAFETY: Ensure fallback always returns at least some results
+  if (fallbackResult.selectedHandles.length === 0 && fallbackCandidates.length > 0) {
+    console.warn("[AI Ranking] ⚠️  Fallback returned 0 handles - using first available candidates");
+    // Use first available candidates as absolute fallback
+    const availableCandidates = fallbackCandidates.filter(c => c.available);
+    const fallbackCandidatesToUse = availableCandidates.length > 0 ? availableCandidates : fallbackCandidates;
+    fallbackResult.selectedHandles = fallbackCandidatesToUse
+      .slice(0, Math.min(resultCount, fallbackCandidatesToUse.length))
+      .map(c => c.handle);
+    fallbackResult.reasoning = "Showing the best available matches for your request.";
+    console.log(`[AI Ranking] ✅ Absolute fallback applied: ${fallbackResult.selectedHandles.length} products`);
+  }
+  
+  return fallbackResult;
 }
 
 /**

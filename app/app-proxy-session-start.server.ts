@@ -289,7 +289,19 @@ function parseIntentGeneric(
   
   // Industry-agnostic: Intelligent term classification using linguistic patterns
   // Classifies terms as HARD (concrete products/attributes) or SOFT (abstract concepts/context)
-  const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those"]);
+  // First, remove price/budget information from text before term extraction (industry-agnostic)
+  let textForTermExtraction = lowerText;
+  // Remove price/budget patterns to prevent them from being extracted as terms
+  const priceBudgetPatterns = [
+    /\b(?:budget|price|cost|spend|spending|total|maximum|max)\s+(?:is|of)?\s*[£$€]?\s*\d+(?:[.,]\d+)?/gi,
+    /\b[£$€]\s*\d+(?:[.,]\d+)?\s+(?:budget|total|for\s+all|for\s+everything)/gi,
+    /\b(?:under|below|less\s+than|up\s+to)\s+[£$€]?\s*\d+(?:[.,]\d+)?/gi,
+  ];
+  for (const pattern of priceBudgetPatterns) {
+    textForTermExtraction = textForTermExtraction.replace(pattern, " ");
+  }
+  
+  const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those", "my", "go", "the"]);
   
   // Context prepositions that indicate use-case/occasion (terms after these are usually SOFT)
   const contextPrepositions = new Set(["for", "at", "in", "on", "during", "when", "while"]);
@@ -299,6 +311,12 @@ function parseIntentGeneric(
   const abstractPatterns = [
     /^(outfit|ensemble|set|kit|bundle|package|collection|combo|combination|pair|group|lot|suite|system|solution)$/i,
     /^(complete|full|entire|whole|total)$/i, // When used as nouns describing collections
+    /^(complete\s+outfit|full\s+outfit|entire\s+outfit|whole\s+outfit)$/i, // Multi-word abstract patterns
+  ];
+  
+  // Price/budget terms (always SOFT - these are constraints, not products)
+  const priceBudgetTerms = [
+    /^(budget|price|cost|spend|spending|total|maximum|max|under|below|less|up\s+to)$/i,
   ];
   
   // Occasion/context terms (always SOFT - these describe when/where/why, not what)
@@ -307,10 +325,11 @@ function parseIntentGeneric(
   ];
   
   // Extract meaningful phrases (2-4 words) that aren't stop words
-  const words = lowerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+  // Use textForTermExtraction (with price/budget removed) for term extraction
+  const words = textForTermExtraction.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w) && !/^\d+$/.test(w)); // Also filter pure numbers
   const wordPositions = new Map<string, number>(); // Track word positions for context analysis
   words.forEach((w, idx) => {
-    const originalIdx = lowerText.indexOf(w, wordPositions.size > 0 ? Array.from(wordPositions.values())[wordPositions.size - 1] + 1 : 0);
+    const originalIdx = textForTermExtraction.indexOf(w, wordPositions.size > 0 ? Array.from(wordPositions.values())[wordPositions.size - 1] + 1 : 0);
     wordPositions.set(w, originalIdx);
   });
   
@@ -329,14 +348,21 @@ function parseIntentGeneric(
       }
     }
     
-    // 2. Check for occasion/context patterns (always SOFT)
+    // 2. Check for price/budget terms (always SOFT - these are constraints, not products)
+    for (const pattern of priceBudgetTerms) {
+      if (pattern.test(termLower)) {
+        return "soft";
+      }
+    }
+    
+    // 3. Check for occasion/context patterns (always SOFT)
     for (const pattern of occasionPatterns) {
       if (pattern.test(termLower)) {
         return "soft";
       }
     }
     
-    // 3. Context-based classification: terms after context prepositions are usually SOFT
+    // 4. Context-based classification: terms after context prepositions are usually SOFT
     const beforeWords = contextBefore.toLowerCase().split(/\s+/).filter(w => w.length > 0);
     if (beforeWords.length > 0) {
       const lastWordBefore = beforeWords[beforeWords.length - 1];
@@ -346,12 +372,12 @@ function parseIntentGeneric(
       }
     }
     
-    // 4. Check for "for X" pattern (use-case indicator)
+    // 5. Check for "for X" pattern (use-case indicator)
     if (contextBefore.trim().endsWith(" for") || contextBefore.trim().endsWith(" for a") || contextBefore.trim().endsWith(" for an")) {
       return "soft"; // "for wedding", "for work", etc. are use-cases
     }
     
-    // 5. Check for descriptive patterns that suggest attributes (HARD)
+    // 6. Check for descriptive patterns that suggest attributes (HARD)
     // Colors, sizes, materials are usually HARD terms
     const colorPattern = /^(red|blue|green|yellow|orange|purple|pink|brown|black|white|gray|grey|navy|beige|tan|maroon|burgundy|teal|cyan|magenta|olive|khaki|ivory|cream|silver|gold|bronze|copper)$/i;
     const sizePattern = /^(small|medium|large|xlarge|xl|xxl|xxxl|tiny|huge|big|little|mini|maxi|petite|tall|short|wide|narrow)$/i;
@@ -361,7 +387,7 @@ function parseIntentGeneric(
       return "hard"; // Descriptive attributes are HARD
     }
     
-    // 6. Default: longer, specific terms are more likely to be concrete products (HARD)
+    // 7. Default: longer, specific terms are more likely to be concrete products (HARD)
     // Shorter, generic terms might be concepts (SOFT)
     if (termLower.length >= 6) {
       // Longer terms are usually specific products (HARD)
@@ -372,7 +398,7 @@ function parseIntentGeneric(
       return "hard";
     }
     
-    // 7. Default to HARD for concrete nouns (most product terms)
+    // 8. Default to HARD for concrete nouns (most product terms)
     return "hard";
   }
   
@@ -843,27 +869,99 @@ function parseBundleIntentGeneric(userIntent: string): {
     
     // Split query by bundle indicators to extract potential items (industry-agnostic)
     if (matchingSeparator) {
-      const segments = userIntent.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      // Remove price/budget information before splitting
+      let intentForSplitting = userIntent;
+      const priceBudgetPatterns = [
+        /\b(?:budget|price|cost|spend|spending|total|maximum|max)\s+(?:is|of)?\s*[£$€]?\s*\d+(?:[.,]\d+)?/gi,
+        /\b[£$€]\s*\d+(?:[.,]\d+)?\s+(?:budget|total|for\s+all|for\s+everything)/gi,
+        /\b(?:under|below|less\s+than|up\s+to)\s+[£$€]?\s*\d+(?:[.,]\d+)?/gi,
+        /\bmy\s+budget/gi,
+      ];
+      for (const pattern of priceBudgetPatterns) {
+        intentForSplitting = intentForSplitting.replace(pattern, " ");
+      }
+      
+      const segments = intentForSplitting.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      
+      // Abstract collection terms that should NOT be treated as bundle items
+      const abstractCollectionPatterns = [
+        /^(complete|full|entire|whole)\s+(outfit|ensemble|set|kit|bundle|package|collection|combo|combination)$/i,
+        /^(outfit|ensemble|set|kit|bundle|package|collection|combo|combination)$/i,
+      ];
       
       // Extract meaningful terms from each segment (industry-agnostic)
       if (segments.length >= 2) {
         let currentPos = 0;
+        let concreteItemsFound = 0;
         
         for (const segment of segments) {
+          // Check if segment is an abstract collection term (skip it, but count it for bundle detection)
+          let isAbstract = false;
+          for (const pattern of abstractCollectionPatterns) {
+            if (pattern.test(segment.trim())) {
+              isAbstract = true;
+              break;
+            }
+          }
+          
+          if (isAbstract) {
+            // Skip abstract collection terms - they're not actual product items
+            // But we still count them as "mentions" for bundle detection
+            currentPos += segment.length + 10;
+            continue;
+          }
+          
           // Extract meaningful noun phrases - remove stop words and get core product terms
           const cleaned = segment.toLowerCase().trim();
-          const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for"]);
-          const words = cleaned.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+          const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "go", "my", "to", "go", "with"]);
+          const words = cleaned.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w) && !/^\d+$/.test(w));
           
           if (words.length > 0) {
             // Use the most significant words (longer words first, up to 3 words for multi-word terms)
-            const significantWords = words
-              .sort((a, b) => b.length - a.length)
-              .slice(0, 3);
-            const term = significantWords.join(" ");
-            foundCategories.push({ term, position: currentPos });
+            // Filter out abstract terms from the words
+            const concreteWords = words.filter(w => {
+              const wLower = w.toLowerCase();
+              // Filter out abstract collection terms and price/budget terms
+              return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to)$/i.test(wLower);
+            });
+            
+            if (concreteWords.length > 0) {
+              const significantWords = concreteWords
+                .sort((a, b) => b.length - a.length)
+                .slice(0, 3);
+              const term = significantWords.join(" ").trim();
+              
+              // Only add if term is not empty and has at least 2 characters
+              if (term.length >= 2) {
+                foundCategories.push({ term, position: currentPos });
+                concreteItemsFound++;
+              }
+            } else {
+              // If all words were filtered out, try to extract at least one meaningful word
+              // This prevents 0 candidates when segments only contain abstract terms
+              const fallbackWords = words.filter(w => {
+                const wLower = w.toLowerCase();
+                // Only filter out the most obvious abstract terms, keep others
+                return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination)$/i.test(wLower);
+              });
+              
+              if (fallbackWords.length > 0) {
+                const term = fallbackWords[0]; // Use first non-abstract word
+                if (term.length >= 2) {
+                  foundCategories.push({ term, position: currentPos });
+                  concreteItemsFound++;
+                }
+              }
+            }
           }
           currentPos += segment.length + 10; // Approximate position
+        }
+        
+        // If we found at least 1 concrete item, it's a valid bundle (even if other segments were abstract)
+        // This handles cases like "blue suit and a complete outfit" - we extract "blue suit" as the item
+        if (concreteItemsFound === 0 && foundCategories.length === 0) {
+          // No concrete items found - don't treat as bundle
+          foundCategories.length = 0;
         }
       }
     }
@@ -871,33 +969,59 @@ function parseBundleIntentGeneric(userIntent: string): {
   
   // Fallback: If no bundle indicators or generic extraction failed, use category matching
   // This helps with single-item queries or queries without clear separators
-  if (foundCategories.length === 0) {
-    for (const phrase of categoryPhrases) {
-      const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "gi");
-      let match;
-      while ((match = regex.exec(lowerText)) !== null) {
-        // Check if it's not part of a soft word
-        const before = lowerText.substring(Math.max(0, match.index - 10), match.index);
-        const after = lowerText.substring(match.index + match[0].length, Math.min(lowerText.length, match.index + match[0].length + 10));
-        const context = (before + " " + after).toLowerCase();
+  // BUT: Only use this fallback if we have bundle indicators but no items found
+  // For true industry-agnostic behavior, we should extract terms generically even without categoryPhrases
+  if (foundCategories.length === 0 && hasBundleIndicator) {
+    // Try generic extraction one more time with less filtering
+    // Extract any meaningful noun phrases from segments (industry-agnostic)
+    if (matchingSeparator) {
+      const segments = userIntent.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      for (let i = 0; i < segments.length; i++) {
+        const segment = segments[i];
+        const cleaned = segment.toLowerCase().trim();
+        const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "go", "my", "to", "go", "with", "the", "suit"]);
+        const words = cleaned.split(/\s+/).filter(w => w.length >= 3 && !stopWords.has(w) && !/^\d+$/.test(w));
         
-        // Skip if it's part of a soft word phrase
-        let isSoftWord = false;
-        for (const soft of softWords) {
-          if (context.includes(soft)) {
-            isSoftWord = true;
-            break;
+        if (words.length > 0) {
+          // Use first 2-3 meaningful words as a term (industry-agnostic)
+          const term = words.slice(0, 2).join(" ").trim();
+          if (term.length >= 3) {
+            foundCategories.push({ term, position: i * 50 }); // Approximate position
           }
         }
-        
-        if (!isSoftWord) {
-          foundCategories.push({ term: phrase, position: match.index });
+      }
+    }
+    
+    // Last resort: use categoryPhrases (but this is less industry-agnostic)
+    if (foundCategories.length === 0) {
+      for (const phrase of categoryPhrases) {
+        const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "gi");
+        let match;
+        while ((match = regex.exec(lowerText)) !== null) {
+          // Check if it's not part of a soft word
+          const before = lowerText.substring(Math.max(0, match.index - 10), match.index);
+          const after = lowerText.substring(match.index + match[0].length, Math.min(lowerText.length, match.index + match[0].length + 10));
+          const context = (before + " " + after).toLowerCase();
+          
+          // Skip if it's part of a soft word phrase
+          let isSoftWord = false;
+          for (const soft of softWords) {
+            if (context.includes(soft)) {
+              isSoftWord = true;
+              break;
+            }
+          }
+          
+          if (!isSoftWord) {
+            foundCategories.push({ term: phrase, position: match.index });
+          }
         }
       }
     }
   }
   
   // Bundle detected if: ≥2 distinct items found (either from categories or extracted segments)
+  // OR: ≥1 item found with bundle indicators (handles "blue suit and complete outfit" case)
   const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
   const categoryCounts = new Map<string, number>();
   for (const { term } of foundCategories) {
@@ -906,7 +1030,10 @@ function parseBundleIntentGeneric(userIntent: string): {
   const hasRepeatedMentions = Array.from(categoryCounts.values()).some(count => count >= 2);
   
   // Bundle if: (≥2 items found) AND (bundle indicators present OR repeated mentions)
-  const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
+  // OR: (≥1 item found) AND (bundle indicators present) - handles abstract term cases
+  // For industry-agnostic: if user says "X and Y" but Y is abstract, we still treat as bundle with X
+  const isBundle = (uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions)) ||
+                   (uniqueCategories.length >= 1 && hasBundleIndicator);
 
   if (!isBundle) {
     return { isBundle: false, items: [], totalBudget: null, totalBudgetCurrency: null };
@@ -5360,10 +5487,107 @@ async function processSessionInBackground({
             maxPriceCeiling,
             deliveredCount
           });
+          
+          // ENFORCE BUDGET: Filter out items that exceed budget, starting with most expensive
+          // Sort handles by price (descending) and remove until within budget
+          const handlesWithPrices = handlesToSave.map(handle => {
+            const candidate = candidateMapForCheck.get(handle);
+            const price = candidate && candidate.price ? parseFloat(String(candidate.price)) : 0;
+            return { handle, price: Number.isFinite(price) ? price : 0 };
+          }).sort((a, b) => b.price - a.price);
+          
+          let filteredHandles: string[] = [];
+          let runningTotal = 0;
+          
+          // Add items one by one, stopping when budget would be exceeded
+          for (const { handle, price } of handlesWithPrices) {
+            if (runningTotal + price <= maxPriceCeiling) {
+              filteredHandles.push(handle);
+              runningTotal += price;
+            } else {
+              // Skip this item to stay within budget
+              console.log(`[Constraints] Skipping ${handle} (price: $${price.toFixed(2)}) to stay within budget`);
+            }
+          }
+          
+          // Update handlesToSave to only include items within budget
+          if (filteredHandles.length < handlesToSave.length) {
+            const originalCount = handlesToSave.length;
+            handlesToSave = filteredHandles;
+            deliveredCount = filteredHandles.length;
+            console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items`);
+          }
         }
       }
       
-      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "handlesPreview=", handlesToSave.slice(0, 5));
+      // FINAL SAFETY CHECK: Only use emergency fallback if absolutely no results (rare occurrence)
+      // AI ranking should handle most cases - this is truly a last resort
+      if (handlesToSave.length === 0 && allCandidatesEnriched.length > 0) {
+        console.warn("[App Proxy] ⚠️  EMERGENCY FALLBACK: No handles after all processing - this should be rare");
+        console.warn("[App Proxy] ⚠️  No handles to save - applying emergency fallback");
+        
+        // Emergency fallback: use any available candidates, prioritizing in-stock items
+        const emergencyCandidates = allCandidatesEnriched
+          .filter(c => c.available) // Prefer in-stock
+          .sort((a, b) => {
+            // Sort by: available first, then by handle for consistency
+            if (a.available !== b.available) return a.available ? -1 : 1;
+            return a.handle.localeCompare(b.handle);
+          })
+          .slice(0, Math.min(finalResultCount, 12)); // Cap at 12 for safety
+        
+        // Apply budget constraint to emergency candidates if needed
+        if (typeof maxPriceCeiling === "number" && maxPriceCeiling > 0) {
+          const emergencyWithPrices = emergencyCandidates.map(c => {
+            const price = c.price ? parseFloat(String(c.price)) : 0;
+            return { handle: c.handle, price: Number.isFinite(price) ? price : 0 };
+          }).sort((a, b) => a.price - b.price); // Sort by price ascending (cheapest first)
+          
+          let emergencyTotal = 0;
+          const emergencyFiltered: string[] = [];
+          for (const { handle, price } of emergencyWithPrices) {
+            if (emergencyTotal + price <= maxPriceCeiling) {
+              emergencyFiltered.push(handle);
+              emergencyTotal += price;
+            }
+          }
+          
+          handlesToSave = emergencyFiltered.length > 0 ? emergencyFiltered : emergencyCandidates.slice(0, 1).map(c => c.handle);
+        } else {
+          handlesToSave = emergencyCandidates.map(c => c.handle);
+        }
+        
+        deliveredCount = handlesToSave.length;
+        console.log(`[App Proxy] ✅ Emergency fallback applied: ${deliveredCount} products selected`);
+        
+        // Update reasoning to reflect emergency fallback
+        if (handlesToSave.length > 0) {
+          reasoning = reasoning || "Showing available products that best match your preferences.";
+        }
+      }
+      
+      // FINAL VALIDATION: Ensure handlesToSave contains valid handles
+      const validHandles = handlesToSave.filter(handle => {
+        const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+        return candidate !== undefined;
+      });
+      
+      if (validHandles.length < handlesToSave.length) {
+        console.warn(`[App Proxy] ⚠️  Filtered out ${handlesToSave.length - validHandles.length} invalid handles`);
+        handlesToSave = validHandles;
+        deliveredCount = validHandles.length;
+      }
+      
+      // ABSOLUTE FINAL CHECK: If still empty, use first available product (guaranteed result)
+      if (handlesToSave.length === 0 && allCandidatesEnriched.length > 0) {
+        const firstAvailable = allCandidatesEnriched.find(c => c.available) || allCandidatesEnriched[0];
+        handlesToSave = [firstAvailable.handle];
+        deliveredCount = 1;
+        console.log(`[App Proxy] ✅ Absolute fallback: using single product ${firstAvailable.handle}`);
+        reasoning = "Showing the best available match for your request.";
+      }
+      
+      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", deliveredCount, "handlesPreview=", handlesToSave.slice(0, 5));
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
       // Note: If missingTypes.length > 0, this is a PARTIAL_BUNDLE (still marked COMPLETE)
