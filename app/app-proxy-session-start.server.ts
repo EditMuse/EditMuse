@@ -287,41 +287,149 @@ function parseIntentGeneric(
     }
   }
   
-  // Industry-agnostic: Extract meaningful noun phrases from query (not just predefined categories)
-  // Extract 2-4 word phrases that look like product terms
+  // Industry-agnostic: Intelligent term classification using linguistic patterns
+  // Classifies terms as HARD (concrete products/attributes) or SOFT (abstract concepts/context)
   const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those"]);
+  
+  // Context prepositions that indicate use-case/occasion (terms after these are usually SOFT)
+  const contextPrepositions = new Set(["for", "at", "in", "on", "during", "when", "while"]);
+  
+  // Abstract collection/concept terms (always SOFT - industry-agnostic patterns)
+  // These are linguistic patterns, not industry-specific lists
+  const abstractPatterns = [
+    /^(outfit|ensemble|set|kit|bundle|package|collection|combo|combination|pair|group|lot|suite|system|solution)$/i,
+    /^(complete|full|entire|whole|total)$/i, // When used as nouns describing collections
+  ];
+  
+  // Occasion/context terms (always SOFT - these describe when/where/why, not what)
+  const occasionPatterns = [
+    /^(wedding|party|event|occasion|ceremony|meeting|interview|date|dinner|work|office|home|outdoor|indoor|formal|casual|sport|exercise|gym|beach|vacation|travel|business|professional)$/i,
+  ];
   
   // Extract meaningful phrases (2-4 words) that aren't stop words
   const words = lowerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+  const wordPositions = new Map<string, number>(); // Track word positions for context analysis
+  words.forEach((w, idx) => {
+    const originalIdx = lowerText.indexOf(w, wordPositions.size > 0 ? Array.from(wordPositions.values())[wordPositions.size - 1] + 1 : 0);
+    wordPositions.set(w, originalIdx);
+  });
   
   // Build phrases: 1-word, 2-word, 3-word combinations (industry-agnostic)
-  const extractedPhrases = new Set<string>();
+  const hardTermCandidates = new Set<string>();
+  const softTermCandidates = new Set<string>();
   
-  // Single significant words (longer words are more likely to be product terms)
-  for (const word of words) {
-    if (word.length >= 4) { // Prefer longer words as they're more specific
-      extractedPhrases.add(word);
+  // Analyze each word/phrase for context and semantic role
+  function classifyTerm(term: string, position: number, contextBefore: string, contextAfter: string): "hard" | "soft" {
+    const termLower = term.toLowerCase();
+    
+    // 1. Check for abstract collection patterns (always SOFT)
+    for (const pattern of abstractPatterns) {
+      if (pattern.test(termLower)) {
+        return "soft";
+      }
+    }
+    
+    // 2. Check for occasion/context patterns (always SOFT)
+    for (const pattern of occasionPatterns) {
+      if (pattern.test(termLower)) {
+        return "soft";
+      }
+    }
+    
+    // 3. Context-based classification: terms after context prepositions are usually SOFT
+    const beforeWords = contextBefore.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    if (beforeWords.length > 0) {
+      const lastWordBefore = beforeWords[beforeWords.length - 1];
+      if (contextPrepositions.has(lastWordBefore)) {
+        // Term follows a context preposition -> likely use-case/occasion (SOFT)
+        return "soft";
+      }
+    }
+    
+    // 4. Check for "for X" pattern (use-case indicator)
+    if (contextBefore.trim().endsWith(" for") || contextBefore.trim().endsWith(" for a") || contextBefore.trim().endsWith(" for an")) {
+      return "soft"; // "for wedding", "for work", etc. are use-cases
+    }
+    
+    // 5. Check for descriptive patterns that suggest attributes (HARD)
+    // Colors, sizes, materials are usually HARD terms
+    const colorPattern = /^(red|blue|green|yellow|orange|purple|pink|brown|black|white|gray|grey|navy|beige|tan|maroon|burgundy|teal|cyan|magenta|olive|khaki|ivory|cream|silver|gold|bronze|copper)$/i;
+    const sizePattern = /^(small|medium|large|xlarge|xl|xxl|xxxl|tiny|huge|big|little|mini|maxi|petite|tall|short|wide|narrow)$/i;
+    const materialPattern = /^(cotton|wool|silk|leather|denim|linen|polyester|nylon|spandex|cashmere|suede|canvas|velvet|satin|chiffon|jersey|knit|woven)$/i;
+    
+    if (colorPattern.test(termLower) || sizePattern.test(termLower) || materialPattern.test(termLower)) {
+      return "hard"; // Descriptive attributes are HARD
+    }
+    
+    // 6. Default: longer, specific terms are more likely to be concrete products (HARD)
+    // Shorter, generic terms might be concepts (SOFT)
+    if (termLower.length >= 6) {
+      // Longer terms are usually specific products (HARD)
+      return "hard";
+    } else if (termLower.length <= 4) {
+      // Very short terms might be concepts, but default to HARD if no other indicators
+      // (most 4-letter words are still product terms: "sofa", "lamp", "book")
+      return "hard";
+    }
+    
+    // 7. Default to HARD for concrete nouns (most product terms)
+    return "hard";
+  }
+  
+  // Single significant words
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word.length >= 4) {
+      const position = wordPositions.get(word) || 0;
+      const contextBefore = lowerText.substring(Math.max(0, position - 20), position);
+      const contextAfter = lowerText.substring(position + word.length, Math.min(lowerText.length, position + word.length + 20));
+      
+      const classification = classifyTerm(word, position, contextBefore, contextAfter);
+      if (classification === "hard") {
+        hardTermCandidates.add(word);
+      } else {
+        softTermCandidates.add(word);
+      }
     }
   }
   
   // 2-word phrases
   for (let i = 0; i < words.length - 1; i++) {
     const phrase = `${words[i]} ${words[i + 1]}`;
-    if (phrase.length >= 5) { // At least 5 chars total
-      extractedPhrases.add(phrase);
+    if (phrase.length >= 5) {
+      const position = wordPositions.get(words[i]) || 0;
+      const contextBefore = lowerText.substring(Math.max(0, position - 20), position);
+      const contextAfter = lowerText.substring(position + phrase.length, Math.min(lowerText.length, position + phrase.length + 20));
+      
+      const classification = classifyTerm(phrase, position, contextBefore, contextAfter);
+      if (classification === "hard") {
+        hardTermCandidates.add(phrase);
+      } else {
+        softTermCandidates.add(phrase);
+      }
     }
   }
   
   // 3-word phrases (most specific)
   for (let i = 0; i < words.length - 2; i++) {
     const phrase = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
-    if (phrase.length >= 8) { // At least 8 chars total
-      extractedPhrases.add(phrase);
+    if (phrase.length >= 8) {
+      const position = wordPositions.get(words[i]) || 0;
+      const contextBefore = lowerText.substring(Math.max(0, position - 20), position);
+      const contextAfter = lowerText.substring(position + phrase.length, Math.min(lowerText.length, position + phrase.length + 20));
+      
+      const classification = classifyTerm(phrase, position, contextBefore, contextAfter);
+      if (classification === "hard") {
+        hardTermCandidates.add(phrase);
+      } else {
+        softTermCandidates.add(phrase);
+      }
     }
   }
   
-  // Add extracted phrases as hard terms (industry-agnostic)
-  hardTerms.push(...Array.from(extractedPhrases));
+  // Add classified terms
+  hardTerms.push(...Array.from(hardTermCandidates));
+  softTerms.push(...Array.from(softTermCandidates));
   
   // Fallback: Also check categoryPhrases for common terms (helps with known categories)
   // But don't rely solely on this - extracted phrases take priority
@@ -346,28 +454,75 @@ function parseIntentGeneric(
         .join(" ")
         .toLowerCase();
       
-      // Extract terms from answers (industry-agnostic)
+      // Use same intelligent classification logic for answers
       const answerWords = answerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
-      for (let i = 0; i < answerWords.length - 1; i++) {
-        const phrase = `${answerWords[i]} ${answerWords[i + 1]}`;
-        if (phrase.length >= 5 && !expandedHardTerms.includes(phrase)) {
-          expandedHardTerms.push(phrase);
+      const answerWordPositions = new Map<string, number>();
+      answerWords.forEach((w, idx) => {
+        const originalIdx = answerText.indexOf(w, answerWordPositions.size > 0 ? Array.from(answerWordPositions.values())[answerWordPositions.size - 1] + 1 : 0);
+        answerWordPositions.set(w, originalIdx);
+      });
+      
+      // Classify and add terms from answers
+      for (let i = 0; i < answerWords.length; i++) {
+        const word = answerWords[i];
+        if (word.length >= 4) {
+          const position = answerWordPositions.get(word) || 0;
+          const contextBefore = answerText.substring(Math.max(0, position - 20), position);
+          const contextAfter = answerText.substring(position + word.length, Math.min(answerText.length, position + word.length + 20));
+          
+          const classification = classifyTerm(word, position, contextBefore, contextAfter);
+          if (classification === "hard" && !expandedHardTerms.includes(word)) {
+            expandedHardTerms.push(word);
+          } else if (classification === "soft" && !softTerms.includes(word)) {
+            softTerms.push(word);
+          }
         }
       }
-      // Also add single significant words
-      for (const word of answerWords) {
-        if (word.length >= 4 && !expandedHardTerms.includes(word)) {
-          expandedHardTerms.push(word);
+      
+      // 2-word phrases from answers
+      for (let i = 0; i < answerWords.length - 1; i++) {
+        const phrase = `${answerWords[i]} ${answerWords[i + 1]}`;
+        if (phrase.length >= 5) {
+          const position = answerWordPositions.get(answerWords[i]) || 0;
+          const contextBefore = answerText.substring(Math.max(0, position - 20), position);
+          const contextAfter = answerText.substring(position + phrase.length, Math.min(answerText.length, position + phrase.length + 20));
+          
+          const classification = classifyTerm(phrase, position, contextBefore, contextAfter);
+          if (classification === "hard" && !expandedHardTerms.includes(phrase)) {
+            expandedHardTerms.push(phrase);
+          } else if (classification === "soft" && !softTerms.includes(phrase)) {
+            softTerms.push(phrase);
+          }
         }
       }
     } else if (typeof answersData === "object") {
       // Extract terms from object values (industry-agnostic)
       const answerText = JSON.stringify(answersData).toLowerCase();
       const answerWords = answerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
-      for (let i = 0; i < answerWords.length - 1; i++) {
-        const phrase = `${answerWords[i]} ${answerWords[i + 1]}`;
-        if (phrase.length >= 5 && !expandedHardTerms.includes(phrase)) {
-          expandedHardTerms.push(phrase);
+      
+      // Simple classification for object values (less context available)
+      for (const word of answerWords) {
+        if (word.length >= 4) {
+          // Use simple pattern matching for object values
+          let isSoft = false;
+          for (const pattern of abstractPatterns) {
+            if (pattern.test(word)) {
+              isSoft = true;
+              break;
+            }
+          }
+          for (const pattern of occasionPatterns) {
+            if (pattern.test(word)) {
+              isSoft = true;
+              break;
+            }
+          }
+          
+          if (isSoft && !softTerms.includes(word)) {
+            softTerms.push(word);
+          } else if (!isSoft && !expandedHardTerms.includes(word)) {
+            expandedHardTerms.push(word);
+          }
         }
       }
     }
