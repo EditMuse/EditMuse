@@ -1451,21 +1451,20 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       // Determine API endpoint based on structured outputs support
-      let apiUsed: "responses" | "chat";
+      let apiUsed: "chat";
       let apiUrl: string;
       
-      // Use Responses API Structured Outputs with strict JSON schema
+      // Use Chat Completions API with structured outputs (json_schema) when supported
       // This guarantees valid JSON output that matches the schema exactly
+      // Note: json_schema is supported through chat.completions, not a separate responses endpoint
+      apiUsed = "chat";
+      apiUrl = OPENAI_CHAT_COMPLETIONS_URL;
+      
       if (supportsJsonSchema) {
-        // Responses API: use simplified request format
-        apiUsed = "responses";
-        apiUrl = OPENAI_RESPONSES_URL;
-        
-        // Build Responses API request body with only required/optional fields
-        // Format: input is array of messages, response_format uses json_schema strict
+        // Use Chat Completions API with json_schema for structured outputs
         requestBody = {
           model,
-          input: [
+          messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
           ],
@@ -1477,15 +1476,13 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
               schema: buildJsonSchema(isBundle),
             },
           },
-          temperature: 0, // Optional: Set to 0 for more deterministic output
-          max_output_tokens: 700, // Optional: Optimized for compact output (rejected_candidates removed from schema)
+          temperature: 0,
+          max_tokens: 700,
         };
         
         console.log("[AI Ranking] structured_outputs=true");
       } else {
-        // Fallback for models that don't support json_schema - use chat.completions
-        apiUsed = "chat";
-        apiUrl = OPENAI_CHAT_COMPLETIONS_URL;
+        // Fallback for models that don't support json_schema - use json_object mode
         requestBody = {
           model,
           messages: [
@@ -1496,7 +1493,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           max_tokens: 700,
           response_format: { type: "json_object" },
         };
-        console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode (chat.completions)");
+        console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
       }
 
       // Use appropriate endpoint based on API type
@@ -1562,50 +1559,51 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // Extract response ID from response body if present (OpenAI sometimes includes this)
       bodyResponseId = data.id || data.request_id || null;
       
-      // Read parsed output from SDK's documented location (Responses API Structured Outputs)
-      // Official SDK location: response.output_parsed (top-level parsed accessor)
-      // Do NOT inspect text content or check other locations - only use documented parsed field
+      // Read parsed output from Chat Completions API
+      // For json_schema mode, the response is in choices[0].message.content as valid JSON
+      // For json_object mode, same structure
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      if (apiUsed === "responses") {
-        // Responses API Structured Outputs: read from official SDK parsed location
-        // The SDK provides parsed output in output_parsed field when using json_schema strict
-        if (data.output_parsed && typeof data.output_parsed === "object") {
-          structuredResult = data.output_parsed as StructuredRankingResult | StructuredBundleResult;
+      // Chat.completions API: check choices[0].message structure
+      const message = data.choices?.[0]?.message;
+      if (message) {
+        // Check for refusal
+        if (message.refusal) {
+          const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+          
+          // Structured error log for model refusal
+          const logData: any = {
+            attempt: attempt + 1,
+            status: responseStatus || "unknown",
+            fail_type: "parse",
+            fail_reason: "Model refusal",
+          };
+          if (refusalResponseId) logData.response_id = refusalResponseId;
+          console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, refusalResponseId ? `response_id=${refusalResponseId}` : "");
+          
+          // Also log refusal details (safe, no PII)
+          console.log("[AI Ranking] Model refused to generate structured output");
+          
+          lastError = new Error("Model refused to generate structured output");
+          lastParseFailReason = "Model refusal";
+          continue; // Try again if retries remaining
         }
-      } else {
-        // Chat.completions API (json_object mode): check choices[0].message structure
-        const message = data.choices?.[0]?.message;
-        if (message) {
-          // Check for refusal
-          if (message.refusal) {
-            const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
-            
-            // Structured error log for model refusal
-            const logData: any = {
-              attempt: attempt + 1,
-              status: responseStatus || "unknown",
-              fail_type: "parse",
-              fail_reason: "Model refusal",
-            };
-            if (refusalResponseId) logData.response_id = refusalResponseId;
-            console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, refusalResponseId ? `response_id=${refusalResponseId}` : "");
-            
-            // Also log refusal details (safe, no PII)
-            console.log("[AI Ranking] Model refused to generate structured output");
-            
-            lastError = new Error("Model refused to generate structured output");
-            lastParseFailReason = "Model refusal";
-            continue; // Try again if retries remaining
-          }
 
-          // Check for parsed field (may be present in some SDK versions)
-          if (message.parsed && typeof message.parsed === "object") {
-            structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
-          }
-          // Check if content is already an object (parsed) rather than a string
-          else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
-            structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
+        // Check for parsed field (may be present in some SDK versions)
+        if (message.parsed && typeof message.parsed === "object") {
+          structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
+        }
+        // Check if content is already an object (parsed) rather than a string
+        else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
+          structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
+        }
+        // For json_schema mode, content is a JSON string that needs parsing
+        else if (message.content && typeof message.content === "string" && supportsJsonSchema) {
+          try {
+            structuredResult = parseStructuredRanking(message.content);
+          } catch (parseError) {
+            // Parse error will be handled below
+            console.warn("[AI Ranking] Failed to parse json_schema content:", parseError instanceof Error ? parseError.message : String(parseError));
           }
         }
       }
