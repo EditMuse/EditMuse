@@ -1233,7 +1233,8 @@ export async function proxySessionStartAction(
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { experienceId, answers, clientRequestId } = body;
+  const { experienceId, clientRequestId } = body;
+  let answers = body.answers;
   // NOTE: resultCount is ignored - Experience.resultCount is the ONLY source of truth
   const bodyResultCount = (body as any).resultCount; // Only for logging
   console.log("[App Proxy] Request body:", {

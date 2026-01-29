@@ -226,42 +226,41 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       parsedQuestions = [];
     }
-      
-      // Validate and normalize each question
-      const validTypes = ["text", "select"];
-      for (let i = 0; i < parsedQuestions.length; i++) {
-        const q = parsedQuestions[i];
-        if (!q.type || !validTypes.includes(q.type)) {
-          return { error: `Question ${i + 1}: type must be "text" or "select"` };
+    
+    // Validate and normalize each question
+    const validTypes = ["text", "select"];
+    for (let i = 0; i < parsedQuestions.length; i++) {
+      const q = parsedQuestions[i];
+      if (!q.type || !validTypes.includes(q.type)) {
+        return { error: `Question ${i + 1}: type must be "text" or "select"` };
+      }
+      // Normalize "prompt" to "question" if present
+      if (q.prompt && !q.question) {
+        q.question = q.prompt;
+        delete q.prompt;
+      }
+      if (!q.question || q.question.trim() === "") {
+        return { error: `Question ${i + 1}: question text is required` };
+      }
+      if (q.type === "select") {
+        if (!q.options || !Array.isArray(q.options) || q.options.length < 2) {
+          return { error: `Question ${i + 1}: select must have at least 2 options` };
         }
-        // Normalize "prompt" to "question" if present
-        if (q.prompt && !q.question) {
-          q.question = q.prompt;
-          delete q.prompt;
-        }
-        if (!q.question || q.question.trim() === "") {
-          return { error: `Question ${i + 1}: question text is required` };
-        }
-        if (q.type === "select") {
-          if (!q.options || !Array.isArray(q.options) || q.options.length < 2) {
-            return { error: `Question ${i + 1}: select must have at least 2 options` };
+        // Normalize options to {value, label} format
+        parsedQuestions[i].options = q.options.map((opt: any) => {
+          if (typeof opt === "string") {
+            return { value: opt, label: opt };
           }
-          // Normalize options to {value, label} format
-          parsedQuestions[i].options = q.options.map((opt: any) => {
-            if (typeof opt === "string") {
-              return { value: opt, label: opt };
-            }
-            if (typeof opt === "object" && opt.value !== undefined) {
-              return { value: String(opt.value), label: String(opt.label || opt.value) };
-            }
-            return { value: String(opt), label: String(opt) };
-          });
-          // Validate normalized options
-          for (let j = 0; j < parsedQuestions[i].options.length; j++) {
-            const opt = parsedQuestions[i].options[j];
-            if (!opt.value || opt.value.trim() === "" || !opt.label || opt.label.trim() === "") {
-              return { error: `Question ${i + 1}, Option ${j + 1}: value and label are required` };
-            }
+          if (typeof opt === "object" && opt.value !== undefined) {
+            return { value: String(opt.value), label: String(opt.label || opt.value) };
+          }
+          return { value: String(opt), label: String(opt) };
+        });
+        // Validate normalized options
+        for (let j = 0; j < parsedQuestions[i].options.length; j++) {
+          const opt = parsedQuestions[i].options[j];
+          if (!opt.value || opt.value.trim() === "" || !opt.label || opt.label.trim() === "") {
+            return { error: `Question ${i + 1}, Option ${j + 1}: value and label are required` };
           }
         }
       }
