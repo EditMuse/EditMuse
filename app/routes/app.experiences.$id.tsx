@@ -75,8 +75,14 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       return normalized;
     })
     .filter((q: any) => q.type === "text" || q.type === "select"); // Only keep supported types
-  } else {
-    // Seed with default questions if empty
+  }
+  
+  // Normalize invalid mode to "hybrid"
+  const validModes = ["quiz", "chat", "hybrid"];
+  const normalizedMode = validModes.includes(experience.mode) ? experience.mode : "hybrid";
+  
+  // Seed with default questions if empty, but only for quiz/hybrid modes (not chat)
+  if (parsedQuestions.length === 0 && normalizedMode !== "chat") {
     parsedQuestions = [
       {
         type: "text",
@@ -99,10 +105,6 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       },
     ];
   }
-
-  // Normalize invalid mode to "hybrid"
-  const validModes = ["quiz", "chat", "hybrid"];
-  const normalizedMode = validModes.includes(experience.mode) ? experience.mode : "hybrid";
 
   const { getMaxResultCount } = await import("~/models/billing.server");
   const maxResultCount = await getMaxResultCount(shop.id);

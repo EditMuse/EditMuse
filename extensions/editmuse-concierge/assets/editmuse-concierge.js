@@ -2346,14 +2346,23 @@
         var data = result.parsed;
         debugLog('[EditMuse] Questions response:', data);
 
-        if (data.ok && data.questions && Array.isArray(data.questions)) {
-          debugLog('[EditMuse] Successfully fetched', data.questions.length, 'questions');
-          // Return empty array if no questions (allowed for chat mode)
+        // Check if response is ok and has questions array (empty array is valid for chat mode)
+        if (data && data.ok && Array.isArray(data.questions)) {
+          var questionsCount = data.questions.length;
+          debugLog('[EditMuse] Successfully fetched', questionsCount, 'questions');
+          // Return array (even if empty - allowed for chat mode with 0 questions)
+          // Empty array is valid for chat mode, so return it directly
           return data.questions;
         }
 
-        var errorMsg = data.error || 'No questions available from experience';
-        debugLog('[EditMuse] Failed to get questions:', errorMsg, data);
+        // If we get here, either data.ok is false, or questions is not an array
+        var errorMsg = (data && data.error) || 'No questions available from experience';
+        debugLog('[EditMuse] Failed to get questions:', errorMsg, { 
+          hasData: !!data, 
+          ok: data ? data.ok : undefined, 
+          questionsIsArray: data ? Array.isArray(data.questions) : undefined,
+          questions: data ? data.questions : undefined
+        });
         throw new Error(errorMsg);
       } catch (error) {
         debugLog('[EditMuse] Error fetching questions:', error);
