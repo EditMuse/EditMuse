@@ -206,7 +206,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     };
   }
 
-  // Validate questionsJson
+  // Validate questionsJson - allow 0 questions for chat mode
   let parsedQuestions: any[] = [];
   try {
     if (questionsJson && questionsJson.trim() !== "") {
@@ -215,10 +215,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return { error: "Questions must be a JSON array" };
       }
       
-      // Validate - at least 1 question required
-      if (parsedQuestions.length === 0) {
-        return { error: "At least one question is required" };
+      // Validate - allow 0 questions for chat mode, require at least 1 for quiz/hybrid
+      if (parsedQuestions.length === 0 && mode !== "chat") {
+        return { error: "At least one question is required for guided quiz and hybrid modes" };
       }
+    } else {
+      // Empty questionsJson - allow for chat mode
+      if (mode !== "chat") {
+        return { error: "At least one question is required for guided quiz and hybrid modes" };
+      }
+      parsedQuestions = [];
+    }
       
       // Validate and normalize each question
       const validTypes = ["text", "select"];
@@ -380,10 +387,10 @@ export default function EditExperience() {
       newErrors.resultCount = "Result count must be 8, 12, or 16";
     }
 
-    // Validate questions - at least 1 question required
-    if (questions.length === 0) {
-      newErrors.questionsJson = "At least one question is required";
-    } else {
+    // Validate questions - allow 0 questions for chat mode
+    if (questions.length === 0 && form.mode !== "chat") {
+      newErrors.questionsJson = "At least one question is required for guided quiz and hybrid modes";
+    } else if (questions.length > 0) {
       const questionErrors: Record<number, string> = {};
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];

@@ -2346,15 +2346,13 @@
         var data = result.parsed;
         debugLog('[EditMuse] Questions response:', data);
 
-        if (data.ok && data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+        if (data.ok && data.questions && Array.isArray(data.questions)) {
           debugLog('[EditMuse] Successfully fetched', data.questions.length, 'questions');
+          // Return empty array if no questions (allowed for chat mode)
           return data.questions;
         }
 
         var errorMsg = data.error || 'No questions available from experience';
-        if (data.questions && Array.isArray(data.questions) && data.questions.length === 0) {
-          errorMsg = 'Experience has no questions configured';
-        }
         debugLog('[EditMuse] Failed to get questions:', errorMsg, data);
         throw new Error(errorMsg);
       } catch (error) {
@@ -2423,15 +2421,52 @@
         var mode = this.state.mode;
         
         if (mode === 'chat') {
-          // Chat mode: single textarea step
-          this.state.questions = [EM_CHAT_QUESTION];
-          this.state.current = 0;
-          this.state.answers = {};
-          this.state.loading = false;
-          this.state.error = null;
-          this.render();
-          this.updateNavState();
-          this.updateProgressBar();
+          // Chat mode: fetch questions first to check if any exist
+          try {
+            var fetchedQuestions = await this.fetchQuestions();
+            var questionsCount = fetchedQuestions ? fetchedQuestions.length : 0;
+            console.log('[Widget] chat_mode_questions_count=' + questionsCount);
+            
+            if (questionsCount === 0) {
+              // Zero questions: skip question flow, allow direct chat
+              // Use EM_CHAT_QUESTION for UI, but mark as skipQuestions so handleSubmit knows
+              console.log('[Widget] skipping_questions=true');
+              var chatQuestionForUI = { ...EM_CHAT_QUESTION };
+              chatQuestionForUI._skipQuestions = true; // Mark as skip case
+              this.state.questions = [chatQuestionForUI];
+              this.state.current = 0;
+              this.state.answers = {};
+              this.state.loading = false;
+              this.state.error = null;
+              this.state.skipQuestions = true; // Flag to indicate we're skipping questions
+              this.render();
+              this.updateNavState();
+              this.updateProgressBar();
+            } else {
+              // Questions exist: use single textarea step (existing behavior)
+              this.state.questions = [EM_CHAT_QUESTION];
+              this.state.current = 0;
+              this.state.answers = {};
+              this.state.loading = false;
+              this.state.error = null;
+              this.state.skipQuestions = false;
+              this.render();
+              this.updateNavState();
+              this.updateProgressBar();
+            }
+          } catch (fetchError) {
+            // If fetch fails, fall back to default chat question
+            console.warn('[EditMuse] Failed to fetch questions in chat mode, using default:', fetchError);
+            this.state.questions = [EM_CHAT_QUESTION];
+            this.state.current = 0;
+            this.state.answers = {};
+            this.state.loading = false;
+            this.state.error = null;
+            this.state.skipQuestions = false;
+            this.render();
+            this.updateNavState();
+            this.updateProgressBar();
+          }
         } else if (mode === 'quiz') {
           // Quiz mode: fetch questions and use as-is
           var fetchPromise = this.fetchQuestions();
@@ -3186,17 +3221,37 @@
 
       // Collect all answers from state (never read DOM for select)
       var messages = [];
-      for (var i = 0; i < this.state.questions.length; i++) {
-        var answer = this.state.answers[i];
-        if (answer !== undefined && answer !== null && answer !== '') {
-          messages.push(answer);
+      
+      // Handle skipQuestions case (chat mode with 0 questions)
+      if (this.state.skipQuestions) {
+        // Get query from the textarea input (same as normal text question)
+        // The UI shows EM_CHAT_QUESTION, so we can get the answer normally
+        var skipAnswer = this.state.answers[this.state.current];
+        if (!skipAnswer && currentStepEl) {
+          // Try to get from DOM if not in state
+          var textInput = currentStepEl.querySelector('textarea[data-editmuse-quiz-input], input[type="text"][data-editmuse-quiz-input]');
+          if (textInput && textInput.value && textInput.value.trim() !== '') {
+            skipAnswer = textInput.value.trim();
+          }
+        }
+        
+        if (skipAnswer && skipAnswer.trim() !== '') {
+          messages.push(skipAnswer.trim());
+        }
+      } else {
+        // Normal flow: collect answers from questions
+        for (var i = 0; i < this.state.questions.length; i++) {
+          var answer = this.state.answers[i];
+          if (answer !== undefined && answer !== null && answer !== '') {
+            messages.push(answer);
+          }
         }
       }
 
       if (messages.length === 0) {
         window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
         window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
-        this.showError('Please answer at least one question');
+        this.showError('Please enter your query');
         return;
       }
       
@@ -3210,13 +3265,23 @@
 
       try {
           var requestBody = {
-            answers: messages,
             clientRequestId: window.__EDITMUSE_SUBMIT_LOCK.requestId
           };
 
         var experienceId = this.getExperienceId();
           if (experienceId && experienceId.trim() !== '') {
             requestBody.experienceId = experienceId;
+          }
+          
+          // For skipQuestions (chat mode with 0 questions), pass query as first answer
+          // Backend will recognize chat mode with 0 questions and handle appropriately
+          if (this.state.skipQuestions) {
+            // Pass query as answers[0] for chat mode with 0 questions
+            // Backend should accept this and start session with the query
+            requestBody.answers = messages.length > 0 ? messages : [];
+          } else {
+            // Normal flow: include answers
+            requestBody.answers = messages;
           }
 
         // resultCount is now controlled by Experience.resultCount on the backend

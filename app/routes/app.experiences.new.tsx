@@ -139,18 +139,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return { error: "Excluded Tags must be valid JSON array (e.g., [\"tag1\", \"tag2\"] or leave empty)" };
     }
 
-    // Validate questionsJson - at least 1 question required
+    // Validate questionsJson - allow 0 questions for chat mode
     let parsedQuestions: any[] = [];
     try {
       if (!questionsJson || questionsJson.trim() === "") {
-        return { error: "At least one question is required" };
-      }
-      parsedQuestions = JSON.parse(questionsJson);
-      if (!Array.isArray(parsedQuestions)) {
-        return { error: "Questions must be a JSON array" };
-      }
-      if (parsedQuestions.length === 0) {
-        return { error: "At least one question is required" };
+        // Allow empty questions for chat mode
+        if (mode !== "chat") {
+          return { error: "At least one question is required" };
+        }
+        parsedQuestions = [];
+      } else {
+        parsedQuestions = JSON.parse(questionsJson);
+        if (!Array.isArray(parsedQuestions)) {
+          return { error: "Questions must be a JSON array" };
+        }
+        // Allow 0 questions for chat mode, require at least 1 for quiz/hybrid
+        if (parsedQuestions.length === 0 && mode !== "chat") {
+          return { error: "At least one question is required for guided quiz and hybrid modes" };
+        }
       }
       // Validate each question has required fields
       const validTypes = ["text", "select"];
@@ -302,10 +308,10 @@ export default function NewExperience() {
       newErrors.resultCount = "Result count must be 8, 12, or 16";
     }
 
-    // Validate questions - at least 1 question required
-    if (questions.length === 0) {
-      newErrors.questionsJson = "At least one question is required";
-    } else {
+    // Validate questions - allow 0 questions for chat mode
+    if (questions.length === 0 && form.mode !== "chat") {
+      newErrors.questionsJson = "At least one question is required for guided quiz and hybrid modes";
+    } else if (questions.length > 0) {
       const questionErrors: Record<number, string> = {};
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];

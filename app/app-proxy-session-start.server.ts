@@ -386,12 +386,82 @@ function parseIntentGeneric(
 }
 
 /**
+ * Get shop currency from Shopify shop data (cached)
+ * Returns currency code (e.g., "USD", "GBP", "EUR") or null if unavailable
+ */
+async function getShopCurrency(shopDomain: string, accessToken: string): Promise<string | null> {
+  try {
+    const apiVersion = "2026-01";
+    const url = `https://${shopDomain}/admin/api/${apiVersion}/graphql.json`;
+    
+    const query = `{
+      shop {
+        currencyCode
+      }
+    }`;
+    
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-Shopify-Access-Token": accessToken,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query }),
+    });
+    
+    if (!response.ok) {
+      console.log("[Currency] Failed to fetch shop currency, status:", response.status);
+      return null;
+    }
+    
+    const data = await response.json();
+    if (data.errors) {
+      console.log("[Currency] GraphQL errors fetching shop currency:", data.errors);
+      return null;
+    }
+    
+    const currencyCode = data.data?.shop?.currencyCode || null;
+    return currencyCode;
+  } catch (error) {
+    console.log("[Currency] Error fetching shop currency:", error instanceof Error ? error.message : String(error));
+    return null;
+  }
+}
+
+/**
+ * Convert currency symbol to ISO currency code
+ */
+function currencySymbolToCode(symbol: string): string | null {
+  const mapping: Record<string, string> = {
+    "$": "USD",
+    "£": "GBP",
+    "€": "EUR",
+  };
+  return mapping[symbol] || null;
+}
+
+/**
+ * Simple currency conversion (can be replaced with configurable FX rate source)
+ * Returns conversion rate or 1.0 if currencies match or unknown
+ */
+function getCurrencyConversionRate(fromCurrency: string | null, toCurrency: string | null): number {
+  if (!fromCurrency || !toCurrency || fromCurrency === toCurrency) {
+    return 1.0;
+  }
+  
+  // Default: treat as numeric if no conversion rate available
+  // In production, this could call an FX API or use cached rates
+  // For now, log mismatch and return 1.0 to treat as numeric
+  return 1.0;
+}
+
+/**
  * Parse numeric price ceiling from user intent text (industry-agnostic)
  * Extracts a single numeric ceiling (maxPriceCeiling) from natural language phrases
  * Supports currency symbols (£ $ €) and optional commas
- * Returns null if no valid ceiling is found
+ * Returns { value: number, currency: string | null } or null if no valid ceiling is found
  */
-function parsePriceCeiling(text: string): number | null {
+function parsePriceCeiling(text: string): { value: number; currency: string | null } | null {
   if (!text || typeof text !== "string") {
     return null;
   }
@@ -463,12 +533,14 @@ function parsePriceCeiling(text: string): number | null {
       const parsed = parseFloat(cleanedValue);
       
       if (!isNaN(parsed) && isFinite(parsed) && parsed > 0) {
+        const currencyCode = currencyDetected ? currencySymbolToCode(currencyDetected) : null;
         console.log("[Constraints] Parsed price ceiling", {
           value: parsed,
           pattern: name,
-          currencyDetected: currencyDetected || "none"
+          currencyDetected: currencyDetected || "none",
+          currencyCode: currencyCode || "none"
         });
-        return parsed;
+        return { value: parsed, currency: currencyCode };
       }
     }
   }
@@ -493,11 +565,13 @@ function parseBundleIntentGeneric(userIntent: string): {
         allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
       };
       priceCeiling?: number | null;
+      userCurrency?: string | null; // User-specified currency (from input)
       includeTerms?: string[];
       excludeTerms?: string[];
     };
   }>;
   totalBudget: number | null;
+  totalBudgetCurrency: string | null; // Currency detected from total budget
 } {
   const lowerText = userIntent.toLowerCase();
   
@@ -643,7 +717,7 @@ function parseBundleIntentGeneric(userIntent: string): {
   const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
 
   if (!isBundle) {
-    return { isBundle: false, items: [], totalBudget: null };
+    return { isBundle: false, items: [], totalBudget: null, totalBudgetCurrency: null };
   }
   
   // Extract items with quantities and per-item constraints
@@ -658,6 +732,7 @@ function parseBundleIntentGeneric(userIntent: string): {
         allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
       };
       priceCeiling?: number | null;
+      userCurrency?: string | null; // User-specified currency (from input)
       includeTerms?: string[];
       excludeTerms?: string[];
     };
@@ -828,7 +903,7 @@ function parseBundleIntentGeneric(userIntent: string): {
     }
     
     // Extract price ceiling scoped to this item (e.g., "suit under $100")
-    const itemPriceCeiling = parsePriceCeiling(itemContext);
+    const itemPriceCeilingResult = parsePriceCeiling(itemContext);
     
     // Build option constraints if any found
     if (itemSize || itemColor || itemMaterial) {
@@ -839,9 +914,13 @@ function parseBundleIntentGeneric(userIntent: string): {
       };
     }
     
-    // Add price ceiling if found
-    if (itemPriceCeiling !== null) {
-      itemConstraints.priceCeiling = itemPriceCeiling;
+    // Add price ceiling if found (currency handling will be done later)
+    if (itemPriceCeilingResult !== null) {
+      itemConstraints.priceCeiling = itemPriceCeilingResult.value;
+      // Store currency for later conversion if needed
+      if (itemPriceCeilingResult.currency) {
+        itemConstraints.userCurrency = itemPriceCeilingResult.currency;
+      }
     }
     
     // Only add constraints object if it has any constraints
@@ -859,12 +938,15 @@ function parseBundleIntentGeneric(userIntent: string): {
   }
   
   // Extract total budget if mentioned using improved numeric constraint parsing
-  const totalBudget = parsePriceCeiling(userIntent);
+  const totalBudgetResult = parsePriceCeiling(userIntent);
+  const totalBudget = totalBudgetResult?.value ?? null;
+  const totalBudgetCurrency = totalBudgetResult?.currency ?? null;
   
   // Log bundle detection
   console.log("[Bundle] detected", {
     itemCount: items.length,
-    totalBudgetOrCeiling: totalBudget !== null ? totalBudget : "none"
+    totalBudgetOrCeiling: totalBudget !== null ? totalBudget : "none",
+    totalBudgetCurrency: totalBudgetCurrency || "none"
   });
   
   // Log per-item constraints
@@ -893,7 +975,7 @@ function parseBundleIntentGeneric(userIntent: string): {
     }
   }
   
-  return { isBundle: true, items, totalBudget };
+  return { isBundle: true, items, totalBudget, totalBudgetCurrency: totalBudgetCurrency || null };
 }
 
 function mergeConstraints(a: VariantConstraints, b: VariantConstraints): VariantConstraints {
@@ -1411,6 +1493,11 @@ export async function proxySessionStartAction(
     
     console.log("[App Proxy] Parsed", questions.length, "questions from JSON");
     
+    // Log questions count for chat mode
+    if (modeUsed === "chat") {
+      console.log("[Experience] chat_mode_questions_count=" + questions.length);
+    }
+    
     // Normalize questions format: use "question" field, ensure select options have {value, label}
     questions = questions.map((q: any) => {
       const normalized: any = { ...q };
@@ -1480,8 +1567,11 @@ export async function proxySessionStartAction(
   }
 
   // Check if answers are provided - if not, just return questions without creating a session
+  // Exception: chat mode with 0 questions can start session with empty answers
   // Note: hasAnswers was already calculated earlier as isQuestionOnlyRequest = !hasAnswers
-  if (!hasAnswers) {
+  const isChatModeWithZeroQuestions = modeUsed === "chat" && questions.length === 0;
+  
+  if (!hasAnswers && !isChatModeWithZeroQuestions) {
     console.log("[App Proxy] No answers provided - returning questions only");
 
     console.log("[App Proxy] Returning questions-only response:", {
@@ -1507,6 +1597,13 @@ export async function proxySessionStartAction(
         showTrialBadge: entitlements.showTrialBadge,
       },
     });
+  }
+  
+  // For chat mode with 0 questions, allow empty answers
+  if (isChatModeWithZeroQuestions && !hasAnswers) {
+    console.log("[App Proxy] Chat mode with 0 questions - allowing session start with empty answers");
+    // Set answers to empty array for processing
+    answers = [];
   }
 
   // Answers provided - proceed with session creation and result processing
@@ -1668,6 +1765,7 @@ async function processSessionInBackground({
   // Parse answers to extract price/budget range if present
   let priceMin: number | null = null;
   let priceMax: number | null = null;
+  let userCurrency: string | null = null; // Track user-specified currency from answers
   
   if (Array.isArray(answers)) {
     // Look for budget/price range answers - check if any answer matches common budget patterns
@@ -1675,9 +1773,11 @@ async function processSessionInBackground({
       const answerStr = String(answer);
       
       // First, try to extract price ceiling using improved parsing
-      const priceCeiling = parsePriceCeiling(answerStr);
-      if (priceCeiling !== null) {
-        priceMax = priceCeiling;
+      const priceCeilingResult = parsePriceCeiling(answerStr);
+      if (priceCeilingResult !== null) {
+        priceMax = priceCeilingResult.value;
+        userCurrency = priceCeilingResult.currency || null;
+        // Currency conversion will be done later when shop currency is available
         continue; // Found ceiling, move to next answer
       }
       
@@ -1724,6 +1824,13 @@ async function processSessionInBackground({
 
   // Get access token from Session table
   const accessToken = await getAccessTokenForShop(shopDomain);
+  
+  // Get shop currency (cached, fetched once)
+  let shopCurrency: string | null = null;
+  if (accessToken) {
+    shopCurrency = await getShopCurrency(shopDomain, accessToken);
+    console.log("[Currency] shop_currency", { shopCurrency: shopCurrency || "unknown" });
+  }
   
   let productHandles: string[] = [];
   let aiCallCount = 0; // Track AI calls per session (should be 0 or 1)
@@ -2093,6 +2200,71 @@ async function processSessionInBackground({
       const bundleIntent = parseBundleIntentGeneric(userIntent);
       // Bundle detection already logged in parseBundleIntentGeneric
       // Additional log for reference: bundleIntent.isBundle, items.length, totalBudget
+      
+      // Currency conversion: Convert user budget to shop currency
+      let convertedPriceMax: number | null = priceMax;
+      let convertedTotalBudget: number | null = bundleIntent.totalBudget;
+      let currencyMismatch = false;
+      
+      if (shopCurrency && accessToken) {
+        // Get user currency from bundle intent or answers
+        const userCurrencyFromBundle = bundleIntent.totalBudgetCurrency || userCurrency;
+        
+        if (userCurrencyFromBundle && userCurrencyFromBundle !== shopCurrency) {
+          currencyMismatch = true;
+          const conversionRate = getCurrencyConversionRate(userCurrencyFromBundle, shopCurrency);
+          
+          if (conversionRate !== 1.0) {
+            // Convert if rate available
+            if (priceMax !== null) {
+              convertedPriceMax = priceMax * conversionRate;
+              console.log("[Currency] converted_priceMax", {
+                userCurrency: userCurrencyFromBundle,
+                shopCurrency,
+                originalValue: priceMax,
+                convertedValue: convertedPriceMax,
+                conversionRate,
+                currencyMismatch: true
+              });
+            }
+            if (bundleIntent.totalBudget !== null) {
+              convertedTotalBudget = bundleIntent.totalBudget * conversionRate;
+              console.log("[Currency] converted_totalBudget", {
+                userCurrency: userCurrencyFromBundle,
+                shopCurrency,
+                originalValue: bundleIntent.totalBudget,
+                convertedValue: convertedTotalBudget,
+                conversionRate,
+                currencyMismatch: true
+              });
+            }
+          } else {
+            // No conversion rate - treat as numeric and log mismatch
+            console.log("[Currency] currency_mismatch", {
+              userCurrency: userCurrencyFromBundle,
+              shopCurrency,
+              originalValue: priceMax || bundleIntent.totalBudget,
+              convertedValue: priceMax || bundleIntent.totalBudget,
+              note: "Treating as numeric - no conversion rate available",
+              currencyMismatch: true
+            });
+          }
+        } else {
+          // Currencies match or no user currency specified
+          console.log("[Currency] currency_match", {
+            userCurrency: userCurrencyFromBundle || "none",
+            shopCurrency,
+            note: "Currencies match or no user currency specified",
+            currencyMismatch: false
+          });
+        }
+      }
+      
+      // Use converted values
+      priceMax = convertedPriceMax;
+      if (bundleIntent.totalBudget !== null) {
+        bundleIntent.totalBudget = convertedTotalBudget;
+      }
       
       // Calculate dynamic AI window - SMALL-FIRST approach
       // Single-item: 20 candidates for first AI attempt (was 40)
@@ -2681,6 +2853,64 @@ async function processSessionInBackground({
         return allocated;
       }
       
+      // Slot allocation: distribute resultCount across bundle items
+      // Minimum 1 slot per type, distribute remaining evenly or weighted by prominence
+      function allocateSlotsAcrossTypes(
+        items: Array<{ hardTerms: string[]; quantity: number }>,
+        totalSlots: number
+      ): Map<number, number> {
+        const slotPlan = new Map<number, number>();
+        const itemCount = items.length;
+        
+        if (itemCount === 0) {
+          return slotPlan;
+        }
+        
+        // Minimum 1 slot per type
+        const minSlotsPerType = 1;
+        const reservedSlots = itemCount * minSlotsPerType;
+        const remainingSlots = Math.max(0, totalSlots - reservedSlots);
+        
+        // Distribute minimum slots
+        for (let i = 0; i < itemCount; i++) {
+          slotPlan.set(i, minSlotsPerType);
+        }
+        
+        // Distribute remaining slots: weight by quantity or evenly
+        if (remainingSlots > 0) {
+          const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+          
+          if (totalQuantity > 0) {
+            // Weighted by quantity (primary type prominence)
+            for (let i = 0; i < itemCount; i++) {
+              const weight = items[i].quantity / totalQuantity;
+              const additionalSlots = Math.floor(remainingSlots * weight);
+              slotPlan.set(i, slotPlan.get(i)! + additionalSlots);
+            }
+            
+            // Distribute any remaining slots due to rounding errors
+            const allocatedRemaining = Array.from(slotPlan.values()).reduce((sum, slots) => sum + slots, 0) - reservedSlots;
+            const stillRemaining = remainingSlots - allocatedRemaining;
+            if (stillRemaining > 0) {
+              // Distribute to first items until exhausted
+              for (let i = 0; i < stillRemaining && i < itemCount; i++) {
+                slotPlan.set(i, slotPlan.get(i)! + 1);
+              }
+            }
+          } else {
+            // Even distribution if no quantities specified
+            const slotsPerType = Math.floor(remainingSlots / itemCount);
+            const extraSlots = remainingSlots % itemCount;
+            
+            for (let i = 0; i < itemCount; i++) {
+              slotPlan.set(i, slotPlan.get(i)! + slotsPerType + (i < extraSlots ? 1 : 0));
+            }
+          }
+        }
+        
+        return slotPlan;
+      }
+      
       const bundleItemsWithBudget: BundleItemWithBudget[] = bundleIntent.isBundle && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number"
         ? allocateBudgetPerItem(bundleIntent.items, bundleIntent.totalBudget).map((item, idx) => ({
             ...item,
@@ -2690,6 +2920,37 @@ async function processSessionInBackground({
             ...item,
             constraints: item.constraints
           }));
+      
+      // Slot allocation plan for bundle mode
+      let slotPlan: Map<number, number> = new Map();
+      if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        slotPlan = allocateSlotsAcrossTypes(bundleIntent.items, finalResultCount);
+        
+        // Log requestedTypes, slotPlan
+        const requestedTypes = bundleIntent.items.map((item, idx) => ({
+          index: idx,
+          type: item.hardTerms[0] || "unknown",
+          quantity: item.quantity,
+          slots: slotPlan.get(idx) || 0
+        }));
+        
+        console.log("[Bundle] requestedTypes", requestedTypes.map(r => ({
+          index: r.index,
+          type: r.type,
+          quantity: r.quantity,
+          slots: r.slots
+        })));
+        
+        console.log("[Bundle] slotPlan", {
+          totalRequested: finalResultCount,
+          allocatedSlots: Array.from(slotPlan.entries()).map(([idx, slots]) => ({
+            itemIndex: idx,
+            type: bundleIntent.items[idx]?.hardTerms[0] || "unknown",
+            slots
+          })),
+          totalAllocated: Array.from(slotPlan.values()).reduce((sum, slots) => sum + slots, 0)
+        });
+      }
       
       if (bundleIntent.isBundle) {
         // Log when no budget is provided
@@ -2969,6 +3230,8 @@ async function processSessionInBackground({
       }
       
       const strictGateCount = strictGate.length;
+      // Store strict gate candidates for fallback ranking (if strictGateCount > 0, fallback must use strict gate only)
+      const strictGateCandidates = strictGate.length > 0 ? [...strictGate] : undefined;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
       
       // BUNDLE/HARD-TERM PATH: Continue processing
@@ -3752,31 +4015,33 @@ async function processSessionInBackground({
       try {
         aiCallCount++; // Track AI call
       const ai1 = await rankProductsWithAI(
-        userIntent,
-        window1,
-        targetCount,
-        shop.id,
-        sessionToken,
-        variantConstraints2,
-        variantPreferences,
-        includeTerms,
-        avoidTerms,
-        {
-          hardTerms,
-          hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
-          avoidTerms,
-          trustFallback,
-          ...(isBundleMode ? {
-            isBundle: true,
-            bundleItems: bundleItemsWithBudget.map(item => ({
-              hardTerms: item.hardTerms,
-              quantity: item.quantity,
-              budgetMax: item.budgetMax,
-            })),
-          } : {}),
-        },
-        experienceIdUsed
-      );
+            userIntent,
+            window1,
+            targetCount,
+            shop.id,
+            sessionToken,
+            variantConstraints2,
+            variantPreferences,
+            includeTerms,
+            avoidTerms,
+            {
+              hardTerms,
+              hardFacets: Object.keys(hardFacetsForAI).length > 0 ? hardFacetsForAI : undefined,
+              avoidTerms,
+              trustFallback,
+              ...(isBundleMode ? {
+                isBundle: true,
+                bundleItems: bundleItemsWithBudget.map(item => ({
+                  hardTerms: item.hardTerms,
+                  quantity: item.quantity,
+                  budgetMax: item.budgetMax,
+                })),
+              } : {}),
+            },
+            experienceIdUsed,
+            strictGateCount,
+            strictGateCandidates
+          );
         // Measure aiMs immediately after AI call completes
         aiMs += Math.round(performance.now() - aiStartSingle);
 
@@ -4328,6 +4593,52 @@ async function processSessionInBackground({
         }).join(" ");
         console.log("[Bundle] finalCounts per item:", finalCountsText);
         
+        // Track per-type counts and check for slot reallocation
+        const perTypeCounts = bundleItemsWithBudget.map((item, idx) => ({
+          index: idx,
+          type: item.hardTerms[0] || "unknown",
+          requested: slotPlan.get(idx) || 0,
+          delivered: finalCountsByItem.get(idx) || 0,
+          hasMatches: (finalCountsByItem.get(idx) || 0) > 0
+        }));
+        
+        // Log perTypeCounts
+        console.log("[Bundle] perTypeCounts", {
+          counts: perTypeCounts.map(p => ({
+            index: p.index,
+            type: p.type,
+            requested: p.requested,
+            delivered: p.delivered,
+            hasMatches: p.hasMatches
+          })),
+          totalRequested: Array.from(slotPlan.values()).reduce((sum, slots) => sum + slots, 0),
+          totalDelivered: finalHandlesGuaranteed.length
+        });
+        
+        // Check for types with no matches and log reallocation
+        const typesWithNoMatches = perTypeCounts.filter(p => !p.hasMatches && p.requested > 0);
+        if (typesWithNoMatches.length > 0) {
+          console.log("[Bundle] slot_reallocation", {
+            reason: "types_with_no_matches",
+            reallocatedTypes: typesWithNoMatches.map(p => ({
+              index: p.index,
+              type: p.type,
+              requestedSlots: p.requested
+            })),
+            note: "Slots reallocated to other types automatically"
+          });
+        }
+        
+        // Log final mix summary
+        console.log("[Bundle] final_mix_summary", {
+          requestedTypes: bundleIntent.items.length,
+          requestedSlots: Array.from(slotPlan.values()).reduce((sum, slots) => sum + slots, 0),
+          deliveredHandles: finalHandlesGuaranteed.length,
+          typesWithMatches: perTypeCounts.filter(p => p.hasMatches).length,
+          typesWithNoMatches: typesWithNoMatches.length,
+          mix: perTypeCounts.map(p => `${p.type}:${p.delivered}`).join(" ")
+        });
+        
         console.log("[App Proxy] [Layer 3] Bundle-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
       } else {
         // SINGLE-ITEM PATH: Existing top-up logic
@@ -4338,27 +4649,27 @@ async function processSessionInBackground({
           finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
         }
         
-        // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
-        if (!trustFallback) {
-          // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
-          if (gatedCandidates.length > 0) {
+      // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+      if (!trustFallback) {
+        // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
+        if (gatedCandidates.length > 0) {
             finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-          }
-          // If still short after gated top-up, return fewer results (better than drift)
+        }
+        // If still short after gated top-up, return fewer results (better than drift)
           console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
-        } else {
-          // Trust fallback: can use broader pool, but prefer gated first
-          if (gatedCandidates.length > 0) {
+      } else {
+        // Trust fallback: can use broader pool, but prefer gated first
+        if (gatedCandidates.length > 0) {
             finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
-          }
-          
-          // If still short, use broader pool (allCandidatesForTopUp)
+        }
+        
+        // If still short, use broader pool (allCandidatesForTopUp)
           if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
             finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
-          }
-          
-          // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
-          if (finalHandlesGuaranteed.length < finalResultCount) {
+        }
+        
+        // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
+        if (finalHandlesGuaranteed.length < finalResultCount) {
           const baseCandidates: EnrichedCandidate[] = baseProducts.map(p => {
             const descPlain = cleanDescription((p as any).description || null);
             const desc1000 = descPlain.substring(0, 1000);
@@ -4587,10 +4898,213 @@ async function processSessionInBackground({
       const finalHandlesToSave = Array.isArray(productHandles) ? productHandles : [];
       
       // Double-check: if finalHandlesToSave is empty but finalHandles has items, use finalHandles
-      const handlesToSave = finalHandlesToSave.length > 0 ? finalHandlesToSave : (Array.isArray(finalHandles) ? finalHandles.slice(0, targetCount) : []);
-      const deliveredCount = handlesToSave.length;
+      let handlesToSave = finalHandlesToSave.length > 0 ? finalHandlesToSave : (Array.isArray(finalHandles) ? finalHandles.slice(0, targetCount) : []);
+      let deliveredCount = handlesToSave.length;
       const requestedCount = finalResultCount;
-      const billedCount = handlesToSave.length;
+      let billedCount = handlesToSave.length;
+      
+      // Bundle mode validation: verify each requested type has at least 1 match (BEFORE Layer 3 validation)
+      let missingTypes: Array<{ index: number; type: string }> = [];
+      if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        // Check which types are missing from finalHandlesGuaranteed
+        const handlesSet = new Set(finalHandlesGuaranteed);
+        const candidateMapForTypeCheck = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+          const bundleItem = bundleIntent.items[itemIdx];
+          const itemHardTerms = bundleItem.hardTerms;
+          
+          // Check if any handle in finalHandlesGuaranteed matches this item's hard terms
+          let hasMatch = false;
+          for (const handle of finalHandlesGuaranteed) {
+            const candidate = candidateMapForTypeCheck.get(handle);
+            if (!candidate) continue;
+            
+            const haystack = [
+              candidate.title || "",
+              candidate.productType || "",
+              (candidate.tags || []).join(" "),
+              candidate.vendor || "",
+              candidate.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              hasMatch = true;
+              break;
+            }
+          }
+          
+          if (!hasMatch) {
+            missingTypes.push({
+              index: itemIdx,
+              type: itemHardTerms[0] || "unknown"
+            });
+          }
+        }
+        
+        // Log missing types before top-up
+        if (missingTypes.length > 0) {
+          console.log("[Bundle] validation_missing_types", {
+            missingTypes: missingTypes.map(m => ({ index: m.index, type: m.type })),
+            beforeTopUp: true
+          });
+          
+          // Top-up per missing type from broader pool
+          const usedHandles = new Set(finalHandlesGuaranteed);
+          const topUpCandidates: EnrichedCandidate[] = [];
+          
+          for (const missing of missingTypes) {
+            const bundleItem = bundleIntent.items[missing.index];
+            const itemHardTerms = bundleItem.hardTerms;
+            
+            // Find candidates from broader pool (allCandidatesEnriched) that match this type
+            // and are not already in finalHandlesGuaranteed
+            const typeCandidates = allCandidatesEnriched
+              .filter(c => {
+                // Skip if already used
+                if (usedHandles.has(c.handle)) return false;
+                
+                // Check availability if inStockOnly is enabled
+                if (experience.inStockOnly && c.available !== true) return false;
+                
+                // Check if matches this item's hard terms
+                const haystack = [
+                  c.title || "",
+                  c.productType || "",
+                  (c.tags || []).join(" "),
+                  c.vendor || "",
+                  c.searchText || "",
+                ].join(" ");
+                
+                return itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+              })
+              .slice(0, Math.min(entitlements.candidateCap || 100, 10)); // Limit per type
+            
+            if (typeCandidates.length > 0) {
+              // Use BM25 ranking for this type
+              const itemTokens = itemHardTerms.flatMap(t => tokenize(t));
+              const itemIdf = calculateIDF(typeCandidates.map(c => ({ tokens: tokenize(c.searchText) })));
+              const itemAvgLen = typeCandidates.reduce((sum, c) => sum + tokenize(c.searchText).length, 0) / typeCandidates.length || 1;
+              
+              const itemRanked = typeCandidates.map(c => {
+                const docTokens = tokenize(c.searchText);
+                const docTokenFreq = new Map<string, number>();
+                for (const token of docTokens) {
+                  docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+                }
+                const score = bm25Score(itemTokens, docTokens, docTokenFreq, docTokens.length, itemAvgLen, itemIdf);
+                return { candidate: c, score };
+              });
+              
+              itemRanked.sort((a, b) => b.score - a.score);
+              
+              // Add top 1-2 candidates per missing type
+              const topCandidatesForType = itemRanked.slice(0, Math.min(2, itemRanked.length)).map(r => r.candidate);
+              topUpCandidates.push(...topCandidatesForType);
+              
+              console.log("[Bundle] validation_top_up_type", {
+                missingTypeIndex: missing.index,
+                missingType: missing.type,
+                candidatesFound: typeCandidates.length,
+                topCandidatesAdded: topCandidatesForType.length,
+                topHandles: topCandidatesForType.map(c => c.handle).slice(0, 3)
+              });
+            } else {
+              console.log("[Bundle] validation_no_candidates_for_type", {
+                missingTypeIndex: missing.index,
+                missingType: missing.type,
+                note: "No candidates found in broader pool for this type"
+              });
+            }
+          }
+          
+          // Add top-up candidates to finalHandlesGuaranteed
+          if (topUpCandidates.length > 0) {
+            const newHandles = topUpCandidates
+              .map(c => c.handle)
+              .filter(h => !usedHandles.has(h));
+            
+            finalHandlesGuaranteed.push(...newHandles);
+            
+            console.log("[Bundle] validation_top_up_result", {
+              missingTypesBefore: missingTypes.length,
+              topUpCandidatesAdded: newHandles.length,
+              newHandles: newHandles.slice(0, 5)
+            });
+            
+            // Re-check which types are still missing after top-up
+            const handlesSetAfter = new Set(finalHandlesGuaranteed);
+            const stillMissing: Array<{ index: number; type: string }> = [];
+            
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const bundleItem = bundleIntent.items[itemIdx];
+              const itemHardTerms = bundleItem.hardTerms;
+              
+              let hasMatch = false;
+              for (const handle of finalHandlesGuaranteed) {
+                const candidate = candidateMapForTypeCheck.get(handle);
+                if (!candidate) continue;
+                
+                const haystack = [
+                  candidate.title || "",
+                  candidate.productType || "",
+                  (candidate.tags || []).join(" "),
+                  candidate.vendor || "",
+                  candidate.searchText || "",
+                ].join(" ");
+                
+                const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (hasItemMatch) {
+                  hasMatch = true;
+                  break;
+                }
+              }
+              
+              if (!hasMatch) {
+                stillMissing.push({
+                  index: itemIdx,
+                  type: itemHardTerms[0] || "unknown"
+                });
+              }
+            }
+            
+            missingTypes = stillMissing;
+            
+            // Update handlesToSave with updated finalHandlesGuaranteed
+            const updatedHandlesToSave = Array.isArray(productHandles) ? productHandles : [];
+            const finalHandlesToSaveUpdated = updatedHandlesToSave.length > 0 
+              ? updatedHandlesToSave 
+              : (Array.isArray(finalHandles) ? finalHandles.slice(0, targetCount) : []);
+            
+            // Merge with finalHandlesGuaranteed (avoid duplicates)
+            const mergedHandles = Array.from(new Set([...finalHandlesToSaveUpdated, ...finalHandlesGuaranteed]));
+            handlesToSave = mergedHandles.slice(0, requestedCount);
+            deliveredCount = handlesToSave.length;
+            billedCount = handlesToSave.length;
+          }
+        }
+        
+        // Log final missing types (if any remain after top-up)
+        if (missingTypes.length > 0) {
+          console.log("[Bundle] validation_final_missing_types", {
+            missingTypes: missingTypes.map(m => ({ index: m.index, type: m.type })),
+            reason: "PARTIAL_BUNDLE",
+            note: "Some requested types have no matches in the product pool"
+          });
+          
+          // Update reasoning to indicate partial bundle
+          if (reasoning && !reasoning.includes("partial bundle")) {
+            const missingTypesList = missingTypes.map(m => m.type).join(", ");
+            reasoning += ` Note: Some requested types (${missingTypesList}) could not be matched from available products.`;
+          }
+        } else {
+          console.log("[Bundle] validation_all_types_satisfied", {
+            requestedTypes: bundleIntent.items.length,
+            note: "All requested types have at least one match"
+          });
+        }
+      }
       
       // Layer 3 final handle validation: track rejection reasons
       const candidateMapForValidation = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
@@ -4662,6 +5176,7 @@ async function processSessionInBackground({
       console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", billedCount, "handlesPreview=", handlesToSave.slice(0, 5));
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
+      // Note: If missingTypes.length > 0, this is a PARTIAL_BUNDLE (still marked COMPLETE)
       const saveStart = performance.now();
       await saveConciergeResult({
         sessionToken,

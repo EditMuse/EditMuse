@@ -695,7 +695,9 @@ export async function rankProductsWithAI(
   includeTerms?: string[],
   avoidTerms?: string[],
   hardConstraints?: HardConstraints,
-  experienceId?: string | null
+  experienceId?: string | null,
+  strictGateCount?: number,
+  strictGateCandidates?: ProductCandidate[]
 ): Promise<{ 
   selectedHandles: string[];
   reasoning?: string | null;
@@ -703,20 +705,34 @@ export async function rankProductsWithAI(
   source: "ai" | "fallback";
   parseFailReason?: string | null;
 }> {
+  // Helper function to determine fallback scope and candidates
+  const getFallbackCandidates = (): { candidates: ProductCandidate[]; scope: "strict_gate" | "full_pool" } => {
+    if (strictGateCount !== undefined && strictGateCount > 0 && strictGateCandidates && strictGateCandidates.length > 0) {
+      return { candidates: strictGateCandidates, scope: "strict_gate" };
+    }
+    return { candidates, scope: "full_pool" };
+  };
+
   if (candidates.length === 0) {
     console.log("[AI Ranking] source=fallback parse_fail_reason=No candidates to rank");
-    return deterministicRanking(candidates, resultCount, variantPreferences, "No candidates to rank");
+    const fallback = getFallbackCandidates();
+    console.log("[AI Ranking] fallback_scope=", fallback.scope);
+    return deterministicRanking(fallback.candidates, resultCount, variantPreferences, "No candidates to rank");
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     console.log("[AI Ranking] source=fallback parse_fail_reason=OPENAI_API_KEY not set");
-    return deterministicRanking(candidates, resultCount, variantPreferences, "OPENAI_API_KEY not set");
+    const fallback = getFallbackCandidates();
+    console.log("[AI Ranking] fallback_scope=", fallback.scope);
+    return deterministicRanking(fallback.candidates, resultCount, variantPreferences, "OPENAI_API_KEY not set");
   }
 
   if (!isAIRankingEnabled()) {
     console.log("[AI Ranking] source=fallback parse_fail_reason=Feature disabled via FEATURE_AI_RANKING");
-    return deterministicRanking(candidates, resultCount, variantPreferences, "Feature disabled via FEATURE_AI_RANKING");
+    const fallback = getFallbackCandidates();
+    console.log("[AI Ranking] fallback_scope=", fallback.scope);
+    return deterministicRanking(fallback.candidates, resultCount, variantPreferences, "Feature disabled via FEATURE_AI_RANKING");
   }
   
   // Check cache first
@@ -1383,6 +1399,11 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let responseId: string | null = null;
   let bodyResponseId: string | null = null;
   
+  // Request payload variables (declared outside try for catch block access)
+  let requestBody: any = null;
+  let currentCandidateCount: number = candidates.length;
+  let currentProductListJsonChars: number = productListJsonChars;
+  
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Calculate timeout for this attempt (needed in catch block)
     let timeoutMs = 40000; // Default to hard cap
@@ -1411,8 +1432,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       // Calculate current productListJsonChars based on currentCandidates and compression
       const currentProductList = useCompressedPrompt ? buildProductList(false, true) : (attempt === 0 ? productList : buildProductList(false));
-      const currentProductListJsonChars = JSON.stringify(currentProductList).length;
-      const currentCandidateCount = currentCandidates.length;
+      currentProductListJsonChars = JSON.stringify(currentProductList).length;
+      currentCandidateCount = currentCandidates.length;
       
       // Calculate adaptive timeout based on current state
       timeoutMs = calculateAdaptiveTimeout(currentCandidateCount, currentProductListJsonChars);
@@ -1429,63 +1450,57 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-      // Build request body with JSON mode/schema if supported
-      const requestBody: any = {
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
-        ],
-        temperature: 0, // Set to 0 for more deterministic output
-        max_tokens: 700, // Optimized for compact output (rejected_candidates removed from schema)
-      };
-      
       // Determine API endpoint based on structured outputs support
-      // When using json_schema with strict: true, we use Responses API structure
-      // Note: OpenAI's Responses API fields (output_parsed, output[]) are returned 
-      // even when calling /v1/chat/completions with json_schema strict mode
       let apiUsed: "responses" | "chat";
+      let apiUrl: string;
       
       // Use Responses API Structured Outputs with strict JSON schema
       // This guarantees valid JSON output that matches the schema exactly
       if (supportsJsonSchema) {
-        // Responses API Structured Outputs: use json_schema with strict: true
+        // Responses API: use simplified request format
         apiUsed = "responses";
-        const serviceTier = getServiceTier();
-        requestBody.response_format = {
-          type: "json_schema",
-          json_schema: {
-            name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
-            strict: true,
-            schema: buildJsonSchema(isBundle),
-          },
-        };
-        // Add service_tier for Responses API
-        requestBody.service_tier = serviceTier;
+        apiUrl = OPENAI_RESPONSES_URL;
         
-        // Add prompt cache for Responses API
-        const promptCacheKey = generatePromptCacheKey(
-          SCHEMA_VERSION,
-          experienceId,
-          isBundle ? "bundle" : "single",
-          currentCandidateCount
-        );
-        const promptCacheRetention = getPromptCacheRetention();
-        requestBody.prompt_cache_key = promptCacheKey;
-        requestBody.prompt_cache_retention = promptCacheRetention;
+        // Build Responses API request body with only required/optional fields
+        // Format: input is array of messages, response_format uses json_schema strict
+        requestBody = {
+          model,
+          input: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
+          ],
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
+              strict: true,
+              schema: buildJsonSchema(isBundle),
+            },
+          },
+          temperature: 0, // Optional: Set to 0 for more deterministic output
+          max_output_tokens: 700, // Optional: Optimized for compact output (rejected_candidates removed from schema)
+        };
+        
         console.log("[AI Ranking] structured_outputs=true");
-        console.log("[AI Ranking] service_tier=", serviceTier);
-        console.log("[AI Ranking] prompt_cache_key_set=true retention=", promptCacheRetention);
       } else {
-        // Fallback for models that don't support json_schema - use chat.completions only
+        // Fallback for models that don't support json_schema - use chat.completions
         apiUsed = "chat";
+        apiUrl = OPENAI_CHAT_COMPLETIONS_URL;
+        requestBody = {
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
+          ],
+          temperature: 0,
+          max_tokens: 700,
+          response_format: { type: "json_object" },
+        };
         console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode (chat.completions)");
-        requestBody.response_format = { type: "json_object" };
       }
 
-      // Always use /v1/chat/completions endpoint
-      // Responses API fields (output_parsed, output[]) are included in response when using json_schema strict
-      const response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
+      // Use appropriate endpoint based on API type
+      const response = await fetch(apiUrl, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -1546,11 +1561,6 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       // Extract response ID from response body if present (OpenAI sometimes includes this)
       bodyResponseId = data.id || data.request_id || null;
-      
-      // Log service tier from response if available (Responses API)
-      if (apiUsed === "responses" && data.service_tier) {
-        console.log("[AI Ranking] service_tier_response=", data.service_tier);
-      }
       
       // Read parsed output from SDK's documented location (Responses API Structured Outputs)
       // Official SDK location: response.output_parsed (top-level parsed accessor)
@@ -1975,6 +1985,16 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       let httpStatus: number | null = responseStatus;
       let errorResponseId: string | null = responseId || bodyResponseId;
       
+      // Extract error details from OpenAI error object
+      const errorMessage = error?.message || error?.error?.message || null;
+      const errorType = error?.type || error?.error?.type || null;
+      const errorCode = error?.code || error?.error?.code || null;
+      const errorParam = error?.param || error?.error?.param || null;
+      
+      // Get request payload keys for debugging (without logging full content)
+      const requestPayloadKeys = requestBody ? Object.keys(requestBody) : [];
+      const responseFormatKeys = requestBody?.response_format ? Object.keys(requestBody.response_format) : [];
+      
       if (error.name === "AbortError") {
         failType = "timeout";
         failReason = `Request timeout after ${timeoutMs}ms`;
@@ -1987,30 +2007,30 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         httpStatus = error.response.status || responseStatus || null;
         errorResponseId = error.response.headers?.["x-request-id"] || error.response.headers?.["openai-request-id"] || responseId || null;
         failReason = httpStatus ? `HTTP ${httpStatus}` : "HTTP error";
-        if (error.message) {
-          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        if (errorMessage) {
+          failReason += `: ${errorMessage.substring(0, 100)}`; // Truncate for safety
         }
       } else if (httpStatus !== null) {
         // We got a response but parsing or processing failed
         failType = "parse";
         failReason = "Response processing error";
-        if (error.message) {
-          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        if (errorMessage) {
+          failReason += `: ${errorMessage.substring(0, 100)}`; // Truncate for safety
         }
-      } else if (error.message && (error.message.includes("JSON") || error.message.includes("parse"))) {
+      } else if (errorMessage && (errorMessage.includes("JSON") || errorMessage.includes("parse"))) {
         // Parse error before response received
         failType = "parse";
         failReason = "Parse error";
-        if (error.message) {
-          failReason += `: ${error.message.substring(0, 100)}`; // Truncate for safety
+        if (errorMessage) {
+          failReason += `: ${errorMessage.substring(0, 100)}`; // Truncate for safety
         }
       } else {
         // Unknown error (network, etc.)
         failType = "unknown";
-        failReason = error.message ? error.message.substring(0, 100) : String(error).substring(0, 100); // Truncate for safety
+        failReason = errorMessage ? errorMessage.substring(0, 100) : String(error).substring(0, 100); // Truncate for safety
       }
       
-      // Structured error log
+      // Enhanced structured error log with request parameter details
       const logData: any = {
         attempt: attempt + 1,
         status: httpStatus || "unknown",
@@ -2018,7 +2038,30 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         fail_reason: failReason,
       };
       if (errorResponseId) logData.response_id = errorResponseId;
-      console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, errorResponseId ? `response_id=${errorResponseId}` : "");
+      if (errorMessage) logData.error_message = errorMessage.substring(0, 200); // Truncate for safety
+      if (errorType) logData.error_type = errorType;
+      if (errorCode) logData.error_code = errorCode;
+      if (errorParam) logData.error_param = errorParam;
+      
+      // Log request payload structure (keys only, no values to avoid logging prompts/products)
+      logData.request_payload_keys = requestPayloadKeys;
+      if (responseFormatKeys.length > 0) {
+        logData.response_format_keys = responseFormatKeys;
+      }
+      
+      // Also log sizes already tracked (candidateCount, productListJsonChars) for context
+      logData.candidate_count = currentCandidateCount;
+      logData.product_list_json_chars = currentProductListJsonChars;
+      
+      console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, 
+        errorResponseId ? `response_id=${errorResponseId}` : "",
+        errorType ? `error_type=${errorType}` : "",
+        errorCode ? `error_code=${errorCode}` : "",
+        errorParam ? `error_param=${errorParam}` : "",
+        `request_payload_keys=[${requestPayloadKeys.join(",")}]`,
+        responseFormatKeys.length > 0 ? `response_format_keys=[${responseFormatKeys.join(",")}]` : "",
+        `candidate_count=${currentCandidateCount} product_list_json_chars=${currentProductListJsonChars}`
+      );
       
       lastParseFailReason = failReason;
       
@@ -2033,8 +2076,19 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   const failReason = lastParseFailReason || (lastError instanceof Error ? lastError.message : String(lastError || "Unknown error"));
   console.log("[AI Ranking] source=fallback parse_fail_reason=", failReason);
   
+  // Determine fallback scope: if strictGateCount > 0, use strict gate pool only; otherwise use full candidates
+  let fallbackCandidates = candidates;
+  let fallbackScope: "strict_gate" | "full_pool" = "full_pool";
+  
+  if (strictGateCount !== undefined && strictGateCount > 0 && strictGateCandidates && strictGateCandidates.length > 0) {
+    fallbackCandidates = strictGateCandidates;
+    fallbackScope = "strict_gate";
+  }
+  
+  console.log("[AI Ranking] fallback_scope=", fallbackScope);
+  
   // Return structured fallback result instead of throwing
-  return deterministicRanking(candidates, resultCount, variantPreferences, failReason);
+  return deterministicRanking(fallbackCandidates, resultCount, variantPreferences, failReason);
 }
 
 /**
