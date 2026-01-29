@@ -257,39 +257,11 @@ function parseIntentGeneric(
     "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper",
   ];
   
-  // Minimal synonym expansion for category-like hard terms (industry-agnostic, easy to extend)
-  // Conservative: only expands specific terms, avoids broad words like "clothing"
-  const categorySynonyms: Record<string, string[]> = {
-    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit"],
-    "dress": ["dress", "gown", "frock", "ladies dress"],
-    "shirt": ["shirt", "button-up", "button down", "dress shirt"],
-    "sofa": ["sofa", "couch", "settee", "chesterfield"],
-    "treadmill": ["treadmill", "running machine", "running treadmill"],
-    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
-    "mattress": ["mattress", "bed mattress", "sleep mattress"],
-    "perfume": ["perfume", "fragrance", "cologne", "eau de parfum"],
-    "laptop": ["laptop", "notebook", "laptop computer"],
-    "headphone": ["headphone", "headphones", "earphones", "earbuds"],
-  };
-  
-  /**
-   * Expand hard terms with synonyms (conservative, only for known categories)
-   */
+  // Industry-agnostic: NO synonym expansion
+  // Use only the exact terms the user provides to avoid industry-specific assumptions
   function expandHardTermsWithSynonyms(terms: string[]): string[] {
-    const expanded = new Set<string>();
-    for (const term of terms) {
-      expanded.add(term);
-      const synonyms = categorySynonyms[term.toLowerCase()];
-      if (synonyms && synonyms.length > 0) {
-        // Add 2-6 synonyms max per term (already limited by map)
-        for (const synonym of synonyms.slice(0, 6)) {
-          if (synonym.toLowerCase() !== term.toLowerCase()) {
-            expanded.add(synonym);
-          }
-        }
-      }
-    }
-    return Array.from(expanded);
+    // Return terms as-is without any expansion for true industry-agnostic behavior
+    return terms;
   }
   
   const hardTerms: string[] = [];
@@ -315,15 +287,52 @@ function parseIntentGeneric(
     }
   }
   
-  // Find category phrases (hard terms)
+  // Industry-agnostic: Extract meaningful noun phrases from query (not just predefined categories)
+  // Extract 2-4 word phrases that look like product terms
+  const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those"]);
+  
+  // Extract meaningful phrases (2-4 words) that aren't stop words
+  const words = lowerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+  
+  // Build phrases: 1-word, 2-word, 3-word combinations (industry-agnostic)
+  const extractedPhrases = new Set<string>();
+  
+  // Single significant words (longer words are more likely to be product terms)
+  for (const word of words) {
+    if (word.length >= 4) { // Prefer longer words as they're more specific
+      extractedPhrases.add(word);
+    }
+  }
+  
+  // 2-word phrases
+  for (let i = 0; i < words.length - 1; i++) {
+    const phrase = `${words[i]} ${words[i + 1]}`;
+    if (phrase.length >= 5) { // At least 5 chars total
+      extractedPhrases.add(phrase);
+    }
+  }
+  
+  // 3-word phrases (most specific)
+  for (let i = 0; i < words.length - 2; i++) {
+    const phrase = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
+    if (phrase.length >= 8) { // At least 8 chars total
+      extractedPhrases.add(phrase);
+    }
+  }
+  
+  // Add extracted phrases as hard terms (industry-agnostic)
+  hardTerms.push(...Array.from(extractedPhrases));
+  
+  // Fallback: Also check categoryPhrases for common terms (helps with known categories)
+  // But don't rely solely on this - extracted phrases take priority
   for (const phrase of categoryPhrases) {
     const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "i");
-    if (regex.test(lowerText)) {
+    if (regex.test(lowerText) && !hardTerms.includes(phrase)) {
       hardTerms.push(phrase);
     }
   }
   
-  // Expand hard terms with synonyms (conservative, only for known categories)
+  // No synonym expansion (industry-agnostic)
   const expandedHardTerms = expandHardTermsWithSynonyms(hardTerms);
   
   // Parse answers JSON for additional context
@@ -331,23 +340,33 @@ function parseIntentGeneric(
   try {
     answersData = typeof answersJson === "string" ? JSON.parse(answersJson) : answersJson;
     if (Array.isArray(answersData)) {
-      // If array, concatenate strings
+      // If array, concatenate strings and extract terms
       const answerText = answersData
         .filter((a: any) => typeof a === "string")
         .join(" ")
         .toLowerCase();
       
-      // Check for category mentions in answers
-      for (const phrase of categoryPhrases) {
-        if (answerText.includes(phrase) && !expandedHardTerms.includes(phrase)) {
+      // Extract terms from answers (industry-agnostic)
+      const answerWords = answerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+      for (let i = 0; i < answerWords.length - 1; i++) {
+        const phrase = `${answerWords[i]} ${answerWords[i + 1]}`;
+        if (phrase.length >= 5 && !expandedHardTerms.includes(phrase)) {
           expandedHardTerms.push(phrase);
         }
       }
+      // Also add single significant words
+      for (const word of answerWords) {
+        if (word.length >= 4 && !expandedHardTerms.includes(word)) {
+          expandedHardTerms.push(word);
+        }
+      }
     } else if (typeof answersData === "object") {
-      // Check object keys/values for categories
+      // Extract terms from object values (industry-agnostic)
       const answerText = JSON.stringify(answersData).toLowerCase();
-      for (const phrase of categoryPhrases) {
-        if (answerText.includes(phrase) && !expandedHardTerms.includes(phrase)) {
+      const answerWords = answerText.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+      for (let i = 0; i < answerWords.length - 1; i++) {
+        const phrase = `${answerWords[i]} ${answerWords[i + 1]}`;
+        if (phrase.length >= 5 && !expandedHardTerms.includes(phrase)) {
           expandedHardTerms.push(phrase);
         }
       }
@@ -356,8 +375,8 @@ function parseIntentGeneric(
     // Ignore parse errors
   }
   
-  // Apply synonym expansion to any newly found terms
-  const finalHardTerms = expandHardTermsWithSynonyms(expandedHardTerms);
+  // No synonym expansion (already done above)
+  const finalHardTerms = expandedHardTerms;
   
   // Extract soft terms (remaining meaningful tokens)
   const allTokens = tokenize(userText);
@@ -607,70 +626,18 @@ function parseBundleIntentGeneric(userIntent: string): {
     "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper", "hat", "cap", "scarf", "gloves",
   ];
   
-  // Category synonyms (industry-agnostic, expanded for all industries)
-  const categorySynonyms: Record<string, string[]> = {
-    // Fashion & Apparel
-    "suit": ["suit", "business suit", "men's suit", "ladies suit", "formal suit", "tuxedo"],
-    "dress": ["dress", "gown", "frock", "ladies dress", "evening dress"],
-    "shirt": ["shirt", "button-up", "button down", "dress shirt", "button shirt"],
-    "pants": ["pants", "trousers", "slacks"],
-    "jacket": ["jacket", "coat", "blazer", "outerwear"],
-    // Home & Garden
-    "sofa": ["sofa", "couch", "settee", "chesterfield", "loveseat"],
-    "mattress": ["mattress", "bed mattress", "sleep mattress"],
-    "chair": ["chair", "seat", "armchair"],
-    "table": ["table", "desk", "dining table"],
-    "lamp": ["lamp", "light", "lighting"],
-    "rug": ["rug", "carpet", "mat"],
-    // Beauty & Cosmetics
-    "serum": ["serum", "face serum", "facial serum", "serum treatment"],
-    "moisturizer": ["moisturizer", "moisturizing cream", "face cream"],
-    "cleanser": ["cleanser", "face wash", "facial cleanser"],
-    "perfume": ["perfume", "fragrance", "cologne", "eau de parfum"],
-    "shampoo": ["shampoo", "hair shampoo"],
-    "conditioner": ["conditioner", "hair conditioner"],
-    // Health & Wellness
-    "treadmill": ["treadmill", "running machine", "running treadmill"],
-    "yoga mat": ["yoga mat", "exercise mat", "fitness mat"],
-    "supplement": ["supplement", "dietary supplement", "nutritional supplement"],
-    "vitamin": ["vitamin", "vitamins", "multivitamin"],
-    // Electronics
-    "laptop": ["laptop", "notebook", "laptop computer"],
-    "headphone": ["headphone", "headphones", "earphones", "earbuds"],
-    "phone": ["phone", "smartphone", "mobile phone", "cell phone"],
-  };
+  // Industry-agnostic: NO synonym expansion
+  // Use only the exact terms the user provides to avoid industry-specific assumptions
+  const categorySynonyms: Record<string, string[]> = {};
   
   // Soft words that are NOT categories (ignore these)
   const softWords = new Set(["complete", "outfit", "set", "kit", "bundle", "package", "collection"]);
   
-  // Find all category mentions in the intent
+  // Industry-agnostic bundle detection: extract items from query, not just predefined categories
   const foundCategories: Array<{ term: string; position: number }> = [];
   
-  for (const phrase of categoryPhrases) {
-    const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "gi");
-    let match;
-    while ((match = regex.exec(lowerText)) !== null) {
-      // Check if it's not part of a soft word
-      const before = lowerText.substring(Math.max(0, match.index - 10), match.index);
-      const after = lowerText.substring(match.index + match[0].length, Math.min(lowerText.length, match.index + match[0].length + 10));
-      const context = (before + " " + after).toLowerCase();
-      
-      // Skip if it's part of a soft word phrase
-      let isSoftWord = false;
-      for (const soft of softWords) {
-        if (context.includes(soft)) {
-          isSoftWord = true;
-          break;
-        }
-      }
-      
-      if (!isSoftWord) {
-        foundCategories.push({ term: phrase, position: match.index });
-      }
-    }
-  }
-  
-  // Check for bundle indicators: commas, "and", "+", lists, repeated mentions
+  // Check for bundle indicators FIRST (industry-agnostic approach)
+  // If bundle indicators are present, extract items generically from query segments
   const bundleIndicators = [
     /,\s*and\s+/i,           // "suit, and shirt"
     /,\s+/,                  // "suit, shirt"
@@ -706,7 +673,76 @@ function parseBundleIntentGeneric(userIntent: string): {
     }
   }
   
-  // Bundle detected if: ≥2 distinct categories AND (bundle indicators present OR repeated category mentions)
+  // Industry-agnostic bundle detection:
+  // If bundle indicators are present, extract items generically from query segments
+  // Don't require items to match predefined category list
+  let matchingSeparator: RegExp | null = null;
+  if (hasBundleIndicator) {
+    // Find which separator matched
+    for (const pattern of bundleIndicators) {
+      if (pattern.test(userIntent)) {
+        matchingSeparator = pattern;
+        break;
+      }
+    }
+    
+    // Split query by bundle indicators to extract potential items (industry-agnostic)
+    if (matchingSeparator) {
+      const segments = userIntent.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      
+      // Extract meaningful terms from each segment (industry-agnostic)
+      if (segments.length >= 2) {
+        let currentPos = 0;
+        
+        for (const segment of segments) {
+          // Extract meaningful noun phrases - remove stop words and get core product terms
+          const cleaned = segment.toLowerCase().trim();
+          const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for"]);
+          const words = cleaned.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+          
+          if (words.length > 0) {
+            // Use the most significant words (longer words first, up to 3 words for multi-word terms)
+            const significantWords = words
+              .sort((a, b) => b.length - a.length)
+              .slice(0, 3);
+            const term = significantWords.join(" ");
+            foundCategories.push({ term, position: currentPos });
+          }
+          currentPos += segment.length + 10; // Approximate position
+        }
+      }
+    }
+  }
+  
+  // Fallback: If no bundle indicators or generic extraction failed, use category matching
+  // This helps with single-item queries or queries without clear separators
+  if (foundCategories.length === 0) {
+    for (const phrase of categoryPhrases) {
+      const regex = new RegExp(`\\b${phrase.replace(/\s+/g, "\\s+")}\\b`, "gi");
+      let match;
+      while ((match = regex.exec(lowerText)) !== null) {
+        // Check if it's not part of a soft word
+        const before = lowerText.substring(Math.max(0, match.index - 10), match.index);
+        const after = lowerText.substring(match.index + match[0].length, Math.min(lowerText.length, match.index + match[0].length + 10));
+        const context = (before + " " + after).toLowerCase();
+        
+        // Skip if it's part of a soft word phrase
+        let isSoftWord = false;
+        for (const soft of softWords) {
+          if (context.includes(soft)) {
+            isSoftWord = true;
+            break;
+          }
+        }
+        
+        if (!isSoftWord) {
+          foundCategories.push({ term: phrase, position: match.index });
+        }
+      }
+    }
+  }
+  
+  // Bundle detected if: ≥2 distinct items found (either from categories or extracted segments)
   const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
   const categoryCounts = new Map<string, number>();
   for (const { term } of foundCategories) {
@@ -714,6 +750,7 @@ function parseBundleIntentGeneric(userIntent: string): {
   }
   const hasRepeatedMentions = Array.from(categoryCounts.values()).some(count => count >= 2);
   
+  // Bundle if: (≥2 items found) AND (bundle indicators present OR repeated mentions)
   const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
 
   if (!isBundle) {
@@ -747,12 +784,8 @@ function parseBundleIntentGeneric(userIntent: string): {
     const quantityMatch = lowerText.match(new RegExp(`(\\d+)\\s*(?:piece|pc|pcs)?\\s*${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i"));
     const quantity = quantityMatch ? parseInt(quantityMatch[1], 10) : 1;
     
-    // Expand with synonyms
+    // Industry-agnostic: use only the exact term, no synonym expansion
     const hardTerms = [term];
-    const synonyms = categorySynonyms[term.toLowerCase()];
-    if (synonyms) {
-      hardTerms.push(...synonyms.filter(s => s.toLowerCase() !== term.toLowerCase()));
-    }
     
     // Extract per-item constraints scoped to this item
     // Look for constraints near this item's position in the text
@@ -771,6 +804,7 @@ function parseBundleIntentGeneric(userIntent: string): {
         allowValues?: Record<string, string[]>; // OR allow-list: attribute -> array of allowed values
       };
       priceCeiling?: number | null;
+      userCurrency?: string | null; // User-specified currency (from input)
       includeTerms?: string[];
       excludeTerms?: string[];
     } = {};

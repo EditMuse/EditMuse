@@ -1381,17 +1381,22 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   // currentCandidates is already declared above (before buildProductList and buildUserPrompt)
   
   // Adaptive timeout function based on candidateCount and productListJsonChars
+  // Increased timeouts to handle larger requests and json_schema mode which can be slower
   function calculateAdaptiveTimeout(candidateCount: number, productListJsonChars: number): number {
-    // <= 20 candidates and <= 12k chars: 15s
-    if (candidateCount <= 20 && productListJsonChars <= 12000) {
-      return 15000;
+    // <= 15 candidates and <= 10k chars: 20s (faster for small requests)
+    if (candidateCount <= 15 && productListJsonChars <= 10000) {
+      return 20000;
     }
-    // <= 40 candidates or <= 25k chars: 25s
+    // <= 25 candidates and <= 15k chars: 30s
+    if (candidateCount <= 25 && productListJsonChars <= 15000) {
+      return 30000;
+    }
+    // <= 40 candidates or <= 25k chars: 40s (increased from 25s)
     if (candidateCount <= 40 || productListJsonChars <= 25000) {
-      return 25000;
+      return 40000;
     }
-    // else: 40s (hard cap)
-    return 40000;
+    // else: 50s (increased from 40s for very large requests)
+    return 50000;
   }
   
   // Response metadata variables (declared outside loop for catch block access)
@@ -1497,15 +1502,31 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       // Use appropriate endpoint based on API type
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
-        body: JSON.stringify(requestBody),
-      });
+      let response: Response;
+      try {
+        response = await fetch(apiUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+          body: JSON.stringify(requestBody),
+        });
+      } catch (fetchError: any) {
+        // Handle fetch errors (network, abort, timeout)
+        clearTimeout(timeoutId);
+        if (fetchError.name === "AbortError" || controller.signal.aborted) {
+          // Timeout occurred - don't try to parse response
+          lastError = new Error(`Request timeout after ${timeoutMs}ms`);
+          lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
+          responseStatus = null;
+          responseId = null;
+          continue; // Try again if retries remaining
+        }
+        // Re-throw other fetch errors to be handled by outer catch
+        throw fetchError;
+      }
 
       clearTimeout(timeoutId);
 
@@ -1554,7 +1575,26 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      const data = await response.json();
+      // Parse response JSON - handle potential timeout/incomplete responses
+      let data: any;
+      try {
+        const responseText = await response.text();
+        if (!responseText || responseText.trim() === "") {
+          throw new Error("Empty response body");
+        }
+        data = JSON.parse(responseText);
+      } catch (parseError: any) {
+        // If parsing fails, check if it was due to timeout/abort
+        if (controller.signal.aborted) {
+          lastError = new Error(`Request timeout after ${timeoutMs}ms`);
+          lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
+          responseStatus = null;
+          responseId = null;
+          continue; // Try again if retries remaining
+        }
+        // Re-throw parse errors to be handled by outer catch
+        throw new Error(`Failed to parse response: ${parseError.message || String(parseError)}`);
+      }
       
       // Extract response ID from response body if present (OpenAI sometimes includes this)
       bodyResponseId = data.id || data.request_id || null;
