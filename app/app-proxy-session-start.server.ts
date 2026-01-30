@@ -1,10 +1,10 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
 import prisma from "~/db.server";
-import { createConciergeSession, saveConciergeResult } from "~/models/concierge.server";
+import { createConciergeSession, saveConciergeResult, addConciergeMessage } from "~/models/concierge.server";
 import { getAccessTokenForShop, fetchShopifyProducts, fetchShopifyProductDescriptionsByHandles } from "~/shopify-admin.server";
 import { rankProductsWithAI, fallbackRanking } from "~/models/ai-ranking.server";
-import { ConciergeSessionStatus } from "@prisma/client";
+import { ConciergeSessionStatus, ConciergeRole } from "@prisma/client";
 import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/models/billing.server";
 import { createOverageUsageCharge } from "~/models/shopify-billing.server";
 import { withProxyLogging } from "~/utils/proxy-logging.server";
@@ -881,7 +881,38 @@ function parseBundleIntentGeneric(userIntent: string): {
         intentForSplitting = intentForSplitting.replace(pattern, " ");
       }
       
-      const segments = intentForSplitting.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      // Split by separator, but also handle nested "and" within segments
+      // Industry-agnostic: works for any product type (e.g., "laptop, mouse and keyboard", "sofa, table and chair")
+      let segments = intentForSplitting.split(matchingSeparator).map(s => s.trim()).filter(s => s.length > 0);
+      
+      // CRITICAL FIX: If a segment contains "and", split it further
+      // This handles cases like "trousers and Shirt" or "mouse and keyboard" which should be separate items
+      // Track which segments came from splitting to ensure single-word extraction
+      const expandedSegments: string[] = [];
+      const wasSplitFromAnd = new Set<number>(); // Track indices of segments that came from splitting by "and"
+      
+      for (const segment of segments) {
+        // Check if segment contains "and" (case-insensitive)
+        const andPattern = /\s+and\s+/i;
+        if (andPattern.test(segment)) {
+          // Split by "and" and add each part as a separate segment
+          const parts = segment.split(andPattern).map(p => p.trim()).filter(p => p.length > 0);
+          console.log(`[Bundle] Splitting segment "${segment}" by "and" into:`, parts);
+          
+          // Mark all resulting parts as coming from splitting
+          const startIdx = expandedSegments.length;
+          expandedSegments.push(...parts);
+          for (let i = startIdx; i < expandedSegments.length; i++) {
+            wasSplitFromAnd.add(i);
+          }
+        } else {
+          expandedSegments.push(segment);
+        }
+      }
+      segments = expandedSegments;
+      
+      console.log(`[Bundle] Final segments after splitting:`, segments);
+      console.log(`[Bundle] Segments split by "and" (indices):`, Array.from(wasSplitFromAnd));
       
       // Abstract collection terms that should NOT be treated as bundle items
       const abstractCollectionPatterns = [
@@ -894,7 +925,8 @@ function parseBundleIntentGeneric(userIntent: string): {
         let currentPos = 0;
         let concreteItemsFound = 0;
         
-        for (const segment of segments) {
+        for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+          const segment = segments[segIdx];
           // Check if segment is an abstract collection term (skip it, but count it for bundle detection)
           let isAbstract = false;
           for (const pattern of abstractCollectionPatterns) {
@@ -933,16 +965,23 @@ function parseBundleIntentGeneric(userIntent: string): {
             
             if (concreteWords.length > 0) {
               // Sort by length (longer = more specific) and take up to 2 words max
-              // This prevents terms like "suits give me" - we only want "suits"
+              // Industry-agnostic: works for any product type
               const significantWords = concreteWords
                 .sort((a, b) => b.length - a.length)
-                .slice(0, 2); // Max 2 words to avoid phrases like "suits give me"
-              const term = significantWords.join(" ").trim();
+                .slice(0, 2); // Max 2 words for multi-word product names (e.g., "yoga mat", "coffee maker", "business suit")
+              
+              // CRITICAL FIX: If this segment came from splitting by "and", use only the first word
+              // This ensures separate items stay separate (e.g., "trousers" and "shirt", not "trousers shirt")
+              // Industry-agnostic: applies to any product type (e.g., "mouse" and "keyboard", not "mouse keyboard")
+              const term = wasSplitFromAnd.has(segIdx)
+                ? significantWords[0] // Segment was split by "and" - use only first word to keep items separate
+                : significantWords.join(" ").trim(); // Multi-word product name - use up to 2 words
               
               // Only add if term is not empty and has at least 2 characters
               if (term.length >= 2) {
                 foundCategories.push({ term, position: currentPos });
                 concreteItemsFound++;
+                console.log(`[Bundle] Extracted term from segment "${segment}": "${term}" (wasSplitFromAnd=${wasSplitFromAnd.has(segIdx)})`);
               }
             } else {
               // If all words were filtered out, try to extract at least one meaningful word
@@ -2007,6 +2046,54 @@ export async function proxySessionStartAction(
     clientRequestId: clientRequestId && typeof clientRequestId === "string" ? clientRequestId.trim() : null,
   });
 
+  // CRITICAL: Save answers as conversation messages for all modes (Quiz, Hybrid, Chat)
+  // This ensures conversation context is available for AI ranking in all modes
+  // For Quiz mode: answers are question-answer pairs
+  // For Hybrid mode: quiz answers + chat messages
+  // For Chat mode: chat messages only (may already be saved via /session/message endpoint)
+  if (Array.isArray(answers) && answers.length > 0) {
+    try {
+      const session = await prisma.conciergeSession.findUnique({
+        where: { publicToken: sessionToken },
+        select: { id: true }
+      });
+      
+      if (session) {
+        // Save each answer as a USER message
+        // This creates conversation history for Quiz and Hybrid modes
+        // Chat mode messages may already exist, but this ensures all answers are captured
+        for (const answer of answers) {
+          if (answer !== null && answer !== undefined) {
+            const answerText = typeof answer === "string" 
+              ? answer.trim() 
+              : (answer.question && answer.answer 
+                  ? `${answer.question}: ${answer.answer}`.trim()
+                  : String(answer).trim());
+            
+            if (answerText.length > 0) {
+              try {
+                await addConciergeMessage({
+                  sessionToken,
+                  role: ConciergeRole.USER,
+                  text: answerText,
+                  imageUrl: null,
+                });
+              } catch (msgError) {
+                // Non-critical: log but continue (message might already exist in chat mode)
+                console.log(`[App Proxy] Could not save answer as message (non-critical):`, msgError instanceof Error ? msgError.message : String(msgError));
+              }
+            }
+          }
+        }
+        
+        console.log(`[App Proxy] Saved ${answers.length} answers as conversation messages for mode: ${modeUsed}`);
+      }
+    } catch (error) {
+      // Non-critical: conversation context enhancement failed, but answersJson still works
+      console.log(`[App Proxy] Could not save answers as messages (non-critical, will use answersJson fallback):`, error instanceof Error ? error.message : String(error));
+    }
+  }
+
   // Update status to PROCESSING immediately
   await prisma.conciergeSession.update({
     where: { publicToken: sessionToken },
@@ -2110,13 +2197,60 @@ async function processSessionInBackground({
   // Track total processing duration for safety clamp
   const processStartTime = performance.now();
 
-  // Parse answers from JSON
+  // Fetch conversation messages for full context
+  const session = await prisma.conciergeSession.findUnique({
+    where: { publicToken: sessionToken },
+    include: {
+      messages: {
+        orderBy: { createdAt: 'asc' } // Order by creation time for conversation flow
+      }
+    }
+  });
+
+  // Format conversation messages for OpenAI (industry-agnostic)
+  type ConversationMessage = { role: "system" | "user" | "assistant"; content: string };
+  const conversationMessages: ConversationMessage[] = [];
+  
+  if (session?.messages && session.messages.length > 0) {
+    // Add system message for context
+    conversationMessages.push({
+      role: "system",
+      content: "You are an expert product recommendation assistant. Help users find products that match their needs, preferences, and budget. Understand their intent from the conversation context."
+    });
+
+    // Add conversation messages
+    for (const msg of session.messages) {
+      if (!msg.text || msg.text.trim().length === 0) continue;
+      
+      // Map ConciergeRole to OpenAI role
+      let role: "user" | "assistant" = "user";
+      if (msg.role === "ASSISTANT" || msg.role === "SYSTEM") {
+        role = "assistant";
+      }
+      
+      conversationMessages.push({
+        role,
+        content: msg.text.trim()
+      });
+    }
+    
+    console.log(`[Conversation] Loaded ${conversationMessages.length} messages (${session.messages.length} from DB)`);
+  }
+
+  // Parse answers from JSON (fallback for backward compatibility)
   let answers: any[] = [];
   try {
     const parsed = JSON.parse(answersJson);
     answers = Array.isArray(parsed) ? parsed : (typeof parsed === "string" ? [parsed] : []);
   } catch (e) {
     console.error("[App Proxy] Failed to parse answersJson in background processing:", e);
+  }
+  
+  // If we have conversation messages but no answers, extract from conversation
+  if (conversationMessages.length > 0 && answers.length === 0) {
+    const userMessages = conversationMessages.filter(m => m.role === "user");
+    answers = userMessages.map(m => m.content);
+    console.log(`[Conversation] Extracted ${answers.length} user messages from conversation`);
   }
 
   // Parse answers to extract price/budget range if present
@@ -2402,8 +2536,25 @@ async function processSessionInBackground({
 
       // Build userIntent from answers (before building candidates, so we can use keywords for filtering)
       // Enhanced: Better context preservation and intent building
+      // If we have conversation messages, use them for better context; otherwise fall back to answers
       let userIntent = "";
-      if (Array.isArray(answers)) {
+      
+      if (conversationMessages.length > 0) {
+        // Use conversation context: extract all user messages and combine them
+        const userMessages = conversationMessages
+          .filter(m => m.role === "user")
+          .map(m => m.content.trim())
+          .filter(c => c.length > 0);
+        
+        if (userMessages.length > 0) {
+          // Join user messages with natural flow
+          userIntent = userMessages.join(". ").trim();
+          console.log(`[App Proxy] Built userIntent from ${userMessages.length} conversation messages`);
+        }
+      }
+      
+      // Fallback to answers if no conversation messages or userIntent is still empty
+      if (!userIntent && Array.isArray(answers)) {
         // Filter out empty/null answers and preserve meaningful context
         const meaningfulAnswers = answers
           .filter(a => a !== null && a !== undefined && String(a).trim().length > 0)
@@ -2412,13 +2563,7 @@ async function processSessionInBackground({
         // Join with better separators to preserve context
         // Use ". " for natural flow instead of "; " which can feel mechanical
         userIntent = meaningfulAnswers.join(". ").trim();
-        
-        // If we have multiple answers, add context connectors for better AI understanding
-        if (meaningfulAnswers.length > 1) {
-          // The userIntent now flows naturally: "Answer 1. Answer 2. Answer 3"
-          // This helps AI understand the full context better
-        }
-      } else if (typeof answers === "string") {
+      } else if (!userIntent && typeof answers === "string") {
         userIntent = String(answers).trim();
       }
 
@@ -4114,7 +4259,10 @@ async function processSessionInBackground({
                 budgetMax: item.budgetMax,
               })),
             },
-            experienceIdUsed
+            experienceIdUsed,
+            undefined, // strictGateCount
+            undefined, // strictGateCandidates
+            conversationMessages // Pass conversation context
           );
           // Measure aiMs immediately after AI call completes
           aiMs += Math.round(performance.now() - aiStartBundle);
@@ -4471,7 +4619,8 @@ async function processSessionInBackground({
             },
             experienceIdUsed,
             strictGateCount,
-            strictGateCandidates
+            strictGateCandidates,
+            conversationMessages // Pass conversation context
           );
         // Measure aiMs immediately after AI call completes
         aiMs += Math.round(performance.now() - aiStartSingle);

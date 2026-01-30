@@ -63,12 +63,15 @@ export async function extractQueryFromMessages(sessionId: string): Promise<{ raw
 /**
  * Gets a concierge session by public token
  */
-export async function getConciergeSessionByToken(sessionToken: string) {
+export async function getConciergeSessionByToken(sessionToken: string, includeMessages: boolean = false) {
   return await prisma.conciergeSession.findUnique({
     where: { publicToken: sessionToken },
     include: { 
       shop: true,
       result: true, // Include ConciergeResult
+      messages: includeMessages ? {
+        orderBy: { createdAt: 'asc' } // Order by creation time for conversation flow
+      } : false,
     },
   });
 }

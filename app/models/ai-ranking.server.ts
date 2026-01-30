@@ -752,7 +752,8 @@ export async function rankProductsWithAI(
   hardConstraints?: HardConstraints,
   experienceId?: string | null,
   strictGateCount?: number,
-  strictGateCandidates?: ProductCandidate[]
+  strictGateCandidates?: ProductCandidate[],
+  conversationMessages?: Array<{ role: "system" | "user" | "assistant"; content: string }>
 ): Promise<{ 
   selectedHandles: string[];
   reasoning?: string | null;
@@ -1524,14 +1525,62 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       apiUsed = "chat";
       apiUrl = OPENAI_CHAT_COMPLETIONS_URL;
       
+      // Build messages array: use conversation history if available, otherwise use single userIntent
+      let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+      
+      if (conversationMessages && conversationMessages.length > 0) {
+        // Use full conversation context
+        // Replace or append system prompt to the first system message if it exists
+        const hasSystemMessage = conversationMessages[0]?.role === "system";
+        if (hasSystemMessage) {
+          // Combine system messages: original conversation system + our system prompt
+          messages.push({
+            role: "system",
+            content: `${conversationMessages[0].content}\n\n${systemPrompt}`
+          });
+          // Add rest of conversation (skip first system message)
+          messages.push(...conversationMessages.slice(1));
+        } else {
+          // Add our system prompt first
+          messages.push({ role: "system", content: systemPrompt });
+          // Add all conversation messages
+          messages.push(...conversationMessages);
+        }
+        
+        // Add the current product ranking task as the final user message
+        messages.push({
+          role: "user",
+          content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt
+        });
+        
+        console.log(`[AI Ranking] Using conversation context: ${conversationMessages.length} conversation messages + 1 system + 1 task = ${messages.length} total messages`);
+      } else {
+        // Fallback to single userIntent (backward compatibility)
+        messages = [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
+        ];
+        console.log("[AI Ranking] Using single userIntent (no conversation context)");
+      }
+      
+      // Adjust timeout based on conversation length (more messages = more processing time)
+      const conversationLength = messages.length;
+      const baseTimeout = timeoutMs;
+      // Add 5 seconds per additional message beyond 2 (system + user)
+      const conversationTimeoutAdjustment = Math.max(0, (conversationLength - 2) * 5000);
+      timeoutMs = baseTimeout + conversationTimeoutAdjustment;
+      // Cap at 90 seconds max for very long conversations
+      timeoutMs = Math.min(timeoutMs, 90000);
+      
+      if (conversationTimeoutAdjustment > 0) {
+        console.log(`[AI Ranking] Adjusted timeout for conversation: ${baseTimeout}ms + ${conversationTimeoutAdjustment}ms = ${timeoutMs}ms (${conversationLength} messages)`);
+      }
+      
       if (supportsJsonSchema) {
         // Use Chat Completions API with json_schema for structured outputs
         requestBody = {
           model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
-          ],
+          messages,
           response_format: {
             type: "json_schema",
             json_schema: {
@@ -1547,12 +1596,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         console.log("[AI Ranking] structured_outputs=true");
       } else {
         // Fallback for models that don't support json_schema - use json_object mode
+        // Use same messages array (with conversation context if available)
         requestBody = {
           model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt },
-          ],
+          messages,
           temperature: 0,
           max_tokens: 700,
           response_format: { type: "json_object" },
