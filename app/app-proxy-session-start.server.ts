@@ -749,6 +749,125 @@ function parsePriceCeiling(text: string): { value: number; currency: string | nu
 }
 
 /**
+ * Industry-agnostic: Normalize text for comparison (strip punctuation, normalize case, collapse whitespace, singularize)
+ */
+function normalizeItemLabel(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[.,;:!?]+/g, "") // Strip punctuation
+    .replace(/\s+/g, " ") // Collapse whitespace
+    .replace(/\b(shirts?|trousers?|pants?|jeans?|shoes?|boots?|sneakers?)\b/gi, (match) => {
+      // Simple pluralization: remove trailing 's' for common patterns
+      return match.replace(/s$/i, "");
+    })
+    .trim();
+}
+
+/**
+ * Industry-agnostic: Check if a term is a contextual modifier (occasion/style/use-case) not a product type
+ */
+function isContextualModifier(term: string): boolean {
+  const normalized = normalizeItemLabel(term);
+  const contextualPatterns = [
+    /^(wedding|party|event|occasion|ceremony|meeting|interview|date|dinner|work|office|home|outdoor|indoor|formal|casual|sport|exercise|gym|beach|vacation|travel|business|professional|gift|for\s+my\s+\w+|for\s+\w+)$/i,
+    /^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination)$/i,
+    /^(budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to)$/i,
+  ];
+  return contextualPatterns.some(pattern => pattern.test(normalized));
+}
+
+/**
+ * Industry-agnostic: Extract structured bundle items from query
+ * Returns array of { label, quantity, constraints, rawTextSpan }
+ */
+function extractStructuredBundleItems(userIntent: string): Array<{
+  label: string;
+  quantity: number;
+  constraints: {
+    priceCeiling?: number | null;
+    color?: string | null;
+    size?: string | null;
+    material?: string | null;
+    tags?: string[];
+  };
+  rawTextSpan?: string;
+}> {
+  const items: Array<{
+    label: string;
+    quantity: number;
+    constraints: {
+      priceCeiling?: number | null;
+      color?: string | null;
+      size?: string | null;
+      material?: string | null;
+      tags?: string[];
+    };
+    rawTextSpan?: string;
+  }> = [];
+  
+  // Extract contextual modifiers as tags (not items)
+  const contextualTags: string[] = [];
+  const words = userIntent.toLowerCase().split(/\s+/);
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (isContextualModifier(word)) {
+      contextualTags.push(word);
+    }
+  }
+  
+  // Use existing parseBundleIntentGeneric to get items, then normalize and filter
+  const bundleResult = parseBundleIntentGeneric(userIntent);
+  if (!bundleResult.isBundle) {
+    return [];
+  }
+  
+  for (const item of bundleResult.items) {
+    const label = item.hardTerms[0] || "";
+    const normalizedLabel = normalizeItemLabel(label);
+    
+    // Skip if label is a contextual modifier
+    if (isContextualModifier(normalizedLabel)) {
+      continue;
+    }
+    
+    // Extract constraints
+    const constraints: {
+      priceCeiling?: number | null;
+      color?: string | null;
+      size?: string | null;
+      material?: string | null;
+      tags?: string[];
+    } = {};
+    
+    if (item.constraints?.priceCeiling) {
+      constraints.priceCeiling = item.constraints.priceCeiling;
+    }
+    if (item.constraints?.optionConstraints?.color) {
+      constraints.color = item.constraints.optionConstraints.color;
+    }
+    if (item.constraints?.optionConstraints?.size) {
+      constraints.size = item.constraints.optionConstraints.size;
+    }
+    if (item.constraints?.optionConstraints?.material) {
+      constraints.material = item.constraints.optionConstraints.material;
+    }
+    if (contextualTags.length > 0) {
+      constraints.tags = contextualTags;
+    }
+    
+    items.push({
+      label: normalizedLabel,
+      quantity: item.quantity || 1,
+      constraints,
+      rawTextSpan: label,
+    });
+  }
+  
+  return items;
+}
+
+/**
  * Parse bundle intent: detect multi-item queries (e.g., "3 piece suit, shirt and trousers")
  * Industry-agnostic bundle detection with per-item constraint extraction
  */
@@ -959,8 +1078,9 @@ function parseBundleIntentGeneric(userIntent: string): {
             // Filter out abstract terms from the words
             const concreteWords = words.filter(w => {
               const wLower = w.toLowerCase();
-              // Filter out abstract collection terms and price/budget terms
-              return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to|give|me|want|need|looking|get|find)$/i.test(wLower);
+              // Filter out abstract collection terms, price/budget terms, and occasion/context terms
+              // Occasion/context terms describe when/where/why, not what product (industry-agnostic)
+              return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to|give|me|want|need|looking|get|find|wedding|party|event|occasion|ceremony|meeting|interview|date|dinner|work|office|home|outdoor|indoor|formal|casual|sport|exercise|gym|beach|vacation|travel|business|professional)$/i.test(wLower);
             });
             
             if (concreteWords.length > 0) {
@@ -973,9 +1093,12 @@ function parseBundleIntentGeneric(userIntent: string): {
               // CRITICAL FIX: If this segment came from splitting by "and", use only the first word
               // This ensures separate items stay separate (e.g., "trousers" and "shirt", not "trousers shirt")
               // Industry-agnostic: applies to any product type (e.g., "mouse" and "keyboard", not "mouse keyboard")
-              const term = wasSplitFromAnd.has(segIdx)
+              let term = wasSplitFromAnd.has(segIdx)
                 ? significantWords[0] // Segment was split by "and" - use only first word to keep items separate
                 : significantWords.join(" ").trim(); // Multi-word product name - use up to 2 words
+              
+              // Clean punctuation from term (remove trailing periods, commas, etc.)
+              term = term.replace(/[.,;:!?]+$/, "").trim();
               
               // Only add if term is not empty and has at least 2 characters
               if (term.length >= 2) {
@@ -988,12 +1111,14 @@ function parseBundleIntentGeneric(userIntent: string): {
               // This prevents 0 candidates when segments only contain abstract terms
               const fallbackWords = words.filter(w => {
                 const wLower = w.toLowerCase();
-                // Only filter out the most obvious abstract terms, keep others
-                return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|give|me|want|need|looking|get|find)$/i.test(wLower);
+                // Only filter out the most obvious abstract terms and occasion/context terms, keep others
+                return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|give|me|want|need|looking|get|find|wedding|party|event|occasion|ceremony|meeting|interview|date|dinner|work|office|home|outdoor|indoor|formal|casual|sport|exercise|gym|beach|vacation|travel|business|professional)$/i.test(wLower);
               });
               
               if (fallbackWords.length > 0) {
-                const term = fallbackWords[0]; // Use first non-abstract word
+                let term = fallbackWords[0]; // Use first non-abstract word
+                // Clean punctuation from term
+                term = term.replace(/[.,;:!?]+$/, "").trim();
                 if (term.length >= 2) {
                   foundCategories.push({ term, position: currentPos });
                   concreteItemsFound++;
@@ -2094,6 +2219,11 @@ export async function proxySessionStartAction(
     }
   }
 
+  // CRITICAL: Ensure messages are committed to database before starting background processing
+  // This prevents race condition where background processing starts before messages are saved
+  // Small delay to ensure database commit completes (messages are saved asynchronously)
+  await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay to ensure DB commit
+
   // Update status to PROCESSING immediately
   await prisma.conciergeSession.update({
     where: { publicToken: sessionToken },
@@ -2198,7 +2328,8 @@ async function processSessionInBackground({
   const processStartTime = performance.now();
 
   // Fetch conversation messages for full context
-  const session = await prisma.conciergeSession.findUnique({
+  // CRITICAL: Retry fetching messages if none found (handles race condition where messages are still being saved)
+  let session = await prisma.conciergeSession.findUnique({
     where: { publicToken: sessionToken },
     include: {
       messages: {
@@ -2207,18 +2338,27 @@ async function processSessionInBackground({
     }
   });
 
+  // If no messages found, wait a bit and retry (handles race condition)
+  if (!session?.messages || session.messages.length === 0) {
+    console.log(`[Conversation] No messages found on first fetch, waiting 200ms and retrying...`);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    session = await prisma.conciergeSession.findUnique({
+      where: { publicToken: sessionToken },
+      include: {
+        messages: {
+          orderBy: { createdAt: 'asc' }
+        }
+      }
+    });
+  }
+
   // Format conversation messages for OpenAI (industry-agnostic)
   type ConversationMessage = { role: "system" | "user" | "assistant"; content: string };
   const conversationMessages: ConversationMessage[] = [];
   
   if (session?.messages && session.messages.length > 0) {
-    // Add system message for context
-    conversationMessages.push({
-      role: "system",
-      content: "You are an expert product recommendation assistant. Help users find products that match their needs, preferences, and budget. Understand their intent from the conversation context."
-    });
-
-    // Add conversation messages
+    // Add conversation messages (DO NOT add system message here - it will be added in rankProductsWithAI)
+    // This ensures the system prompt is properly combined with conversation context
     for (const msg of session.messages) {
       if (!msg.text || msg.text.trim().length === 0) continue;
       
@@ -2234,7 +2374,16 @@ async function processSessionInBackground({
       });
     }
     
-    console.log(`[Conversation] Loaded ${conversationMessages.length} messages (${session.messages.length} from DB)`);
+    console.log(`[Conversation] ✅ Loaded ${conversationMessages.length} messages (${session.messages.length} from DB) for AI ranking`);
+    if (conversationMessages.length > 0) {
+      const preview = conversationMessages.slice(0, 3).map(m => {
+        const content = m.content || "";
+        return `${m.role}: ${content.substring(0, 50)}${content.length > 50 ? "..." : ""}`;
+      });
+      console.log(`[Conversation] Message preview:`, preview);
+    }
+  } else {
+    console.log(`[Conversation] ⚠️  No conversation messages found - will use answersJson fallback`);
   }
 
   // Parse answers from JSON (fallback for backward compatibility)
@@ -2542,8 +2691,8 @@ async function processSessionInBackground({
       if (conversationMessages.length > 0) {
         // Use conversation context: extract all user messages and combine them
         const userMessages = conversationMessages
-          .filter(m => m.role === "user")
-          .map(m => m.content.trim())
+          .filter(m => m.role === "user" && m.content)
+          .map(m => (m.content || "").trim())
           .filter(c => c.length > 0);
         
         if (userMessages.length > 0) {
@@ -2702,6 +2851,16 @@ async function processSessionInBackground({
       const bundleIntent = parseBundleIntentGeneric(userIntent);
       // Bundle detection already logged in parseBundleIntentGeneric
       // Additional log for reference: bundleIntent.isBundle, items.length, totalBudget
+      
+      // Log requested groups (normalized) for bundle mode
+      if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        const requestedGroupsNormalized = bundleIntent.items.map((item, idx) => ({
+          index: idx,
+          label: normalizeItemLabel(item.hardTerms[0] || "unknown"),
+          quantity: item.quantity || 1,
+        }));
+        console.log("[Bundle] requestedGroupsNormalized", requestedGroupsNormalized);
+      }
       
       // Currency conversion: Convert user budget to shop currency
       let convertedPriceMax: number | null = priceMax;
@@ -5418,38 +5577,8 @@ async function processSessionInBackground({
       const finalHandlesArray = Array.isArray(finalHandlesGuaranteed) ? finalHandlesGuaranteed : [];
       productHandles = (Array.isArray(diverseHandles) ? diverseHandles : finalHandlesArray).slice(0, targetCount);
       
-      // Add delivered vs requested count to reasoning
-      const deliveredCountAtReasoning = productHandles.length;
-      const requestedCountAtReasoning = targetCount;
-      const isBundleModeForReasoning = bundleIntent?.isBundle === true;
-      
-      if (deliveredCountAtReasoning < requestedCountAtReasoning) {
-        // Explain why fewer results
-        let whyFewer = "";
-        if (isBundleModeForReasoning) {
-          // Bundle-specific reasons
-          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
-            whyFewer = "Limited matches available within budget and stock constraints.";
-          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
-            whyFewer = "Limited in-stock matches available for the requested bundle categories.";
-          } else {
-            whyFewer = "Limited matches available for the requested bundle categories.";
-          }
-        } else {
-          // Single-item reasons
-          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
-            whyFewer = "Limited matches available within budget constraints.";
-          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
-            whyFewer = "Limited in-stock matches available.";
-          } else {
-            whyFewer = "Limited matches available for your criteria.";
-          }
-        }
-        reasoning += ` Showing ${deliveredCountAtReasoning} results (requested ${requestedCountAtReasoning}). ${whyFewer}`;
-      } else if (deliveredCountAtReasoning === requestedCountAtReasoning && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
-        // Budget was exceeded in pass 3
-        reasoning += ` Showing ${deliveredCountAtReasoning} results (requested ${requestedCountAtReasoning}). Budget was relaxed to show more options.`;
-      }
+      // NOTE: Do NOT add delivered count to reasoning here - it will be added AFTER handlesToSave is finalized
+      // This prevents the "Showing 0 results" bug where intermediate variables are used instead of final saved result
 
       console.log("[App Proxy] Final product handles:", productHandles.length, "out of", targetCount, "requested");
       
@@ -5752,18 +5881,72 @@ async function processSessionInBackground({
           });
           
           // ENFORCE BUDGET: Filter out items that exceed budget, starting with most expensive
-          // Sort handles by price (descending) and remove until within budget
+          // BUT: For bundles, ensure at least one item per type is kept (budget is soft constraint)
+          // Only reduce if we can still maintain bundle integrity
           const handlesWithPrices = handlesToSave.map(handle => {
             const candidate = candidateMapForCheck.get(handle);
             const price = candidate && candidate.price ? parseFloat(String(candidate.price)) : 0;
             return { handle, price: Number.isFinite(price) ? price : 0 };
-          }).sort((a, b) => b.price - a.price);
+          });
+          
+          // For bundles, track which items belong to which type
+          const handlesByType = new Map<number, string[]>();
+          if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+            for (const handle of handlesToSave) {
+              const candidate = candidateMapForCheck.get(handle);
+              const itemIdx = (candidate as any)?._bundleItemIndex;
+              if (typeof itemIdx === "number") {
+                if (!handlesByType.has(itemIdx)) {
+                  handlesByType.set(itemIdx, []);
+                }
+                handlesByType.get(itemIdx)!.push(handle);
+              }
+            }
+          }
+          
+          // Sort by price descending (most expensive first)
+          handlesWithPrices.sort((a, b) => b.price - a.price);
           
           let filteredHandles: string[] = [];
           let runningTotal = 0;
+          const usedHandles = new Set<string>();
           
-          // Add items one by one, stopping when budget would be exceeded
+          // First pass: Add at least one item per type (for bundles) or cheapest item (for single-item)
+          if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+            // For bundles: ensure at least one item per type is included
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const typeHandles = handlesByType.get(itemIdx) || [];
+              if (typeHandles.length > 0) {
+                // Add the cheapest item from this type first
+                const typeHandlesWithPrices = typeHandles
+                  .map(h => {
+                    const item = handlesWithPrices.find(x => x.handle === h);
+                    return item ? { handle: h, price: item.price } : null;
+                  })
+                  .filter((x): x is { handle: string; price: number } => x !== null)
+                  .sort((a, b) => a.price - b.price); // Cheapest first
+                
+                if (typeHandlesWithPrices.length > 0) {
+                  const cheapest = typeHandlesWithPrices[0];
+                  filteredHandles.push(cheapest.handle);
+                  usedHandles.add(cheapest.handle);
+                  runningTotal += cheapest.price;
+                }
+              }
+            }
+          } else {
+            // For single-item: add cheapest item first
+            const sortedByPrice = [...handlesWithPrices].sort((a, b) => a.price - b.price);
+            if (sortedByPrice.length > 0) {
+              filteredHandles.push(sortedByPrice[0].handle);
+              usedHandles.add(sortedByPrice[0].handle);
+              runningTotal += sortedByPrice[0].price;
+            }
+          }
+          
+          // Second pass: Add remaining items within budget
           for (const { handle, price } of handlesWithPrices) {
+            if (usedHandles.has(handle)) continue; // Already added in first pass
             if (runningTotal + price <= maxPriceCeiling) {
               filteredHandles.push(handle);
               runningTotal += price;
@@ -5773,12 +5956,22 @@ async function processSessionInBackground({
             }
           }
           
-          // Update handlesToSave to only include items within budget
-          if (filteredHandles.length < handlesToSave.length) {
+          // Only reduce if we still have at least the minimum required items
+          // For bundles: at least one per type
+          // For single-item: at least 1
+          const minRequired = isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2
+            ? bundleIntent.items.length // At least one per type
+            : 1;
+          
+          if (filteredHandles.length >= minRequired && filteredHandles.length < handlesToSave.length) {
             const originalCount = handlesToSave.length;
             handlesToSave = filteredHandles;
             deliveredCount = filteredHandles.length;
-            console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items`);
+            console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items (minRequired: ${minRequired})`);
+          } else if (filteredHandles.length < minRequired) {
+            // Can't meet budget without breaking bundle integrity - keep original selection
+            console.log(`[Constraints] Budget enforcement: cannot reduce below ${minRequired} items (bundle integrity), keeping ${handlesToSave.length} items`);
+            trustFallback = true;
           }
         }
       }
@@ -5850,7 +6043,46 @@ async function processSessionInBackground({
         reasoning = "Showing the best available match for your request.";
       }
       
-      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "billedCount=", deliveredCount, "handlesPreview=", handlesToSave.slice(0, 5));
+      // CRITICAL FIX: Build reasoning using FINAL saved result count (handlesToSave.length)
+      // This ensures the UI message matches what was actually saved, preventing "Showing 0 results" bug
+      const deliveredCountFinal = handlesToSave.length; // Authoritative: use saved handles count
+      const requestedCountFinal = finalResultCount;
+      const isBundleModeForReasoning = bundleIntent?.isBundle === true;
+      
+      // Remove any existing "Showing X results" from reasoning to avoid duplication
+      let finalReasoningToSave = reasoning || finalReasoning || "";
+      finalReasoningToSave = finalReasoningToSave.replace(/\s*Showing\s+\d+\s+results\s+\(requested\s+\d+\)[^.]*/gi, "");
+      
+      // Update reasoning with final delivered count (only if different from requested)
+      if (deliveredCountFinal < requestedCountFinal) {
+        // Explain why fewer results
+        let whyFewer = "";
+        if (isBundleModeForReasoning) {
+          // Bundle-specific reasons
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+            whyFewer = "Limited matches available within budget and stock constraints.";
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+            whyFewer = "Limited in-stock matches available for the requested bundle categories.";
+          } else {
+            whyFewer = "Limited matches available for the requested bundle categories.";
+          }
+        } else {
+          // Single-item reasons
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+            whyFewer = "Limited matches available within budget constraints.";
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+            whyFewer = "Limited in-stock matches available.";
+          } else {
+            whyFewer = "Limited matches available for your criteria.";
+          }
+        }
+        finalReasoningToSave += ` Showing ${deliveredCountFinal} results (requested ${requestedCountFinal}). ${whyFewer}`;
+      } else if (deliveredCountFinal === requestedCountFinal && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
+        // Budget was exceeded in pass 3
+        finalReasoningToSave += ` Showing ${deliveredCountFinal} results (requested ${requestedCountFinal}). Budget was relaxed to show more options.`;
+      }
+      
+      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "deliveredCountFinal=", deliveredCountFinal, "billedCount=", deliveredCount, "handlesPreview=", handlesToSave.slice(0, 5));
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
       // Note: If missingTypes.length > 0, this is a PARTIAL_BUNDLE (still marked COMPLETE)
@@ -5860,7 +6092,7 @@ async function processSessionInBackground({
         productHandles: handlesToSave,
         productIds: null,
         reasoning: handlesToSave.length > 0 
-          ? reasoning
+          ? finalReasoningToSave
           : finalReasoning,
       });
       saveMs = Math.round(performance.now() - saveStart);

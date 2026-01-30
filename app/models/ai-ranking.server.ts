@@ -1530,30 +1530,34 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       if (conversationMessages && conversationMessages.length > 0) {
         // Use full conversation context
-        // Replace or append system prompt to the first system message if it exists
+        // Check if first message is a system message (from conversation context)
         const hasSystemMessage = conversationMessages[0]?.role === "system";
         if (hasSystemMessage) {
           // Combine system messages: original conversation system + our system prompt
+          const existingSystemContent = conversationMessages[0].content || "";
           messages.push({
             role: "system",
-            content: `${conversationMessages[0].content}\n\n${systemPrompt}`
+            content: `${existingSystemContent}\n\n${systemPrompt}`
           });
           // Add rest of conversation (skip first system message)
           messages.push(...conversationMessages.slice(1));
         } else {
-          // Add our system prompt first
+          // No system message in conversation - add our system prompt first
+          // Then add all conversation messages (user/assistant)
           messages.push({ role: "system", content: systemPrompt });
-          // Add all conversation messages
           messages.push(...conversationMessages);
         }
         
         // Add the current product ranking task as the final user message
-        messages.push({
-          role: "user",
-          content: useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt
-        });
+        const taskContent = useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt;
+        if (taskContent && taskContent.trim().length > 0) {
+          messages.push({
+            role: "user",
+            content: taskContent
+          });
+        }
         
-        console.log(`[AI Ranking] Using conversation context: ${conversationMessages.length} conversation messages + 1 system + 1 task = ${messages.length} total messages`);
+        console.log(`[AI Ranking] ✅ Using conversation context: ${conversationMessages.length} conversation messages + 1 system + 1 task = ${messages.length} total messages`);
       } else {
         // Fallback to single userIntent (backward compatibility)
         messages = [
