@@ -1442,20 +1442,20 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   // Adaptive timeout function based on candidateCount and productListJsonChars
   // Increased timeouts to handle larger requests and json_schema mode which can be slower
   function calculateAdaptiveTimeout(candidateCount: number, productListJsonChars: number): number {
-    // <= 15 candidates and <= 10k chars: 20s (faster for small requests)
+    // <= 15 candidates and <= 10k chars: 30s (increased from 20s for better AI success rate)
     if (candidateCount <= 15 && productListJsonChars <= 10000) {
-      return 20000;
-    }
-    // <= 25 candidates and <= 15k chars: 30s
-    if (candidateCount <= 25 && productListJsonChars <= 15000) {
       return 30000;
     }
-    // <= 40 candidates or <= 25k chars: 40s (increased from 25s)
-    if (candidateCount <= 40 || productListJsonChars <= 25000) {
-      return 40000;
+    // <= 25 candidates and <= 15k chars: 35s (increased from 30s)
+    if (candidateCount <= 25 && productListJsonChars <= 15000) {
+      return 35000;
     }
-    // else: 50s (increased from 40s for very large requests)
-    return 50000;
+    // <= 40 candidates or <= 25k chars: 45s (increased from 40s)
+    if (candidateCount <= 40 || productListJsonChars <= 25000) {
+      return 45000;
+    }
+    // else: 60s (increased from 50s for very large requests)
+    return 60000;
   }
   
   // Response metadata variables (declared outside loop for catch block access)

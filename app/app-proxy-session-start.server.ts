@@ -2672,7 +2672,8 @@ async function processSessionInBackground({
         totalBudget: number | null,
         requestedCount: number,
         itemCount: number,
-        rankedCandidatesByItem?: Map<number, EnrichedCandidate[]>
+        rankedCandidatesByItem?: Map<number, EnrichedCandidate[]>,
+        slotPlan?: Map<number, number>
       ): {
         handles: string[];
         trustFallback: boolean;
@@ -2706,10 +2707,10 @@ async function processSessionInBackground({
           // Use ranked candidates if provided, otherwise use pool order
           const candidatesToCheck = rankedCandidatesByItem?.get(itemIdx) || pool;
           
-          // Find best candidate within allocated budget
+          // Find best candidate (prefer within budget, but still select if none fit)
           let selected: EnrichedCandidate | null = null;
           if (allocatedBudget !== undefined && allocatedBudget !== null) {
-            // Try to find candidate within allocated budget
+            // Try to find candidate within allocated budget first
             for (const c of candidatesToCheck) {
               if (used.has(c.handle)) continue;
               const price = getPrice(c);
@@ -2719,7 +2720,7 @@ async function processSessionInBackground({
               }
             }
             
-            // If none fit, pick cheapest and mark trustFallback
+            // If none fit, pick cheapest (budget is soft constraint)
             if (!selected) {
               const sorted = [...pool].filter(c => !used.has(c.handle)).sort((a, b) => getPrice(a) - getPrice(b));
               if (sorted.length > 0) {
@@ -2739,23 +2740,21 @@ async function processSessionInBackground({
           
           if (selected) {
             const price = getPrice(selected);
-            // Check total budget constraint ONLY when totalBudget is a number
-            if (totalBudget !== null && typeof totalBudget === "number" && totalPrice + price > totalBudget) {
-              // Can't add primary without exceeding total budget
+            // Always add primary - budget is a soft constraint
+            handles.push(selected.handle);
+            used.add(selected.handle);
+            totalPrice += price;
+            chosenPrimaries.set(itemIdx, selected.handle);
+            
+            // Mark budget exceeded if needed, but still add the primary
+            if (totalBudget !== null && typeof totalBudget === "number" && totalPrice > totalBudget) {
               budgetExceeded = true;
               trustFallback = true;
-            } else {
-              handles.push(selected.handle);
-              used.add(selected.handle);
-              totalPrice += price;
-              chosenPrimaries.set(itemIdx, selected.handle);
             }
           }
         }
         
-        // Step 2: Fill remaining slots round-robin, respecting budget constraints
-        const itemIndices = Array.from({ length: itemCount }, (_, i) => i);
-        let roundRobinIdx = 0;
+        // Step 2: Fill remaining slots using proportional distribution from slotPlan
         const handlesByItem = new Map<number, string[]>();
         
         // Initialize handlesByItem with primaries
@@ -2763,80 +2762,116 @@ async function processSessionInBackground({
           handlesByItem.set(itemIdx, [handle]);
         }
         
-        while (handles.length < requestedCount && roundRobinIdx < 200) {
-          const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
-          const pool = itemPools.get(currentItemIdx) || [];
-          const currentHandles = handlesByItem.get(currentItemIdx) || [];
-          const allocatedBudget = allocatedBudgets.get(currentItemIdx);
-          
-          // Find next candidate that fits budget constraints
-          let added = false;
-          for (const candidate of pool) {
-            if (used.has(candidate.handle)) continue;
-            if (handles.length >= requestedCount) break;
-            
-            const price = getPrice(candidate);
-            
-            // Check allocated budget constraint
-            if (allocatedBudget !== undefined && allocatedBudget !== null) {
-              const remainingAllocated = allocatedBudget - (currentHandles.reduce((sum, h) => {
-                const c = pool.find(p => p.handle === h);
-                return sum + (c ? getPrice(c) : 0);
-              }, 0));
-              if (price > remainingAllocated) {
-                continue; // Skip this candidate
-              }
-            }
-            
-            // Check total budget constraint ONLY when totalBudget is a number
-            if (totalBudget !== null && typeof totalBudget === "number" && totalPrice + price > totalBudget) {
-              // Can't add without exceeding total budget
-              budgetExceeded = true;
-              break; // Stop trying to add more
-            }
-            
-            // Add candidate
-            handles.push(candidate.handle);
-            used.add(candidate.handle);
-            totalPrice += price;
-            if (!handlesByItem.has(currentItemIdx)) {
-              handlesByItem.set(currentItemIdx, []);
-            }
-            handlesByItem.get(currentItemIdx)!.push(candidate.handle);
-            added = true;
-            break;
+        // Determine target counts per item based on slotPlan (proportional distribution)
+        const targetCountsByItem = new Map<number, number>();
+        if (slotPlan && slotPlan.size > 0) {
+          // Use slotPlan for proportional distribution
+          for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
+            targetCountsByItem.set(itemIdx, slotPlan.get(itemIdx) || 0);
           }
+        } else {
+          // Fallback: distribute evenly if no slotPlan
+          const slotsPerItem = Math.floor(requestedCount / itemCount);
+          const extraSlots = requestedCount % itemCount;
+          for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
+            targetCountsByItem.set(itemIdx, slotsPerItem + (itemIdx < extraSlots ? 1 : 0));
+          }
+        }
+        
+        // Fill each item type to its target count (proportional distribution)
+        for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
+          const pool = itemPools.get(itemIdx) || [];
+          const currentHandles = handlesByItem.get(itemIdx) || [];
+          const targetCount = targetCountsByItem.get(itemIdx) || 0;
+          const allocatedBudget = allocatedBudgets.get(itemIdx);
           
-          // If we couldn't add any candidate and we're under requestedCount, try cheapest remaining
-          if (!added && handles.length < requestedCount && totalBudget === null) {
-            // No total budget constraint, try cheapest from any pool
-            let cheapest: { candidate: EnrichedCandidate; itemIdx: number } | null = null;
-            for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
-              const pool = itemPools.get(itemIdx) || [];
-              for (const c of pool) {
-                if (used.has(c.handle)) continue;
-                const price = getPrice(c);
-                if (!cheapest || price < getPrice(cheapest.candidate)) {
-                  cheapest = { candidate: c, itemIdx };
+          // Fill up to target count for this item type
+          while (currentHandles.length < targetCount && handles.length < requestedCount) {
+            const candidatesToCheck = rankedCandidatesByItem?.get(itemIdx) || pool;
+            let added = false;
+            
+            // First pass: try to find candidates within budget (prefer budget-friendly)
+            for (const candidate of candidatesToCheck) {
+              if (used.has(candidate.handle)) continue;
+              if (currentHandles.length >= targetCount) break;
+              
+              const price = getPrice(candidate);
+              
+              // Prefer candidates within allocated budget, but don't require it
+              if (allocatedBudget !== undefined && allocatedBudget !== null) {
+                const currentSpent = currentHandles.reduce((sum, h) => {
+                  const c = pool.find(p => p.handle === h);
+                  return sum + (c ? getPrice(c) : 0);
+                }, 0);
+                const remainingAllocated = allocatedBudget - currentSpent;
+                
+                // Prefer within allocated budget, but still add if exceeds (soft constraint)
+                if (price > remainingAllocated && currentHandles.length > 0) {
+                  // Already have at least one, prefer budget-friendly but continue if needed
+                  continue;
                 }
               }
+              
+              // Add candidate (budget is soft - always fill slots)
+              handles.push(candidate.handle);
+              used.add(candidate.handle);
+              totalPrice += price;
+              currentHandles.push(candidate.handle);
+              added = true;
+              break;
             }
             
-            if (cheapest) {
-              handles.push(cheapest.candidate.handle);
-              used.add(cheapest.candidate.handle);
-              totalPrice += getPrice(cheapest.candidate);
-              if (!handlesByItem.has(cheapest.itemIdx)) {
-                handlesByItem.set(cheapest.itemIdx, []);
+            // Second pass: if couldn't add within budget, add cheapest available (ensure we fill slots)
+            if (!added && currentHandles.length < targetCount) {
+              const available = pool.filter(c => !used.has(c.handle));
+              if (available.length > 0) {
+                const cheapest = available.sort((a, b) => getPrice(a) - getPrice(b))[0];
+                handles.push(cheapest.handle);
+                used.add(cheapest.handle);
+                totalPrice += getPrice(cheapest);
+                currentHandles.push(cheapest.handle);
+                trustFallback = true;
+                added = true; // Mark as added so we continue the loop
+              } else {
+                break; // No more candidates for this type
               }
-              handlesByItem.get(cheapest.itemIdx)!.push(cheapest.candidate.handle);
-            } else {
-              break; // No more candidates available
             }
+            
+            if (!added) break; // Couldn't add any candidate for this iteration
           }
           
-          roundRobinIdx++;
-          if (roundRobinIdx > 200) break;
+          handlesByItem.set(itemIdx, currentHandles);
+        }
+        
+        // Step 3: If still under requestedCount, fill remaining slots round-robin (ensure full count)
+        if (handles.length < requestedCount) {
+          const itemIndices = Array.from({ length: itemCount }, (_, i) => i);
+          let roundRobinIdx = 0;
+          
+          while (handles.length < requestedCount && roundRobinIdx < 200) {
+            const currentItemIdx = itemIndices[roundRobinIdx % itemIndices.length];
+            const pool = itemPools.get(currentItemIdx) || [];
+            
+            // Find any available candidate (budget is soft constraint)
+            let added = false;
+            for (const candidate of pool) {
+              if (used.has(candidate.handle)) continue;
+              if (handles.length >= requestedCount) break;
+              
+              // Add candidate regardless of budget (ensure full count)
+              handles.push(candidate.handle);
+              used.add(candidate.handle);
+              totalPrice += getPrice(candidate);
+              const currentHandles = handlesByItem.get(currentItemIdx) || [];
+              currentHandles.push(candidate.handle);
+              handlesByItem.set(currentItemIdx, currentHandles);
+              added = true;
+              break;
+            }
+            
+            if (!added) break; // No more candidates available
+            roundRobinIdx++;
+          }
         }
         
         // Set budgetExceeded: null if totalBudget is null, boolean if totalBudget is a number
@@ -4121,7 +4156,8 @@ async function processSessionInBackground({
               bundleIntent.totalBudget,
               finalResultCount,
               bundleItemsWithBudget.length,
-              rankedCandidatesByItem
+              rankedCandidatesByItem,
+              slotPlan
             );
             
             finalHandles = selectionResult.handles;
@@ -4208,7 +4244,9 @@ async function processSessionInBackground({
               allocatedBudgets,
               bundleIntent.totalBudget,
               finalResultCount,
-              bundleItemsWithBudget.length
+              bundleItemsWithBudget.length,
+              undefined, // No rankedCandidatesByItem for deterministic fallback
+              slotPlan
             );
             
             finalHandles = selectionResult.handles;
@@ -4272,7 +4310,9 @@ async function processSessionInBackground({
             allocatedBudgets,
             bundleIntent.totalBudget,
             finalResultCount,
-            bundleItemsWithBudget.length
+            bundleItemsWithBudget.length,
+            undefined, // No rankedCandidatesByItem for this path
+            slotPlan
           );
           
           finalHandles = selectionResult.handles;
