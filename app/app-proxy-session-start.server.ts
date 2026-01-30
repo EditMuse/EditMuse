@@ -987,7 +987,7 @@ function parseBundleIntentGeneric(userIntent: string): {
       for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         const cleaned = segment.toLowerCase().trim();
-        const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "go", "my", "to", "go", "with", "the", "suit"]);
+        const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "go", "my", "to", "go", "with", "the"]);
         const words = cleaned.split(/\s+/).filter(w => w.length >= 3 && !stopWords.has(w) && !/^\d+$/.test(w));
         
         if (words.length > 0) {
@@ -2695,9 +2695,17 @@ async function processSessionInBackground({
         };
         
         // Step 1: Select primaries (at least 1 per itemIndex)
+        // CRITICAL: Log item pool sizes for debugging
+        console.log("[Bundle Selection] Step 1: Item pool sizes", Array.from({ length: itemCount }, (_, i) => ({
+          itemIndex: i,
+          poolSize: (itemPools.get(i) || []).length,
+          hasPool: itemPools.has(i)
+        })));
+        
         for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
           const pool = itemPools.get(itemIdx) || [];
           if (pool.length === 0) {
+            console.warn(`[Bundle Selection] ⚠️  Item ${itemIdx} has empty pool - skipping primary selection`);
             trustFallback = true;
             continue;
           }
@@ -2766,11 +2774,13 @@ async function processSessionInBackground({
         const targetCountsByItem = new Map<number, number>();
         if (slotPlan && slotPlan.size > 0) {
           // Use slotPlan for proportional distribution
+          console.log("[Bundle Selection] Using slotPlan for proportional distribution", Array.from(slotPlan.entries()).map(([idx, slots]) => ({ itemIndex: idx, slots })));
           for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
             targetCountsByItem.set(itemIdx, slotPlan.get(itemIdx) || 0);
           }
         } else {
           // Fallback: distribute evenly if no slotPlan
+          console.log("[Bundle Selection] No slotPlan - distributing evenly");
           const slotsPerItem = Math.floor(requestedCount / itemCount);
           const extraSlots = requestedCount % itemCount;
           for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
@@ -2778,12 +2788,22 @@ async function processSessionInBackground({
           }
         }
         
+        console.log("[Bundle Selection] Target counts per item", Array.from(targetCountsByItem.entries()).map(([idx, count]) => ({ itemIndex: idx, targetCount: count })));
+        
         // Fill each item type to its target count (proportional distribution)
+        console.log("[Bundle Selection] Step 2: Starting proportional fill", {
+          requestedCount,
+          currentHandlesCount: handles.length,
+          primariesCount: chosenPrimaries.size
+        });
+        
         for (let itemIdx = 0; itemIdx < itemCount; itemIdx++) {
           const pool = itemPools.get(itemIdx) || [];
           const currentHandles = handlesByItem.get(itemIdx) || [];
           const targetCount = targetCountsByItem.get(itemIdx) || 0;
           const allocatedBudget = allocatedBudgets.get(itemIdx);
+          
+          console.log(`[Bundle Selection] Filling item ${itemIdx}: poolSize=${pool.length}, currentHandles=${currentHandles.length}, targetCount=${targetCount}`);
           
           // Fill up to target count for this item type
           while (currentHandles.length < targetCount && handles.length < requestedCount) {
@@ -3073,24 +3093,13 @@ async function processSessionInBackground({
           const substituteMap = new Map<number, string[]>(); // itemIdx -> substitute terms
           for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
             const item = bundleItemsWithBudget[itemIdx];
-            const mainTerm = item.hardTerms[0]?.toLowerCase() || "";
+            // Industry-agnostic: No hardcoded substitutes
+            // The system should rely on user-provided terms and linguistic patterns
+            // Substitutes would introduce industry-specific assumptions
+            // If needed, substitutes can be extracted from user query context, not hardcoded
             const substitutes: string[] = [];
             
-            // Define substitutes
-            if (mainTerm.includes("blazer") || mainTerm.includes("outerwear")) {
-              substitutes.push("jacket", "coat", "waistcoat");
-            }
-            if (mainTerm.includes("trouser")) {
-              substitutes.push("pant", "chino");
-            }
-            if (mainTerm.includes("shirt")) {
-              substitutes.push("dress shirt", "button-up", "formal shirt");
-            }
-            if (mainTerm.includes("suit")) {
-              // Only allow tuxedo if wedding/formal intent (check userIntent later, for now skip)
-              // substitutes.push("tuxedo");
-            }
-            
+            // Empty substitutes array - no industry-specific assumptions
             if (substitutes.length > 0) {
               substituteMap.set(itemIdx, substitutes);
             }
@@ -3513,16 +3522,26 @@ async function processSessionInBackground({
         }
       }
       
-      // Special boost terms for fashion/apparel (detected from user intent)
+      // Industry-agnostic boost terms (detected from user intent)
       // These provide additional matching signals when present in user queries
+      // Works for any industry: "3 piece", "set", "kit", "bundle", etc.
       const boostTerms = new Set<string>();
       const lowerIntent = userIntent.toLowerCase();
-      if (/\b(3\s*piece|three\s*piece)\b/i.test(lowerIntent)) {
-        boostTerms.add("3 piece");
-        boostTerms.add("three piece");
+      
+      // Generic multi-piece/set patterns (industry-agnostic)
+      if (/\b(3\s*piece|three\s*piece|4\s*piece|four\s*piece|5\s*piece|five\s*piece)\b/i.test(lowerIntent)) {
+        const match = lowerIntent.match(/\b(\d+\s*piece|three\s*piece|four\s*piece|five\s*piece)\b/i);
+        if (match) {
+          boostTerms.add(match[1].toLowerCase());
+        }
       }
-      if (/\bwaistcoat\b/i.test(lowerIntent)) {
-        boostTerms.add("waistcoat");
+      
+      // Generic collection terms (industry-agnostic)
+      if (/\b(set|kit|bundle|collection|suite|system)\b/i.test(lowerIntent)) {
+        const match = lowerIntent.match(/\b(set|kit|bundle|collection|suite|system)\b/i);
+        if (match) {
+          boostTerms.add(match[1].toLowerCase());
+        }
       }
       
       // Gate 2: Hard terms (must match at least one hard term if hard terms exist)
@@ -3661,10 +3680,10 @@ async function processSessionInBackground({
           }
         }
         
-        // Boost for special terms (3 piece, waistcoat, etc.)
+        // Boost for generic collection/multi-piece terms (industry-agnostic)
         for (const boostTerm of boostTerms) {
           if (matchesHardTermWithBoundary(haystack, boostTerm)) {
-            score += 1.5; // Boost for related fashion terms
+            score += 1.5; // Boost for collection/multi-piece terms
           }
         }
         
@@ -3997,31 +4016,24 @@ async function processSessionInBackground({
           }
         }
         
-        // Log bundle AI window with per-item counts
-        // Identify item types from hardTerms (suit, shirt, trousers, etc.)
-        let suitCount = 0;
-        let shirtCount = 0;
-        let trousersCount = 0;
+        // Log bundle AI window with per-item counts (industry-agnostic)
+        // Build per-item type counts dynamically from hardTerms
+        const itemTypeCounts: Record<string, number> = {};
         
         for (const pool of itemGatedPools) {
           const count = itemCounts.get(pool.itemIndex) || 0;
           const firstTerm = (pool.hardTerms[0] || "").toLowerCase();
-          if (firstTerm.includes("suit")) {
-            suitCount = count;
-          } else if (firstTerm.includes("shirt")) {
-            shirtCount = count;
-          } else if (firstTerm.includes("trouser") || firstTerm.includes("pant")) {
-            trousersCount = count;
+          // Use first term as key (industry-agnostic - works for any product type)
+          if (firstTerm) {
+            itemTypeCounts[firstTerm] = count;
           }
         }
         
-        // Log AI window used (small-first approach)
+        // Log AI window used (small-first approach) - industry-agnostic
         console.log("[Perf] ai_window_used", {
           flow: "bundle",
           perItem: MAX_BUNDLE_AI_PER_ITEM,
-          suitCount,
-          shirtCount,
-          trousersCount,
+          itemTypeCounts, // Dynamic per-item counts (industry-agnostic)
           total: bundleCandidatesForAI.length,
         });
         
@@ -4218,17 +4230,39 @@ async function processSessionInBackground({
             parseFailReason = "AI returned empty handles";
             console.log("[Bundle] Deterministic fallback selected (AI returned empty handles)");
             
-            // Build item pools from sortedCandidates
+            // Build item pools from itemGatedPools (ensures all items are represented)
+            // CRITICAL: Use itemGatedPools instead of sortedCandidates to ensure all item types have candidates
             const itemPools = new Map<number, EnrichedCandidate[]>();
+            
+            // First, build from itemGatedPools (this ensures all items have pools)
+            for (const pool of itemGatedPools) {
+              if (!itemPools.has(pool.itemIndex)) {
+                itemPools.set(pool.itemIndex, []);
+              }
+              // Add candidates from this item's gated pool
+              itemPools.get(pool.itemIndex)!.push(...pool.candidates);
+            }
+            
+            // Also add any candidates from sortedCandidates that might have been enriched
+            // This ensures we have the latest enriched data (descriptions, etc.)
             for (const c of sortedCandidates) {
               const itemIdx = (c as any)._bundleItemIndex;
               if (typeof itemIdx === "number") {
-                if (!itemPools.has(itemIdx)) {
-                  itemPools.set(itemIdx, []);
+                const pool = itemPools.get(itemIdx) || [];
+                // Only add if not already in pool (avoid duplicates)
+                if (!pool.some(existing => existing.handle === c.handle)) {
+                  pool.push(c);
+                  itemPools.set(itemIdx, pool);
                 }
-                itemPools.get(itemIdx)!.push(c);
               }
             }
+            
+            // Log pool sizes for debugging
+            console.log("[Bundle] Fallback item pools", Array.from(itemPools.entries()).map(([idx, pool]) => ({
+              itemIndex: idx,
+              poolSize: pool.length,
+              itemType: bundleItemsWithBudget[idx]?.hardTerms[0] || "unknown"
+            })));
             
             // Build allocated budgets map
             const allocatedBudgets = new Map<number, number>();
