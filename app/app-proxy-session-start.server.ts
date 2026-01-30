@@ -912,23 +912,31 @@ function parseBundleIntentGeneric(userIntent: string): {
           }
           
           // Extract meaningful noun phrases - remove stop words and get core product terms
-          const cleaned = segment.toLowerCase().trim();
-          const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "for", "go", "my", "to", "go", "with"]);
+          // CRITICAL: Clean segment more aggressively to extract only product terms
+          let cleaned = segment.toLowerCase().trim();
+          
+          // Remove common phrases that aren't product terms
+          cleaned = cleaned.replace(/\b(give\s+me|i\s+want|i\s+need|looking\s+for|need\s+some|want\s+some|get\s+me|find\s+me)\b/gi, " ");
+          cleaned = cleaned.replace(/\b(some|any|few|several|couple|pair|pairs)\b/gi, " ");
+          
+          const stopWords = new Set(["a", "an", "the", "and", "or", "for", "in", "on", "at", "to", "of", "with", "i", "want", "need", "looking", "go", "my", "give", "me", "get", "find", "some", "any"]);
           const words = cleaned.split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w) && !/^\d+$/.test(w));
           
           if (words.length > 0) {
-            // Use the most significant words (longer words first, up to 3 words for multi-word terms)
+            // Use the most significant words (longer words first, up to 2 words for multi-word terms)
             // Filter out abstract terms from the words
             const concreteWords = words.filter(w => {
               const wLower = w.toLowerCase();
               // Filter out abstract collection terms and price/budget terms
-              return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to)$/i.test(wLower);
+              return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|budget|price|cost|spend|spending|total|maximum|max|under|below|less|up|to|give|me|want|need|looking|get|find)$/i.test(wLower);
             });
             
             if (concreteWords.length > 0) {
+              // Sort by length (longer = more specific) and take up to 2 words max
+              // This prevents terms like "suits give me" - we only want "suits"
               const significantWords = concreteWords
                 .sort((a, b) => b.length - a.length)
-                .slice(0, 3);
+                .slice(0, 2); // Max 2 words to avoid phrases like "suits give me"
               const term = significantWords.join(" ").trim();
               
               // Only add if term is not empty and has at least 2 characters
@@ -942,7 +950,7 @@ function parseBundleIntentGeneric(userIntent: string): {
               const fallbackWords = words.filter(w => {
                 const wLower = w.toLowerCase();
                 // Only filter out the most obvious abstract terms, keep others
-                return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination)$/i.test(wLower);
+                return !/^(complete|full|entire|whole|outfit|ensemble|set|kit|bundle|package|collection|combo|combination|give|me|want|need|looking|get|find)$/i.test(wLower);
               });
               
               if (fallbackWords.length > 0) {
@@ -1553,10 +1561,30 @@ export async function proxySessionStartAction(
   let answers = body.answers;
   // NOTE: resultCount is ignored - Experience.resultCount is the ONLY source of truth
   const bodyResultCount = (body as any).resultCount; // Only for logging
+  
+  // Log answers preview (first 200 chars) for debugging - safe substring
+  let answersPreview = "none";
+  try {
+    if (answers !== undefined && answers !== null) {
+      if (Array.isArray(answers)) {
+        const jsonStr = JSON.stringify(answers);
+        answersPreview = `array[${answers.length}]: ${jsonStr.substring(0, Math.min(200, jsonStr.length))}`;
+      } else if (typeof answers === "string") {
+        answersPreview = `string: ${answers.substring(0, Math.min(200, answers.length))}`;
+      } else {
+        const str = String(answers);
+        answersPreview = `other: ${str.substring(0, Math.min(200, str.length))}`;
+      }
+    }
+  } catch (e) {
+    answersPreview = "error_logging";
+  }
+  
   console.log("[App Proxy] Request body:", {
     experienceId,
     bodyResultCount, // Log only, not used
     hasAnswers: !!answers,
+    answersPreview, // Show what answers were provided
     clientRequestId,
   });
 
@@ -1957,6 +1985,18 @@ export async function proxySessionStartAction(
   const answersJson = Array.isArray(answers) 
     ? JSON.stringify(answers) 
     : (typeof answers === "string" ? answers : "[]");
+  
+  try {
+    console.log("[App Proxy] Storing answers as JSON:", {
+      answersLength: Array.isArray(answers) ? answers.length : (typeof answers === "string" ? answers.length : 0),
+      answersJsonLength: answersJson.length,
+      answersJsonPreview: answersJson.substring(0, Math.min(200, answersJson.length)),
+      isEmpty: answersJson === "[]" || answersJson.trim() === "",
+    });
+  } catch (e) {
+    // Logging error - non-critical, continue
+    console.log("[App Proxy] Storing answers as JSON (logging error)");
+  }
 
   // Create session with PROCESSING status (will be updated to COMPLETE/FAILED by background processing)
   const sessionToken = await createConciergeSession({

@@ -338,9 +338,17 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
       console.log("[AI Ranking] Fixed JSON syntax errors and successfully parsed");
       return parsed as StructuredRankingResult;
     } catch (retryErr) {
-      // Third attempt: More aggressive array repair (handles "Expected ',' or ']' after array element")
-      // Use a more comprehensive approach to fix array syntax
+      // Third attempt: More aggressive repair (handles "Expected ',' or '}' after property value" and array errors)
+      // Use a more comprehensive approach to fix JSON syntax
       let repaired = fixed;
+      
+      // CRITICAL FIX: Handle "Expected ',' or '}' after property value" errors
+      // Pattern: Property value followed by another property or closing brace without comma
+      // Example: "key": "value" "key2": ... or "key": "value" }
+      repaired = repaired.replace(/("(?:[^"\\]|\\.)*")\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // String value before string property
+      repaired = repaired.replace(/(\d+)\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Number before property
+      repaired = repaired.replace(/(true|false|null)\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Boolean/null before property
+      repaired = repaired.replace(/([}\]"])\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Closing bracket/brace/quote before property
       
       // Fix missing commas in arrays - more aggressive patterns
       // Pattern 1: Value followed by value without comma (any type)
@@ -353,6 +361,11 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
       // Fix missing commas in nested structures
       repaired = repaired.replace(/([}\]"])\s*"([^"]+)":/g, '$1, "$2":'); // Missing comma before property
       repaired = repaired.replace(/([}\]"])\s*([{[])/g, '$1, $2'); // Missing comma between structures
+      
+      // Fix property value followed by closing brace without comma
+      repaired = repaired.replace(/("(?:[^"\\]|\\.)*")\s*([}])/g, '$1$2'); // String value before closing brace (no comma needed)
+      repaired = repaired.replace(/(\d+)\s*([}])/g, '$1$2'); // Number before closing brace
+      repaired = repaired.replace(/(true|false|null)\s*([}])/g, '$1$2'); // Boolean/null before closing brace
       
       // Remove double commas and clean up
       repaired = repaired.replace(/,+/g, ',');
