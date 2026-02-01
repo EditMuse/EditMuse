@@ -5446,12 +5446,9 @@ async function processSessionInBackground({
         }
       }
 
-      console.log(
-        "[App Proxy] Final handles after top-up:",
-        finalHandlesGuaranteed.length,
-        "requested:",
-        finalResultCount
-      );
+      // NOTE: Do NOT log "Final handles after top-up" here - this is an intermediate variable
+      // Logging will happen AFTER validation/dedupe/availability/budget enforcement are complete
+      // See deliveredHandlesFinal logging below
 
       finalHandles = finalHandlesGuaranteed;
 
@@ -5580,21 +5577,11 @@ async function processSessionInBackground({
       // NOTE: Do NOT add delivered count to reasoning here - it will be added AFTER handlesToSave is finalized
       // This prevents the "Showing 0 results" bug where intermediate variables are used instead of final saved result
 
-      console.log("[App Proxy] Final product handles:", productHandles.length, "out of", targetCount, "requested");
+      // NOTE: Do NOT check "No products found" here - productHandles is an intermediate variable
+      // This check will happen AFTER validation/dedupe/availability/budget enforcement are complete
+      // See deliveredHandlesFinal check below
       
-      // Generate helpful suggestions if no results
       let finalReasoning = reasoning;
-      if (productHandles.length === 0) {
-        const suggestions = generateEmptyResultSuggestions(
-          userIntent,
-          filteredProducts.length,
-          baseProducts.length
-        );
-        finalReasoning = suggestions.length > 0 
-          ? `No products match your criteria. ${suggestions[0]}`
-          : "No products available. Please try adjusting your search criteria or filters.";
-        console.log("[App Proxy] No products found - generated suggestions:", suggestions);
-      }
       
       // Guard: finalHandles must be defined and an array before saving
       if (finalHandles === undefined || !Array.isArray(finalHandles)) {
@@ -5889,88 +5876,172 @@ async function processSessionInBackground({
             return { handle, price: Number.isFinite(price) ? price : 0 };
           });
           
-          // For bundles, track which items belong to which type
-          const handlesByType = new Map<number, string[]>();
+          // CRITICAL FIX: Budget enforcement must preserve required categories
+          // For bundles, each requested item group is REQUIRED - ensure >=1 product per group
+          // Use proper matching logic (same as missing types check) instead of relying on metadata
+          
+          // Step 1: Group handles by matching item type using proper matching logic (industry-agnostic)
+          const handlesByType = new Map<number, Array<{ handle: string; price: number }>>();
+          const groupPoolSizes: Array<{ index: number; label: string; poolSize: number }> = [];
+          
           if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
-            for (const handle of handlesToSave) {
+            // Initialize empty arrays for each required group
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              handlesByType.set(itemIdx, []);
+            }
+            
+            // Group handles by matching item type using proper matching logic
+            for (const { handle, price } of handlesWithPrices) {
               const candidate = candidateMapForCheck.get(handle);
-              const itemIdx = (candidate as any)?._bundleItemIndex;
-              if (typeof itemIdx === "number") {
-                if (!handlesByType.has(itemIdx)) {
-                  handlesByType.set(itemIdx, []);
+              if (!candidate) continue;
+              
+              const haystack = [
+                candidate.title || "",
+                candidate.productType || "",
+                (candidate.tags || []).join(" "),
+                candidate.vendor || "",
+                candidate.searchText || "",
+              ].join(" ");
+              
+              // Find which item type this handle matches (industry-agnostic matching)
+              let matched = false;
+              for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+                const bundleItem = bundleIntent.items[itemIdx];
+                const itemHardTerms = bundleItem.hardTerms;
+                const matches = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (matches) {
+                  handlesByType.get(itemIdx)!.push({ handle, price });
+                  matched = true;
+                  break;
                 }
-                handlesByType.get(itemIdx)!.push(handle);
+              }
+              
+              // If no match found, assign to first type (fallback - should be rare)
+              if (!matched && bundleIntent.items.length > 0) {
+                handlesByType.get(0)!.push({ handle, price });
               }
             }
+            
+            // Log pool sizes per group
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const bundleItem = bundleIntent.items[itemIdx];
+              const label = normalizeItemLabel(bundleItem.hardTerms[0] || "unknown");
+              const poolSize = handlesByType.get(itemIdx)?.length || 0;
+              groupPoolSizes.push({ index: itemIdx, label, poolSize });
+            }
+            console.log("[Bundle] groupPoolSizes", groupPoolSizes);
+          } else {
+            // Single-item: all handles belong to one group
+            handlesByType.set(0, handlesWithPrices);
           }
           
-          // Sort by price descending (most expensive first)
-          handlesWithPrices.sort((a, b) => b.price - a.price);
+          // Step 2: Calculate cheapest one-per-group total (for bundles) or cheapest single item (for single-item)
+          let cheapestOnePerGroupTotal = 0;
+          const cheapestOnePerGroup: string[] = [];
           
-          let filteredHandles: string[] = [];
-          let runningTotal = 0;
-          const usedHandles = new Set<string>();
-          
-          // First pass: Add at least one item per type (for bundles) or cheapest item (for single-item)
           if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
-            // For bundles: ensure at least one item per type is included
+            // For bundles: find cheapest item per required group
             for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-              const typeHandles = handlesByType.get(itemIdx) || [];
-              if (typeHandles.length > 0) {
-                // Add the cheapest item from this type first
-                const typeHandlesWithPrices = typeHandles
-                  .map(h => {
-                    const item = handlesWithPrices.find(x => x.handle === h);
-                    return item ? { handle: h, price: item.price } : null;
-                  })
-                  .filter((x): x is { handle: string; price: number } => x !== null)
-                  .sort((a, b) => a.price - b.price); // Cheapest first
-                
-                if (typeHandlesWithPrices.length > 0) {
-                  const cheapest = typeHandlesWithPrices[0];
-                  filteredHandles.push(cheapest.handle);
-                  usedHandles.add(cheapest.handle);
-                  runningTotal += cheapest.price;
-                }
+              const groupHandles = handlesByType.get(itemIdx) || [];
+              if (groupHandles.length > 0) {
+                // Sort by price ascending and take cheapest
+                const sorted = [...groupHandles].sort((a, b) => a.price - b.price);
+                cheapestOnePerGroup.push(sorted[0].handle);
+                cheapestOnePerGroupTotal += sorted[0].price;
               }
             }
           } else {
-            // For single-item: add cheapest item first
-            const sortedByPrice = [...handlesWithPrices].sort((a, b) => a.price - b.price);
-            if (sortedByPrice.length > 0) {
-              filteredHandles.push(sortedByPrice[0].handle);
-              usedHandles.add(sortedByPrice[0].handle);
-              runningTotal += sortedByPrice[0].price;
+            // Single-item: just take cheapest
+            const sorted = [...handlesWithPrices].sort((a, b) => a.price - b.price);
+            if (sorted.length > 0) {
+              cheapestOnePerGroup.push(sorted[0].handle);
+              cheapestOnePerGroupTotal = sorted[0].price;
             }
           }
           
-          // Second pass: Add remaining items within budget
-          for (const { handle, price } of handlesWithPrices) {
-            if (usedHandles.has(handle)) continue; // Already added in first pass
+          console.log("[Bundle] cheapestOnePerGroupTotal", {
+            total: cheapestOnePerGroupTotal,
+            maxPriceCeiling,
+            canMeetBudget: cheapestOnePerGroupTotal <= maxPriceCeiling,
+            handles: cheapestOnePerGroup,
+          });
+          
+          // Step 3: If cheapest one-per-group exceeds budget, still return it (budget is soft constraint)
+          // Set budgetExceeded=true and include explanation
+          let filteredHandles: string[] = [];
+          let runningTotal = 0;
+          const usedHandles = new Set<string>();
+          let budgetExceeded = false;
+          
+          // First pass: ALWAYS add at least one item per required group (preserve required categories)
+          if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+            // For bundles: ensure at least one item per required group is included
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const groupHandles = handlesByType.get(itemIdx) || [];
+              if (groupHandles.length > 0) {
+                // Add the cheapest item from this required group (always preserve)
+                const sorted = [...groupHandles].sort((a, b) => a.price - b.price);
+                const cheapest = sorted[0];
+                filteredHandles.push(cheapest.handle);
+                usedHandles.add(cheapest.handle);
+                runningTotal += cheapest.price;
+              }
+              // If group has zero candidates, mark it missing and continue (partial bundle)
+            }
+            
+            // If cheapest one-per-group exceeds budget, mark as exceeded but still return it
+            if (cheapestOnePerGroupTotal > maxPriceCeiling) {
+              budgetExceeded = true;
+              console.log("[Constraints] Budget exceeded by cheapest one-per-group set, but preserving required categories", {
+                cheapestOnePerGroupTotal,
+                maxPriceCeiling,
+                difference: cheapestOnePerGroupTotal - maxPriceCeiling,
+              });
+            }
+          } else {
+            // Single-item: add cheapest item first
+            const sorted = [...handlesWithPrices].sort((a, b) => a.price - b.price);
+            if (sorted.length > 0) {
+              filteredHandles.push(sorted[0].handle);
+              usedHandles.add(sorted[0].handle);
+              runningTotal += sorted[0].price;
+            }
+          }
+          
+          // Step 4: Add remaining items within budget (extra slots, not required)
+          // Only add extra items if they fit within budget
+          const sortedByPrice = handlesWithPrices.sort((a, b) => a.price - b.price); // Cheapest first for extra slots
+          for (const { handle, price } of sortedByPrice) {
+            if (usedHandles.has(handle)) continue; // Already added in first pass (required)
             if (runningTotal + price <= maxPriceCeiling) {
               filteredHandles.push(handle);
+              usedHandles.add(handle);
               runningTotal += price;
             } else {
-              // Skip this item to stay within budget
-              console.log(`[Constraints] Skipping ${handle} (price: $${price.toFixed(2)}) to stay within budget`);
+              // Skip this extra item to stay within budget
+              console.log(`[Constraints] Skipping extra item ${handle} (price: $${price.toFixed(2)}) to stay within budget`);
             }
           }
           
-          // Only reduce if we still have at least the minimum required items
-          // For bundles: at least one per type
-          // For single-item: at least 1
+          // Step 5: Apply filtered handles (preserving required categories)
           const minRequired = isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2
-            ? bundleIntent.items.length // At least one per type
+            ? bundleIntent.items.length // At least one per required group
             : 1;
           
-          if (filteredHandles.length >= minRequired && filteredHandles.length < handlesToSave.length) {
+          // Always preserve required categories - only reduce extra slots
+          if (filteredHandles.length >= minRequired) {
             const originalCount = handlesToSave.length;
             handlesToSave = filteredHandles;
             deliveredCount = filteredHandles.length;
-            console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items (minRequired: ${minRequired})`);
-          } else if (filteredHandles.length < minRequired) {
-            // Can't meet budget without breaking bundle integrity - keep original selection
-            console.log(`[Constraints] Budget enforcement: cannot reduce below ${minRequired} items (bundle integrity), keeping ${handlesToSave.length} items`);
+            
+            if (budgetExceeded) {
+              console.log(`[Constraints] Budget enforcement: preserved ${minRequired} required items (one per group) even though budget exceeded. Total: ${filteredHandles.length} items, price: $${runningTotal.toFixed(2)} (budget: $${maxPriceCeiling.toFixed(2)})`);
+            } else {
+              console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items (minRequired: ${minRequired})`);
+            }
+          } else {
+            // This should never happen if we have candidates, but handle gracefully
+            console.log(`[Constraints] Budget enforcement: cannot preserve ${minRequired} required items, keeping ${handlesToSave.length} items`);
             trustFallback = true;
           }
         }
@@ -6043,11 +6114,28 @@ async function processSessionInBackground({
         reasoning = "Showing the best available match for your request.";
       }
       
-      // CRITICAL FIX: Build reasoning using FINAL saved result count (handlesToSave.length)
-      // This ensures the UI message matches what was actually saved, preventing "Showing 0 results" bug
-      const deliveredCountFinal = handlesToSave.length; // Authoritative: use saved handles count
+      // CRITICAL FIX: Use authoritative final saved result count
+      // This is the ONLY source of truth for delivered count - computed AFTER all processing
+      const deliveredHandlesFinal = handlesToSave; // Authoritative: final saved handles
+      const deliveredCountFinal = deliveredHandlesFinal.length; // Authoritative: use saved handles count
       const requestedCountFinal = finalResultCount;
       const isBundleModeForReasoning = bundleIntent?.isBundle === true;
+      
+      // Log final delivery metrics (authoritative values)
+      console.log("[App Proxy] Final handles after top-up:", deliveredCountFinal, "requested:", requestedCountFinal);
+      
+      // Generate helpful suggestions ONLY if deliveredCountFinal === 0 (authoritative check)
+      if (deliveredCountFinal === 0) {
+        const suggestions = generateEmptyResultSuggestions(
+          userIntent,
+          filteredProducts.length,
+          baseProducts.length
+        );
+        finalReasoning = suggestions.length > 0 
+          ? `No products match your criteria. ${suggestions[0]}`
+          : "No products available. Please try adjusting your search criteria or filters.";
+        console.log("[App Proxy] No products found - generated suggestions:", suggestions);
+      }
       
       // Remove any existing "Showing X results" from reasoning to avoid duplication
       let finalReasoningToSave = reasoning || finalReasoning || "";
@@ -6082,16 +6170,16 @@ async function processSessionInBackground({
         finalReasoningToSave += ` Showing ${deliveredCountFinal} results (requested ${requestedCountFinal}). Budget was relaxed to show more options.`;
       }
       
-      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "deliveredCountFinal=", deliveredCountFinal, "billedCount=", deliveredCount, "handlesPreview=", handlesToSave.slice(0, 5));
+      console.log("[App Proxy] Saving: requested=", requestedCount, "delivered=", deliveredCount, "deliveredCountFinal=", deliveredCountFinal, "billedCount=", deliveredCount, "handlesPreview=", deliveredHandlesFinal.slice(0, 5));
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
       // Note: If missingTypes.length > 0, this is a PARTIAL_BUNDLE (still marked COMPLETE)
       const saveStart = performance.now();
       await saveConciergeResult({
         sessionToken,
-        productHandles: handlesToSave,
+        productHandles: deliveredHandlesFinal, // Use authoritative final handles
         productIds: null,
-        reasoning: handlesToSave.length > 0 
+        reasoning: deliveredCountFinal > 0 
           ? finalReasoningToSave
           : finalReasoning,
       });
