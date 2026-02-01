@@ -146,12 +146,12 @@ export async function saveConciergeResult({
       create: {
         sessionId: session.id,
         productHandles: productHandles,
-        productIds: productIds || null,
+        productIds: productIds || undefined,
         reasoning: reasoning || null,
       },
       update: {
         productHandles: productHandles,
-        productIds: productIds || null,
+        productIds: productIds || undefined,
         reasoning: reasoning || null,
       },
     }),

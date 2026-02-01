@@ -60,6 +60,60 @@ function pickString(obj: any, keys: string[]): string | null {
  * Combines common catalog fields: title, handle, productType, tags, vendor, description snippet
  * Uses cleanDescription to strip HTML and normalize
  */
+/**
+ * Assign a group key to a product (industry-agnostic)
+ * Uses product.type, vendor, collections/tags, or fallback heuristics
+ */
+function assignGroupKey(candidate: any): string {
+  // Priority 1: Use productType if present and meaningful
+  if (candidate.productType && typeof candidate.productType === "string") {
+    const type = candidate.productType.trim().toLowerCase();
+    if (type.length > 0 && type !== "null" && type !== "undefined") {
+      return type;
+    }
+  }
+  
+  // Priority 2: Use vendor if type is missing
+  if (candidate.vendor && typeof candidate.vendor === "string") {
+    const vendor = candidate.vendor.trim().toLowerCase();
+    if (vendor.length > 0 && vendor !== "null" && vendor !== "undefined") {
+      return vendor;
+    }
+  }
+  
+  // Priority 3: Extract first meaningful noun phrase from title
+  if (candidate.title && typeof candidate.title === "string") {
+    const title = candidate.title.trim();
+    if (title.length > 0) {
+      // Simple heuristic: take first 1-2 words that are not common stopwords
+      const stopwords = new Set(["the", "a", "an", "for", "with", "and", "or", "of", "in", "on", "at", "to", "from"]);
+      const words = title.toLowerCase().split(/\s+/).filter((w: string) => {
+        const cleaned = w.replace(/[^\w]/g, "");
+        return cleaned.length >= 3 && !stopwords.has(cleaned);
+      });
+      
+      if (words.length > 0) {
+        // Take first 1-2 meaningful words as group key
+        const key = words.slice(0, 2).join(" ");
+        if (key.length >= 3) {
+          return key;
+        }
+      }
+    }
+  }
+  
+  // Priority 4: Use first tag if available
+  if (Array.isArray(candidate.tags) && candidate.tags.length > 0) {
+    const firstTag = String(candidate.tags[0]).trim().toLowerCase();
+    if (firstTag.length >= 3) {
+      return firstTag;
+    }
+  }
+  
+  // Fallback: generic "other"
+  return "other";
+}
+
 function extractSearchText(candidate: any): string {
   const parts: string[] = [];
   
@@ -3202,6 +3256,7 @@ async function processSessionInBackground({
         totalBudget: null,
         totalBudgetCurrency: null
       };
+      let collectionIntent = false; // Multi-item intent flag (for single-item queries that want a mixed set)
       let llmIntentUsed = false;
       
       // Prepare conversation history for LLM (if available)
@@ -3304,6 +3359,45 @@ async function processSessionInBackground({
       console.log(`[Intent Parsing] Method: ${llmIntentUsed ? "LLM" : "pattern-based"}, isBundle: ${bundleIntent.isBundle}, hardTerms: ${hardTerms.length}, avoidTerms: ${avoidTerms.length}`);
       
       // Bundle detection already logged above or in parseBundleIntentGeneric
+      
+      // ============================================
+      // COLLECTION INTENT DETECTION (Multi-item intent for single-item queries)
+      // ============================================
+      // Only detect collection intent if NOT a bundle (isBundle=false)
+      // Collection intent means user wants a mixed set (e.g., "outfit", "set", "kit") without explicit bundle items
+      if (!bundleIntent.isBundle) {
+        const lowerIntent = userIntent.toLowerCase();
+        const collectionPhrases = [
+          "outfit", "set", "kit", "bundle", "complete", "whole", "everything i need",
+          "for a", "recommend me items for", "build me a", "put together", "create a",
+          "full", "entire", "all", "combination", "collection", "ensemble"
+        ];
+        
+        // Check for collection phrases
+        const hasCollectionPhrase = collectionPhrases.some(phrase => lowerIntent.includes(phrase));
+        
+        // Check for event/context soft terms without explicit product type
+        // If softTerms contain event/context words (wedding, dinner, interview, work, casual, formal, etc.)
+        // AND hardTerms is empty or very minimal, treat as collection intent
+        const eventContextTerms = [
+          "wedding", "dinner", "interview", "work", "casual", "formal", "party", "event",
+          "occasion", "meeting", "date", "business", "professional", "sport", "exercise",
+          "travel", "vacation", "holiday", "celebration", "gift", "present"
+        ];
+        const hasEventContext = softTerms.some(term => 
+          eventContextTerms.some(event => term.toLowerCase().includes(event))
+        );
+        const hasMinimalHardTerms = hardTerms.length <= 1; // Only generic terms like "blue" or "large"
+        
+        collectionIntent = hasCollectionPhrase || (hasEventContext && hasMinimalHardTerms);
+        
+        if (collectionIntent) {
+          const reason = hasCollectionPhrase 
+            ? `collection_phrase:${collectionPhrases.find(p => lowerIntent.includes(p))}`
+            : `event_context_without_product_type:${softTerms.filter(t => eventContextTerms.some(e => t.toLowerCase().includes(e))).join(",")}`;
+          console.log(`[CollectionIntent] enabled=true reason=${reason} isBundle=false`);
+        }
+      }
       
       // Log requested groups (normalized) for bundle mode
       if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
@@ -4499,8 +4593,85 @@ async function processSessionInBackground({
       // Sort by score descending
       rankedCandidates.sort((a, b) => b.score - a.score);
       
-      // Take top aiWindow candidates for AI
-      const topCandidates = rankedCandidates.slice(0, aiWindow).map(r => r.candidate);
+      // ============================================
+      // GROUP-BALANCED WINDOW SELECTION (for collection intent)
+      // ============================================
+      let topCandidates: EnrichedCandidate[];
+      
+      if (collectionIntent && !bundleIntent.isBundle) {
+        // Assign group keys to all ranked candidates
+        const candidatesWithGroups = rankedCandidates.map(r => ({
+          ...r,
+          groupKey: assignGroupKey(r.candidate)
+        }));
+        
+        // Count groups and their frequencies
+        const groupFreq = new Map<string, number>();
+        candidatesWithGroups.forEach(c => {
+          groupFreq.set(c.groupKey, (groupFreq.get(c.groupKey) || 0) + 1);
+        });
+        
+        // Filter out trivial groups (only 1-2 items) and sort by frequency
+        const nonTrivialGroups = Array.from(groupFreq.entries())
+          .filter(([_, count]) => count >= 3) // At least 3 items to be considered
+          .sort((a, b) => b[1] - a[1]); // Sort by frequency descending
+        
+        // Choose target number of groups: min(3, non-trivial groups) with fallback to 2
+        const targetGroups = Math.min(3, nonTrivialGroups.length || 2);
+        const chosenGroups = nonTrivialGroups.slice(0, targetGroups).map(([key]) => key);
+        
+        // If we don't have enough non-trivial groups, include all groups
+        if (chosenGroups.length < 2) {
+          const allGroups = Array.from(groupFreq.keys()).sort((a, b) => 
+            (groupFreq.get(b) || 0) - (groupFreq.get(a) || 0)
+          );
+          chosenGroups.push(...allGroups.slice(0, 2 - chosenGroups.length));
+        }
+        
+        console.log(`[CollectionIntent] ai_window_balanced groups=${chosenGroups.length} windowSize=${aiWindow} chosenGroups=[${chosenGroups.join(", ")}]`);
+        
+        // Pick top candidates per group using BM25 scores, then interleave
+        const perGroupCandidates = new Map<string, typeof candidatesWithGroups>();
+        chosenGroups.forEach(groupKey => {
+          const groupItems = candidatesWithGroups
+            .filter(c => c.groupKey === groupKey)
+            .slice(0, Math.ceil(aiWindow / chosenGroups.length) + 2); // Take a few extra per group for interleaving
+          perGroupCandidates.set(groupKey, groupItems);
+        });
+        
+        // Interleave candidates from each group
+        const interleaved: typeof candidatesWithGroups = [];
+        const maxPerGroup = Math.ceil(aiWindow / chosenGroups.length);
+        for (let i = 0; i < maxPerGroup && interleaved.length < aiWindow; i++) {
+          chosenGroups.forEach(groupKey => {
+            const groupItems = perGroupCandidates.get(groupKey) || [];
+            if (groupItems.length > 0 && interleaved.length < aiWindow) {
+              interleaved.push(groupItems.shift()!);
+            }
+          });
+        }
+        
+        // Fill remaining slots with highest-scored candidates from any group
+        if (interleaved.length < aiWindow) {
+          const remaining = candidatesWithGroups
+            .filter(c => !interleaved.some(il => il.candidate.handle === c.candidate.handle))
+            .slice(0, aiWindow - interleaved.length);
+          interleaved.push(...remaining);
+        }
+        
+        topCandidates = interleaved.slice(0, aiWindow).map(r => r.candidate);
+        
+        // Log per-group counts
+        const perGroupCounts: Record<string, number> = {};
+        topCandidates.forEach(c => {
+          const key = assignGroupKey(c);
+          perGroupCounts[key] = (perGroupCounts[key] || 0) + 1;
+        });
+        console.log(`[CollectionIntent] ai_window_balanced perGroupCounts=${JSON.stringify(perGroupCounts)}`);
+      } else {
+        // Standard behavior: take top aiWindow candidates
+        topCandidates = rankedCandidates.slice(0, aiWindow).map(r => r.candidate);
+      }
       
       console.log("[App Proxy] [Layer 2] Pre-ranked top", topCandidates.length, "candidates for AI");
       const bm25EndSingle = performance.now();
@@ -5367,6 +5538,103 @@ async function processSessionInBackground({
         if (validHandles.length < ai1.selectedHandles.length) {
           const filteredCount = ai1.selectedHandles.length - validHandles.length;
           console.log(`[App Proxy] Filtered ${filteredCount} out-of-stock/unavailable products from cache`);
+        }
+        
+        // ============================================
+        // COVERAGE GUARDRAIL (for collection intent)
+        // ============================================
+        if (collectionIntent && !bundleIntent.isBundle && finalHandles.length > 0) {
+          // Get the chosen groups from the balanced window selection (stored earlier)
+          // We need to reconstruct which groups were chosen - use the same logic as window selection
+          const candidatesWithGroups = rankedCandidates.map(r => ({
+            candidate: r.candidate,
+            score: r.score,
+            groupKey: assignGroupKey(r.candidate)
+          }));
+          
+          const groupFreq = new Map<string, number>();
+          candidatesWithGroups.forEach(c => {
+            groupFreq.set(c.groupKey, (groupFreq.get(c.groupKey) || 0) + 1);
+          });
+          
+          const nonTrivialGroups = Array.from(groupFreq.entries())
+            .filter(([_, count]) => count >= 3)
+            .sort((a, b) => b[1] - a[1]);
+          
+          const targetGroups = Math.min(3, nonTrivialGroups.length || 2);
+          const chosenGroups = nonTrivialGroups.slice(0, targetGroups).map(([key]) => key);
+          
+          if (chosenGroups.length < 2) {
+            const allGroups = Array.from(groupFreq.keys()).sort((a, b) => 
+              (groupFreq.get(b) || 0) - (groupFreq.get(a) || 0)
+            );
+            chosenGroups.push(...allGroups.slice(0, 2 - chosenGroups.length));
+          }
+          
+          // Check which groups are represented in finalHandles
+          const coverageBefore: Record<string, number> = {};
+          finalHandles.forEach(handle => {
+            const candidate = sortedCandidates.find(c => c.handle === handle);
+            if (candidate) {
+              const key = assignGroupKey(candidate);
+              coverageBefore[key] = (coverageBefore[key] || 0) + 1;
+            }
+          });
+          
+          // Find missing groups
+          const missingGroups = chosenGroups.filter(groupKey => !coverageBefore[groupKey] || coverageBefore[groupKey] === 0);
+          
+          if (missingGroups.length > 0) {
+            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} missingGroups=[${missingGroups.join(", ")}]`);
+            
+            // Refill missing groups by pulling best unused candidates from those groups
+            let swaps = 0;
+            const finalHandlesSet = new Set(finalHandles);
+            
+            for (const missingGroup of missingGroups) {
+              // Find best unused candidate from this group
+              const groupCandidates = candidatesWithGroups
+                .filter(c => c.groupKey === missingGroup && !finalHandlesSet.has(c.candidate.handle))
+                .sort((a, b) => b.score - a.score);
+              
+              if (groupCandidates.length > 0) {
+                // Find weakest item in finalHandles to swap out (lowest BM25 score)
+                const finalWithScores = finalHandles.map(handle => {
+                  const candidate = candidatesWithGroups.find(c => c.candidate.handle === handle);
+                  return { handle, score: candidate?.score || 0 };
+                }).sort((a, b) => a.score - b.score);
+                
+                if (finalWithScores.length > 0) {
+                  // Swap out weakest item
+                  const weakestHandle = finalWithScores[0].handle;
+                  const newHandle = groupCandidates[0].candidate.handle;
+                  
+                  const weakestIdx = finalHandles.indexOf(weakestHandle);
+                  if (weakestIdx >= 0) {
+                    finalHandles[weakestIdx] = newHandle;
+                    finalHandlesSet.delete(weakestHandle);
+                    finalHandlesSet.add(newHandle);
+                    swaps++;
+                    console.log(`[CollectionIntent] coverage_swap group=${missingGroup} removed=${weakestHandle} added=${newHandle}`);
+                  }
+                }
+              }
+            }
+            
+            // Log coverage after
+            const coverageAfter: Record<string, number> = {};
+            finalHandles.forEach(handle => {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const key = assignGroupKey(candidate);
+                coverageAfter[key] = (coverageAfter[key] || 0) + 1;
+              }
+            });
+            
+            console.log(`[CollectionIntent] coverage_after=${JSON.stringify(coverageAfter)} swaps=${swaps}`);
+          } else {
+            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} all_groups_represented=true`);
+          }
         }
       } else {
         // if AI fails completely, we will fallback at the end
@@ -6699,6 +6967,115 @@ async function processSessionInBackground({
             beforeCount,
             requestedCount: finalResultCount
           });
+          
+          // ============================================
+          // BUDGET REFILL (after budget constraints)
+          // ============================================
+          // If deliveredCount < requestedCount after budget filtering, refill from remaining candidates
+          if (filteredHandles.length < finalResultCount && filteredHandles.length < beforeCount) {
+            const handlesToRefill = finalResultCount - filteredHandles.length;
+            const usedHandlesSet = new Set(filteredHandles);
+            
+            // Get remaining candidates that satisfy constraints (price, availability, non-duplicate)
+            const remainingCandidates = allCandidatesEnriched
+              .filter(c => {
+                if (usedHandlesSet.has(c.handle)) return false; // Skip already used
+                if (!c.available && experience.inStockOnly) return false; // Skip unavailable if inStockOnly
+                const price = c.price ? parseFloat(String(c.price)) : 0;
+                if (Number.isFinite(price) && price > maxPriceCeiling) return false; // Skip over budget
+                return true;
+              });
+            
+            // If collectionIntent=true, preserve group coverage when refilling
+            if (collectionIntent && !bundleIntent.isBundle) {
+              // Get current group coverage
+              const currentGroups = new Set<string>();
+              filteredHandles.forEach(handle => {
+                const candidate = candidateMapForCheck.get(handle);
+                if (candidate) {
+                  currentGroups.add(assignGroupKey(candidate));
+                }
+              });
+              
+              // Get the chosen groups from earlier (same logic as window selection)
+              const candidatesWithGroups = remainingCandidates.map(c => ({
+                candidate: c,
+                groupKey: assignGroupKey(c)
+              }));
+              
+              const groupFreq = new Map<string, number>();
+              candidatesWithGroups.forEach(c => {
+                groupFreq.set(c.groupKey, (groupFreq.get(c.groupKey) || 0) + 1);
+              });
+              
+              const nonTrivialGroups = Array.from(groupFreq.entries())
+                .filter(([_, count]) => count >= 3)
+                .sort((a, b) => b[1] - a[1]);
+              
+              const targetGroups = Math.min(3, nonTrivialGroups.length || 2);
+              const chosenGroups = nonTrivialGroups.slice(0, targetGroups).map(([key]) => key);
+              
+              if (chosenGroups.length < 2) {
+                const allGroups = Array.from(groupFreq.keys()).sort((a, b) => 
+                  (groupFreq.get(b) || 0) - (groupFreq.get(a) || 0)
+                );
+                chosenGroups.push(...allGroups.slice(0, 2 - chosenGroups.length));
+              }
+              
+              // Prioritize refilling missing groups first, then fill remaining slots
+              const refillHandles: string[] = [];
+              const missingGroups = chosenGroups.filter(g => !currentGroups.has(g));
+              
+              // First, refill missing groups (one per missing group)
+              for (const missingGroup of missingGroups) {
+                if (refillHandles.length >= handlesToRefill) break;
+                
+                const groupCandidates = remainingCandidates
+                  .filter(c => assignGroupKey(c) === missingGroup && !usedHandlesSet.has(c.handle))
+                  .sort((a, b) => {
+                    // Sort by BM25-like score (use searchText match with hardTerms)
+                    const aScore = hardTerms.length > 0 ? (extractSearchText(a).toLowerCase().includes(hardTerms[0]?.toLowerCase() || "") ? 1 : 0) : 0;
+                    const bScore = hardTerms.length > 0 ? (extractSearchText(b).toLowerCase().includes(hardTerms[0]?.toLowerCase() || "") ? 1 : 0) : 0;
+                    return bScore - aScore;
+                  });
+                
+                if (groupCandidates.length > 0) {
+                  refillHandles.push(groupCandidates[0].handle);
+                  usedHandlesSet.add(groupCandidates[0].handle);
+                }
+              }
+              
+              // Then fill remaining slots from any group (prioritize by BM25-like score)
+              if (refillHandles.length < handlesToRefill) {
+                const remaining = remainingCandidates
+                  .filter(c => !usedHandlesSet.has(c.handle))
+                  .sort((a, b) => {
+                    const aScore = hardTerms.length > 0 ? (extractSearchText(a).toLowerCase().includes(hardTerms[0]?.toLowerCase() || "") ? 1 : 0) : 0;
+                    const bScore = hardTerms.length > 0 ? (extractSearchText(b).toLowerCase().includes(hardTerms[0]?.toLowerCase() || "") ? 1 : 0) : 0;
+                    return bScore - aScore;
+                  })
+                  .slice(0, handlesToRefill - refillHandles.length)
+                  .map(c => c.handle);
+                
+                refillHandles.push(...remaining);
+              }
+              
+              filteredHandles.push(...refillHandles);
+              console.log(`[Refill] after_budget delivered=${filteredHandles.length} requested=${finalResultCount} added=${refillHandles.length} reason=budget collectionIntent=true`);
+            } else {
+              // Standard refill: just take top remaining candidates
+              const refillHandles = remainingCandidates
+                .slice(0, handlesToRefill)
+                .map(c => c.handle);
+              
+              filteredHandles.push(...refillHandles);
+              console.log(`[Refill] after_budget delivered=${filteredHandles.length} requested=${finalResultCount} added=${refillHandles.length} reason=budget`);
+            }
+            
+            // Update handlesToSave and deliveredCount
+            handlesToSave = filteredHandles.slice(0, finalResultCount); // Cap at requested count
+            deliveredCount = handlesToSave.length;
+          }
         }
       }
       

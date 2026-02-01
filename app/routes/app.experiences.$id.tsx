@@ -203,8 +203,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   const isAllowed = await isResultCountAllowed(shop.id, resultCount);
   if (!isAllowed) {
     const plan = await getCurrentPlan(shop.id);
+    const { getMaxResultCount } = await import("~/models/billing.server");
+    const maxResultCount = await getMaxResultCount(shop.id);
     return { 
-      error: `Your ${plan.name} plan allows up to ${plan.resultCount} results. Please upgrade to use ${resultCount} results.` 
+      error: `Your ${plan.name} plan allows up to ${maxResultCount} results. Please upgrade to use ${resultCount} results.` 
     };
   }
 
