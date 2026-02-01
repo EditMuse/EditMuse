@@ -191,6 +191,37 @@ function cleanDescription(description: string | null | undefined): string {
 }
 
 /**
+ * Extracts a description snippet from product data (industry-agnostic)
+ * Sources from description, bodyHtml, or other available fields
+ * Strips HTML, normalizes whitespace, truncates to maxChars
+ */
+function extractDescriptionSnippet(product: ProductCandidate | any, maxChars: number = 400): string {
+  // Try multiple possible description fields (industry-agnostic)
+  let rawDescription: string | null | undefined = 
+    product.description || 
+    product.bodyHtml || 
+    product.body_html ||
+    product.longDescription ||
+    product.long_description ||
+    product.fullDescription ||
+    product.full_description ||
+    (product as any).desc1000 ||
+    null;
+  
+  if (!rawDescription) return "";
+  
+  // Clean HTML and normalize
+  let cleaned = cleanDescription(rawDescription);
+  
+  // Truncate to maxChars (hard cap)
+  if (cleaned.length > maxChars) {
+    cleaned = cleaned.substring(0, maxChars).trim();
+  }
+  
+  return cleaned;
+}
+
+/**
  * Enhances and normalizes user intent for better AI understanding
  * Expands abbreviations, normalizes language, adds context
  */
@@ -972,29 +1003,25 @@ export async function rankProductsWithAI(
     const candidatesToUse = currentCandidates;
     const maxCandidates = 200;
     if (compressed) {
-      // Compressed mode: include key structured fields + smart-truncated description with key info preserved
+      // Compressed mode: include key structured fields + description snippet
       return candidatesToUse.slice(0, maxCandidates).map((p, idx) => {
         const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
         const sizes = (p.sizes && p.sizes.length > 0) ? p.sizes.slice(0, 10).join(", ") : "none";
         const colors = (p.colors && p.colors.length > 0) ? p.colors.slice(0, 10).join(", ") : "none";
         const materials = (p.materials && p.materials.length > 0) ? p.materials.slice(0, 10).join(", ") : "none";
-        
-        // Use smart truncation for description to preserve key info (materials, features, sizing)
-        const fullDesc = (p as any).desc1000 
-          ? (p as any).desc1000
-          : (cleanDescription(p.description) || "");
-        const descText = smartTruncateDescription(fullDesc, 200);
+        const descriptionSnippet = extractDescriptionSnippet(p, 400);
         
         return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
    productType: ${p.productType || "unknown"}
+   vendor: ${p.vendor || "unknown"}
    tags: ${tags}
    sizes: ${sizes}
    colors: ${colors}
    materials: ${materials}
    available: ${p.available ? "yes" : "no"}
    price: ${p.price || "unknown"}
-   description: ${descText}`;
+   descriptionSnippet: ${descriptionSnippet || ""}`;
       }).join("\n\n");
     }
     
@@ -1023,11 +1050,7 @@ export async function rankProductsWithAI(
       optionValuesJson = JSON.stringify(cappedOptionValues);
     }
     
-      // Use desc1000 if available, use smart truncation to preserve key information
-      const fullDesc = (p as any).desc1000 
-        ? (p as any).desc1000
-        : (cleanDescription(p.description) || "No description available");
-      const descriptionText = smartTruncateDescription(fullDesc, descLimit);
+    const descriptionSnippet = extractDescriptionSnippet(p, 400);
     
     return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
@@ -1040,7 +1063,7 @@ export async function rankProductsWithAI(
    colors: ${colors}
    materials: ${materials}
    optionValues: ${optionValuesJson}
-   desc1000: ${descriptionText}`;
+   descriptionSnippet: ${descriptionSnippet || ""}`;
   }).join("\n\n");
   }
   
@@ -1134,9 +1157,9 @@ ${bundleItems.some(item => item.budgetMax) ? `- Total budget: $${bundleItems.red
 
 HARD CONSTRAINT RULES:
 ${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
-  a) At least one hardTerm match for its itemIndex in (title OR productType OR tags OR desc1000 snippet)
+  a) At least one hardTerm match for its itemIndex in (title OR productType OR tags OR descriptionSnippet)
   b) ALL hardFacets must match when provided (size, color, material)
-  c) Must NOT contain any avoidTerms in title/tags/desc1000 (unless avoidTerms is empty)
+  c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)
   d) Evidence must not be empty - must specify which hardTerms matched and which fields were used
   e) Handle MUST exist in that itemIndex's candidate group`}
 
@@ -1152,7 +1175,7 @@ OUTPUT SCHEMA (MUST be exactly this structure):
       "evidence": {
         "matchedHardTerms": ["suit"],
         "matchedFacets": { "size": [], "color": ["navy"], "material": [] },
-        "fieldsUsed": ["title", "productType", "desc1000"]
+        "fieldsUsed": ["title", "productType", "tags", "descriptionSnippet"]
       },
       "reason": "Navy suit matches category and color requirements."
     }
@@ -1165,7 +1188,7 @@ REQUIREMENTS:
 - All handles must exist in their itemIndex's candidate group (copy exactly as shown)
 - No duplicate handles
 - evidence.matchedHardTerms must not be empty when trustFallback=false
-- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
+- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "descriptionSnippet"]
 - CRITICAL: Each "reason" must be professional, human-like, and conversational:
   * Write as if you're a knowledgeable sales associate speaking directly to the customer
   * Use natural language that highlights benefits, style, occasion, or fit
@@ -1195,9 +1218,9 @@ REASONING QUALITY (CRITICAL):
 
 HARD CONSTRAINT RULES:
 ${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + overall relevance. Do NOT reject products for missing hardTerms since none were specified. Prioritize products that match soft terms, variant preferences, and overall relevance to the user's intent.` : trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
-  a) At least one hardTerm match in (title OR productType OR tags OR desc1000 snippet)
+  a) At least one hardTerm match in (title OR productType OR tags OR descriptionSnippet)
   b) ALL hardFacets must match when provided (size, color, material)
-  c) Must NOT contain any avoidTerms in title/tags/desc1000 (unless avoidTerms is empty)
+  c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)
   d) Evidence must not be empty - must specify which hardTerms matched and which fields were used`}
 
 CATEGORY DRIFT PREVENTION:
@@ -1210,10 +1233,9 @@ CATEGORY DRIFT PREVENTION:
 - Adjacent categories can only be "alternative" when trustFallback=true
 
 MATCHING REQUIREMENTS:
-1. Read the FULL desc1000 field for each candidate (up to 1000 characters)
-2. Check title, productType, tags, and desc1000 for hardTerm matches
-3. Verify hardFacet matches in sizes/colors/materials arrays
-4. Exclude products containing avoidTerms in title/tags/desc1000
+1. Check title, productType, tags, and descriptionSnippet for hardTerm matches
+2. Verify hardFacet matches in sizes/colors/materials arrays
+3. Exclude products containing avoidTerms in title/tags/descriptionSnippet
 5. Score 0-100 based on relevance (higher = better match)
 
 OUTPUT SCHEMA (MUST be exactly this structure):
@@ -1227,7 +1249,7 @@ OUTPUT SCHEMA (MUST be exactly this structure):
       "evidence": {
         "matchedHardTerms": ["suit"],
         "matchedFacets": { "color": ["navy", "blue"] },
-        "fieldsUsed": ["title", "productType", "desc1000"]
+        "fieldsUsed": ["title", "productType", "tags", "descriptionSnippet"]
       },
       "reason": "Navy blue suit matches category and color requirements."
     }
@@ -1239,7 +1261,7 @@ REQUIREMENTS:
 - All handles must exist in the candidate list (copy exactly as shown)
 - No duplicate handles
 - evidence.matchedHardTerms must not be empty when trustFallback=false
-- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "desc1000"]
+- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "descriptionSnippet"]
 - CRITICAL: Each "reason" must be professional, human-like, and conversational:
   * Write as if you're a knowledgeable sales associate speaking directly to the customer
   * Use natural language that highlights benefits, style, occasion, or fit
@@ -1292,11 +1314,7 @@ REQUIREMENTS:
         candidateGroupsText += `\n\n=== Item ${itemIdx} Candidates (${itemHardTerms.join(", ")}) ===\n`;
         candidateGroupsText += itemCandidates.slice(0, 30).map((p, idx) => {
           const tags = (p.tags && p.tags.length > 0) ? p.tags.slice(0, 20).join(", ") : "none";
-          // Use smart truncation for bundle descriptions (150 chars in compressed mode, 500 otherwise)
-          const fullDesc = (p as any).desc1000 
-            ? (p as any).desc1000
-            : (cleanDescription(p.description) || "No description available");
-          const descText = smartTruncateDescription(fullDesc, compressed ? 150 : 500);
+          const descriptionSnippet = extractDescriptionSnippet(p, 400);
           
           return `${idx + 1}. handle: ${p.handle}
    title: ${p.title}
@@ -1305,7 +1323,7 @@ REQUIREMENTS:
    tags: ${tags}
    available: ${p.available ? "yes" : "no"}
    price: ${p.price || "unknown"}
-   desc1000: ${descText}`;
+   descriptionSnippet: ${descriptionSnippet || ""}`;
         }).join("\n\n");
       }
       
@@ -1354,13 +1372,13 @@ Return ONLY the JSON object matching the bundle schema - no markdown, no prose o
     // Update matching requirements for compressed mode
     const matchingRequirements = compressed
       ? `1. For each candidate, check if it satisfies the hard constraints:
-   - At least one hardTerm in title/productType/tags/searchText
+   - At least one hardTerm in title/productType/tags/descriptionSnippet
    - All hardFacets match (if provided in candidate data)
-   - No avoidTerms in title/tags/searchText`
+   - No avoidTerms in title/tags/descriptionSnippet`
       : `1. For each candidate, check if it satisfies the hard constraints:
-   - At least one hardTerm in title/productType/tags/desc1000
+   - At least one hardTerm in title/productType/tags/descriptionSnippet
    - All hardFacets match (size/color/material in candidate arrays)
-   - No avoidTerms in title/tags/desc1000`;
+   - No avoidTerms in title/tags/descriptionSnippet`;
     
     return `Shopper Intent:
 ${intentForPrompt}
@@ -1633,7 +1651,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             },
           },
           temperature: 0,
-          max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
+          max_tokens: 1400, // Increased to 1400 for all ranking to reduce truncation risk
         };
         
         console.log("[AI Ranking] structured_outputs=true");
@@ -1644,7 +1662,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           model,
           messages,
           temperature: 0,
-          max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
+          max_tokens: 1400, // Increased to 1400 for all ranking to reduce truncation risk
           response_format: { type: "json_object" },
         };
         console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
@@ -1669,12 +1687,14 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           },
         } : { type: "json_object" as const },
         temperature: 0,
-        max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
+        max_tokens: 1400, // Increased to 1400 for all ranking to reduce truncation risk
       };
 
       let completion: OpenAI.Chat.Completions.ChatCompletion;
       try {
         // Use chat.completions.create with structured outputs
+        console.log("[AI Ranking] max_tokens=1400");
+        console.log("[AI Ranking] include_description_snippets=true snippet_max_chars=400");
         completion = await openai.chat.completions.create(sdkRequestParams);
       } catch (sdkError: any) {
         clearTimeout(timeoutId);
@@ -1748,42 +1768,15 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         structuredResult = messageWithParsed.parsed as StructuredRankingResult | StructuredBundleResult;
         console.log("[AI Ranking] structured_outputs=true");
         console.log("[AI Ranking] parsed_output=true");
-      } else if (message.content && typeof message.content === "string") {
-        // Fallback: if parsed is not available, parse content directly
-        // Strict schema guarantees valid JSON, so simple JSON.parse should work
-        try {
-          structuredResult = JSON.parse(message.content) as StructuredRankingResult | StructuredBundleResult;
-          console.log("[AI Ranking] structured_outputs=true");
-          console.log("[AI Ranking] parsed_output=false (using JSON.parse fallback)");
-        } catch (parseError) {
-          // Parse failed - this should be very rare with strict schema
-          // This indicates a serious issue with the API response
-          const contentPreview = message.content.substring(0, 300);
-          const redactedPreview = contentPreview
-            .replace(/"handle"\s*:\s*"[^"]+"/gi, '"handle":"[REDACTED]"')
-            .replace(/"title"\s*:\s*"[^"]+"/gi, '"title":"[REDACTED]"');
-          
-          console.warn("[AI Ranking] Failed to parse json_schema content (unexpected with strict schema):", parseError instanceof Error ? parseError.message : String(parseError));
-          console.log("[AI Ranking] Content preview (first 300 chars):", redactedPreview);
-          
-          lastError = parseError instanceof Error ? parseError : new Error(String(parseError));
-          lastParseFailReason = parseError instanceof Error ? parseError.message : String(parseError);
-          
-          // If first attempt and we have many candidates, retry with smaller set
-          if (attempt === 0 && currentCandidates.length > 20) {
-            continue; // Retry with smaller candidate set
-          }
-          
-          // If retry already attempted or too few candidates, proceed to fallback
-          continue; // This will eventually fallback after MAX_RETRIES
-        }
       } else {
-        // message.parsed and message.content are both missing - this should be very rare with strict schema
+        // Parsed output is missing - treat as failure and use existing fallback
+        // Do NOT attempt JSON.parse or JSON repair - if SDK didn't parse it, we shouldn't either
         const parseResponseId = bodyResponseId || responseId || null;
-        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=No parsed output or content in message", parseResponseId ? `response_id=${parseResponseId}` : "");
-        lastError = new Error("No parsed output or content in message");
-        lastParseFailReason = "No parsed output or content in message";
-        continue;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Missing parsed output from SDK (structured outputs)", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("Missing parsed output from SDK");
+        lastParseFailReason = "Missing parsed output from SDK";
+        // Do NOT retry for parsing failures - proceed directly to fallback
+        continue; // This will eventually fallback after MAX_RETRIES
       }
 
       // If we still don't have a structured result, this is an error
