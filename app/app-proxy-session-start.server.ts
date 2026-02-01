@@ -55,6 +55,87 @@ function pickString(obj: any, keys: string[]): string | null {
   return null;
 }
 
+/**
+ * Extract searchable text from product candidate (industry-agnostic)
+ * Combines common catalog fields: title, handle, productType, tags, vendor, description snippet
+ * Uses cleanDescription to strip HTML and normalize
+ */
+function extractSearchText(candidate: any): string {
+  const parts: string[] = [];
+  
+  // Title
+  if (candidate.title && typeof candidate.title === "string") {
+    parts.push(candidate.title);
+  }
+  
+  // Handle
+  if (candidate.handle && typeof candidate.handle === "string") {
+    parts.push(candidate.handle);
+  }
+  
+  // ProductType (handles both productType and product_type)
+  const productType = candidate.productType || candidate.product_type;
+  if (productType && typeof productType === "string") {
+    parts.push(productType);
+  }
+  
+  // Tags (array or string)
+  if (Array.isArray(candidate.tags)) {
+    parts.push(...candidate.tags.filter((t: any) => typeof t === "string"));
+  } else if (candidate.tags && typeof candidate.tags === "string") {
+    parts.push(candidate.tags);
+  }
+  
+  // Vendor (optional)
+  if (candidate.vendor && typeof candidate.vendor === "string") {
+    parts.push(candidate.vendor);
+  }
+  
+  // Description snippet (use existing cleanDescription if available, or extract snippet)
+  let descText = "";
+  if (candidate.description) {
+    descText = cleanDescription(candidate.description);
+  } else if (candidate.descPlain) {
+    descText = candidate.descPlain;
+  } else if (candidate.desc1000) {
+    descText = cleanDescription(candidate.desc1000);
+  }
+  
+  // Truncate description to 400 chars (snippet)
+  if (descText.length > 400) {
+    descText = descText.substring(0, 400);
+  }
+  if (descText) {
+    parts.push(descText);
+  }
+  
+  // Join and normalize whitespace
+  return parts.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * Get non-facet hard terms (excludes color/size/material from hardTerms)
+ * Industry-agnostic: only filters out terms that match facets exactly (case-insensitive)
+ */
+function getNonFacetHardTerms(
+  hardTerms: string[],
+  facets: { size: string | null; color: string | null; material: string | null }
+): string[] {
+  const facetValues: string[] = [];
+  if (facets.size) facetValues.push(facets.size.toLowerCase().trim());
+  if (facets.color) facetValues.push(facets.color.toLowerCase().trim());
+  if (facets.material) facetValues.push(facets.material.toLowerCase().trim());
+  
+  if (facetValues.length === 0) {
+    return hardTerms; // No facets to filter
+  }
+  
+  return hardTerms.filter(term => {
+    const termLower = term.toLowerCase().trim();
+    return !facetValues.some(facet => facet === termLower);
+  });
+}
+
 function parseConstraintsFromAnswers(answersJson: any): VariantConstraints {
   // We don't know your exact answers shape, so we search common keys.
   // Works for { size: "Small" } or { answers: { size: "Small" } } etc.
@@ -4122,12 +4203,32 @@ async function processSessionInBackground({
         console.log("[App Proxy] [Layer 2] No hard terms, using facet-gated candidates");
       }
       
-      // Filter avoid terms (penalty/filter)
+      // Type anchor gating: filter by non-facet hard terms to prevent facet-only matches
+      // This ensures products must contain at least one non-facet term (e.g., "shirt" not just "blue")
+      // Only apply to single-item flow (bundle items are handled separately)
+      const isBundleFlow = bundleIntent.isBundle && Array.isArray(bundleIntent.items) && bundleIntent.items.length >= 2;
+      const nonFacetTerms = getNonFacetHardTerms(hardTerms, hardFacets);
+      if (nonFacetTerms.length > 0 && !isBundleFlow) {
+        const beforeAnchor = gatedCandidates.length;
+        gatedCandidates = gatedCandidates.filter(c => {
+          const searchText = extractSearchText(c);
+          return nonFacetTerms.some(term => {
+            const termLower = term.toLowerCase().trim();
+            return searchText.includes(termLower);
+          });
+        });
+        const afterAnchor = gatedCandidates.length;
+        console.log(`[Gating] mode=${modeUsed} flow=single anchor_terms=[${nonFacetTerms.join(", ")}] before=${beforeAnchor} after=${afterAnchor}`);
+      } else if (nonFacetTerms.length === 0 && !isBundleFlow) {
+        console.log(`[Gating] mode=${modeUsed} flow=single anchor_terms_empty=true (skipping anchor filter)`);
+      }
+      
+      // Filter avoid terms (penalty/filter) - use extractSearchText for consistency
       if (avoidTerms.length > 0 && !trustFallback) {
         const beforeAvoid = gatedCandidates.length;
         gatedCandidates = gatedCandidates.filter(c => {
-          const searchLower = c.searchText.toLowerCase();
-          return !avoidTerms.some(avoid => searchLower.includes(avoid.toLowerCase()));
+          const searchText = extractSearchText(c);
+          return !avoidTerms.some(avoid => searchText.includes(avoid.toLowerCase()));
         });
         if (gatedCandidates.length < beforeAvoid) {
           console.log("[App Proxy] [Layer 2] Avoid terms filtered:", gatedCandidates.length, "candidates (from", beforeAvoid, ")");
@@ -4192,10 +4293,10 @@ async function processSessionInBackground({
           score += 1.5;
         }
         
-        // Penalty for avoid terms
+        // Penalty for avoid terms (use extractSearchText for consistency)
         if (avoidTerms.length > 0) {
-          const searchLower = c.searchText.toLowerCase();
-          const avoidMatches = avoidTerms.filter(avoid => searchLower.includes(avoid.toLowerCase())).length;
+          const searchText = extractSearchText(c);
+          const avoidMatches = avoidTerms.filter(avoid => searchText.includes(avoid.toLowerCase())).length;
           score -= avoidMatches * 1.0;
         }
         
@@ -4375,8 +4476,38 @@ async function processSessionInBackground({
             return true;
           });
           
+          // Type anchor gating for bundle item: filter by non-facet hard terms
+          // Combine item hardTerms with includeTerms to get all item terms
+          const itemTerms = [
+            ...itemHardTerms,
+            ...(itemConstraints?.includeTerms || [])
+          ];
+          // Normalize itemFacets to match expected type
+          const itemFacets = {
+            size: itemOptionConstraints?.size ?? hardFacets.size,
+            color: itemOptionConstraints?.color ?? hardFacets.color,
+            material: itemOptionConstraints?.material ?? hardFacets.material,
+          };
+          const nonFacetItemTerms = getNonFacetHardTerms(itemTerms, itemFacets);
+          
+          let itemGatedAfterAnchor = itemGatedUnfiltered;
+          if (nonFacetItemTerms.length > 0) {
+            const beforeAnchor = itemGatedUnfiltered.length;
+            itemGatedAfterAnchor = itemGatedUnfiltered.filter(c => {
+              const searchText = extractSearchText(c);
+              return nonFacetItemTerms.some(term => {
+                const termLower = term.toLowerCase().trim();
+                return searchText.includes(termLower);
+              });
+            });
+            const afterAnchor = itemGatedAfterAnchor.length;
+            console.log(`[Gating] mode=${modeUsed} flow=bundle bundle_item=${itemIdx} anchor_terms=[${nonFacetItemTerms.join(", ")}] before=${beforeAnchor} after=${afterAnchor}`);
+          } else {
+            console.log(`[Gating] mode=${modeUsed} flow=bundle bundle_item=${itemIdx} anchor_terms_empty=true (skipping anchor filter)`);
+          }
+          
           // Second pass: apply budget filter (item-specific price ceiling or allocated budget)
-          let itemGated: EnrichedCandidate[] = itemGatedUnfiltered;
+          let itemGated: EnrichedCandidate[] = itemGatedAfterAnchor;
           
           // Prefer item-specific price ceiling over allocated budget
           const itemPriceCeiling = itemConstraints?.priceCeiling;
@@ -4385,7 +4516,7 @@ async function processSessionInBackground({
             : (bundleItem.budgetMax !== undefined && bundleItem.budgetMax !== null ? bundleItem.budgetMax : null);
           
           if (budgetMax !== null) {
-            const itemGatedFiltered = itemGatedUnfiltered.filter(c => {
+            const itemGatedFiltered = itemGatedAfterAnchor.filter(c => {
               const price = c.price ? parseFloat(String(c.price)) : NaN;
               return !Number.isFinite(price) || price <= budgetMax;
             });
@@ -4394,7 +4525,7 @@ async function processSessionInBackground({
             if (itemGatedFiltered.length > 0) {
               itemGated = itemGatedFiltered;
             } else {
-              itemGated = itemGatedUnfiltered;
+              itemGated = itemGatedAfterAnchor;
               // Will set trustFallback later if needed
             }
           }
@@ -5288,6 +5419,20 @@ async function processSessionInBackground({
           const pool = new Set<string>();
           
           // Check all candidates to see if they match this item's hard terms
+          // Apply type anchor gating: must contain at least one non-facet term
+          const itemConstraints = bundleItem.constraints;
+          const itemOptionConstraints = itemConstraints?.optionConstraints;
+          const itemTerms = [
+            ...itemHardTerms,
+            ...(itemConstraints?.includeTerms || [])
+          ];
+          const itemFacets = {
+            size: itemOptionConstraints?.size ?? null,
+            color: itemOptionConstraints?.color ?? null,
+            material: itemOptionConstraints?.material ?? null,
+          };
+          const nonFacetItemTerms = getNonFacetHardTerms(itemTerms, itemFacets);
+          
           for (const c of allCandidatesEnriched) {
             const haystack = [
               c.title || "",
@@ -5298,9 +5443,19 @@ async function processSessionInBackground({
             ].join(" ");
             
             const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-            if (hasItemMatch) {
-              pool.add(c.handle);
+            if (!hasItemMatch) continue;
+            
+            // Type anchor: if non-facet terms exist, product must contain at least one
+            if (nonFacetItemTerms.length > 0) {
+              const searchText = extractSearchText(c);
+              const hasAnchorMatch = nonFacetItemTerms.some(term => {
+                const termLower = term.toLowerCase().trim();
+                return searchText.includes(termLower);
+              });
+              if (!hasAnchorMatch) continue;
             }
+            
+            pool.add(c.handle);
           }
           
           itemPools.set(itemIdx, pool);

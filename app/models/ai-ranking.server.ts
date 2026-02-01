@@ -1170,6 +1170,12 @@ OUTPUT SCHEMA (MUST be exactly this structure - MINIMAL):
   ]
 }
 
+CRITICAL HANDLE REQUIREMENTS:
+- You MUST select handles ONLY from allowedHandles (see below)
+- Handles must match EXACTLY (case-sensitive, identical string)
+- Do NOT invent, modify, prefix, or alter handles
+- If the best match handle is not obvious, choose the closest handle from allowedHandles
+
 REQUIREMENTS:
 - "selected_by_item" array MUST contain at least 1 selection per itemIndex (exactly 1 primary per item)
 - After primaries, add alternates to reach ${resultCount} total, distributing evenly across items
@@ -1305,6 +1311,9 @@ ${keywordText || ""}
 Candidates Grouped by Item:
 ${candidateGroupsText}
 
+ALLOWED HANDLES (You MUST use ONLY these exact handles):
+${Array.from(candidatesByItem.values()).flat().map(c => c.handle).filter((h, i, arr) => arr.indexOf(h) === i).slice(0, 100).join(", ")}${Array.from(candidatesByItem.values()).flat().map(c => c.handle).filter((h, i, arr) => arr.indexOf(h) === i).length > 100 ? ` (and ${Array.from(candidatesByItem.values()).flat().map(c => c.handle).filter((h, i, arr) => arr.indexOf(h) === i).length - 100} more)` : ""}
+
 TASK:
 1. For each bundle item, choose exactly 1 primary selection from that item's candidate group
 2. After selecting 1 primary per item, add alternates to fill ${resultCount} total selections
@@ -1313,11 +1322,11 @@ TASK:
 
 For each selected item in selected_by_item:
    - itemIndex: Must match the candidate's group (0, 1, 2, ...)
-   - Exact handle (copy from that itemIndex's candidate list)
-   - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
+   - Exact handle (MUST match EXACTLY from allowedHandles above - case-sensitive, identical string)
+   - Label: "exact" if all constraints satisfied, "good" or "fallback" if trustFallback=true
    - Score: 0-100 based on match quality
-   - Evidence: Which hardTerms matched, which facets matched, which fields were used
-   - Reason: Write a natural, professional, conversational 1-sentence explanation as if speaking directly to the customer. Be specific about benefits, style, occasion, or use case. Avoid technical jargon or robotic phrases.
+
+CRITICAL: Handles must match EXACTLY from allowedHandles. Do NOT invent, modify, prefix, or alter handles.
 
 Return ONLY the JSON object matching the bundle schema - no markdown, no prose outside JSON.`;
     }
@@ -1355,6 +1364,9 @@ ${keywordText || ""}
 Candidate Products (${candidates.length} total):
 ${productListForPrompt}
 
+ALLOWED HANDLES (You MUST use ONLY these exact handles):
+${currentCandidates.map(c => c.handle).slice(0, 100).join(", ")}${currentCandidates.length > 100 ? ` (and ${currentCandidates.length - 100} more)` : ""}
+
 TASK:
 ${matchingRequirements}
 
@@ -1363,11 +1375,11 @@ ${matchingRequirements}
    ${trustFallback ? "- If fewer than ${resultCount} exact matches, fill with 'alternative' matches closest to intent" : "- If fewer than ${resultCount} exact matches exist, return only the exact matches you find"}
 
 3. For each selected item, provide:
-   - Exact handle (copy from candidate list)
-   - Label: "exact" if all constraints satisfied, "alternative" only if trustFallback=true
+   - Exact handle (MUST match EXACTLY from allowedHandles above - case-sensitive, identical string)
+   - Label: "exact" if all constraints satisfied, "good" or "fallback" if trustFallback=true
    - Score: 0-100 based on match quality
-   - Evidence: Which hardTerms matched, which facets matched, which fields were used
-   - Reason: Write a natural, professional, conversational 1-sentence explanation as if you're a knowledgeable sales associate speaking directly to the customer. Be specific about benefits, style, occasion, or use case. Example: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look" (NOT "Matches suit category and navy color")
+
+CRITICAL: Handles must match EXACTLY from allowedHandles. Do NOT invent, modify, prefix, or alter handles.
 
 Return ONLY the JSON object matching the schema - no markdown, no prose outside JSON.`;
   }
@@ -1758,6 +1770,33 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       if (isBundle && "selected_by_item" in structuredResult) {
         const bundleResult = structuredResult as StructuredBundleResult;
         
+        // Defensive check: validate all handles are in allowedHandles before processing
+        const allowedHandles = new Set(currentCandidates.map(c => c.handle));
+        const bundleReturnedHandles = bundleResult.selected_by_item.map(item => item.handle.trim());
+        const invalidHandles = bundleReturnedHandles.filter(handle => !allowedHandles.has(handle));
+        
+        if (invalidHandles.length > 0) {
+          for (const invalidHandle of invalidHandles) {
+            console.log(`[AI Ranking] invalid_handle_returned=${invalidHandle} (not in allowedHandles)`);
+          }
+          console.log(`[AI Ranking] allowed_handles_count=${allowedHandles.size}`);
+          const firstFiveHandles = Array.from(allowedHandles).slice(0, 5);
+          console.log(`[AI Ranking] allowed_handles_preview=[${firstFiveHandles.join(", ")}]`);
+          lastError = new Error(`Invalid handles returned: ${invalidHandles.join(", ")}`);
+          lastParseFailReason = `Invalid handles returned: ${invalidHandles.join(", ")}`;
+          continue; // This will eventually fallback after MAX_RETRIES
+        }
+        
+        // Log allowed handles count
+        console.log(`[AI Ranking] allowed_handles_count=${allowedHandles.size}`);
+        if (allowedHandles.size <= 20) {
+          const allHandles = Array.from(allowedHandles);
+          console.log(`[AI Ranking] allowed_handles=[${allHandles.join(", ")}]`);
+        } else {
+          const firstFiveHandles = Array.from(allowedHandles).slice(0, 5);
+          console.log(`[AI Ranking] allowed_handles_preview=[${firstFiveHandles.join(", ")}...] (${allowedHandles.size} total)`);
+        }
+        
         // Build item pools for validation
         const candidatesByItem = new Map<number, Set<string>>();
         for (const c of candidates) {
@@ -1927,6 +1966,41 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       console.log("[AI Ranking] Successfully parsed and validated JSON response");
       
       // Single-item mode: runtime validation of selected items
+      // Defensive check: validate all handles are in allowedHandles before processing
+      const allowedHandles = new Set(currentCandidates.map(c => c.handle));
+      const allReturnedHandles: string[] = [];
+      
+      if (!isBundle || !("selected_by_item" in structuredResult)) {
+        const singleItemResult = structuredResult as StructuredRankingResult;
+        allReturnedHandles.push(...singleItemResult.selected.map(item => item.handle.trim()));
+      } else {
+        const bundleResult = structuredResult as StructuredBundleResult;
+        allReturnedHandles.push(...bundleResult.selected_by_item.map(item => item.handle.trim()));
+      }
+      
+      const invalidHandles = allReturnedHandles.filter(handle => !allowedHandles.has(handle));
+      if (invalidHandles.length > 0) {
+        for (const invalidHandle of invalidHandles) {
+          console.log(`[AI Ranking] invalid_handle_returned=${invalidHandle} (not in allowedHandles)`);
+        }
+        console.log(`[AI Ranking] allowed_handles_count=${allowedHandles.size}`);
+        const firstFiveHandles = Array.from(allowedHandles).slice(0, 5);
+        console.log(`[AI Ranking] allowed_handles_preview=[${firstFiveHandles.join(", ")}]`);
+        lastError = new Error(`Invalid handles returned: ${invalidHandles.join(", ")}`);
+        lastParseFailReason = `Invalid handles returned: ${invalidHandles.join(", ")}`;
+        continue; // This will eventually fallback after MAX_RETRIES
+      }
+      
+      // Log allowed handles count
+      console.log(`[AI Ranking] allowed_handles_count=${allowedHandles.size}`);
+      if (allowedHandles.size <= 20) {
+        const allHandles = Array.from(allowedHandles);
+        console.log(`[AI Ranking] allowed_handles=[${allHandles.join(", ")}]`);
+      } else {
+        const firstFiveHandles = Array.from(allowedHandles).slice(0, 5);
+        console.log(`[AI Ranking] allowed_handles_preview=[${firstFiveHandles.join(", ")}...] (${allowedHandles.size} total)`);
+      }
+      
       if (!isBundle || !("selected_by_item" in structuredResult)) {
         // Schema validation already passed, now do runtime validation of selected items
         const singleItemResult = structuredResult as StructuredRankingResult;
