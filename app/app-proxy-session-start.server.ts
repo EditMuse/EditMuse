@@ -6896,26 +6896,31 @@ async function processSessionInBackground({
         total: intentParseCallCount + aiCallCount
       });
     }
-    } catch (error: any) {
-      console.error("[App Proxy] Background processing failed:", error);
-      // Mark session as FAILED
-      await prisma.conciergeSession.update({
-        where: { publicToken: sessionToken },
-        data: { 
-          status: ConciergeSessionStatus.FAILED,
-        },
-      }).catch(() => {});
-      
-      // Save error result
-      await saveConciergeResult({
-        sessionToken,
-        productHandles: [],
-        productIds: null,
-        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
-      }).catch(() => {});
-      
-      // Re-throw to be caught by outer handler in setImmediate
-      throw error;
-    }
+  } catch (innerError: any) {
+    // If error occurs in product fetching/processing, re-throw to be caught by outer try-catch
+    console.error("[App Proxy] Error in product fetching/processing:", innerError);
+    throw innerError;
+  }
+  } catch (error: any) {
+    console.error("[App Proxy] Background processing failed:", error);
+    // Mark session as FAILED
+    await prisma.conciergeSession.update({
+      where: { publicToken: sessionToken },
+      data: { 
+        status: ConciergeSessionStatus.FAILED,
+      },
+    }).catch(() => {});
+    
+    // Save error result
+    await saveConciergeResult({
+      sessionToken,
+      productHandles: [],
+      productIds: null,
+      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+    }).catch(() => {});
+    
+    // Re-throw to be caught by outer handler in setImmediate
+    throw error;
+  }
 }
 
