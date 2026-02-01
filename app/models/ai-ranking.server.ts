@@ -89,7 +89,6 @@ interface StructuredBundleResult {
 }
 
 const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? "20000"); // Configurable timeout, default 20 seconds
 const TIMEOUT_MS_BUNDLE = Number(process.env.OPENAI_TIMEOUT_MS_BUNDLE ?? "12000"); // Stricter timeout for bundle mode, default 12 seconds
@@ -1483,8 +1482,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // Use compressed prompt if: retry with parse failure OR adaptive compression triggered on first attempt
       const useCompressedPrompt = (isRetry && lastParseFailReason !== undefined) || (attempt === 0 && shouldUseCompressedFirst);
       
-      // On retry after missing parsed output, use smaller candidate set (reduce by 30-50%)
-      if (isRetry && lastParseFailReason === "Missing parsed output in SDK response" && currentCandidates.length === candidates.length) {
+      // On retry after parse failure, use smaller candidate set (reduce by 30-50%)
+      if (isRetry && lastParseFailReason && lastParseFailReason.includes("parse") && currentCandidates.length === candidates.length) {
         // Reduce by 30-50% (using 30% reduction as existing logic)
         const reductionFactor = 0.7; // 30% reduction (keeps 70%)
         currentCandidates = candidates.slice(0, Math.floor(candidates.length * reductionFactor));
@@ -1517,13 +1516,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
 
       // Determine API endpoint based on structured outputs support
       let apiUsed: "chat";
-      let apiUrl: string;
-      
-      // Use Chat Completions API with structured outputs (json_schema) when supported
+      // Use ONLY Chat Completions API with structured outputs (json_schema)
       // This guarantees valid JSON output that matches the schema exactly
       // Note: json_schema is supported through chat.completions, not a separate responses endpoint
       apiUsed = "chat";
-      apiUrl = OPENAI_CHAT_COMPLETIONS_URL;
       
       // Build messages array: use conversation history if available, otherwise use single userIntent
       let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
@@ -1611,10 +1607,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
       }
 
-      // Use appropriate endpoint based on API type
+      // Use Chat Completions API only (no /v1/responses endpoint)
       let response: Response;
       try {
-        response = await fetch(apiUrl, {
+        response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${apiKey}`,
@@ -1709,94 +1705,76 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       // Extract response ID from response body if present (OpenAI sometimes includes this)
       bodyResponseId = data.id || data.request_id || null;
       
-      // Read parsed output from Chat Completions API
-      // For json_schema mode, the response is in choices[0].message.content as valid JSON
-      // For json_object mode, same structure
+      // Parse structured output from Chat Completions API
+      // For json_schema mode with strict:true, the response is in choices[0].message.content as a JSON string
+      // We parse it directly - do NOT reference message.parsed or data.output_parsed (SDK helpers, not in raw fetch)
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      // Chat.completions API: check choices[0].message structure
+      // Chat Completions API: extract message from choices[0].message
       const message = data.choices?.[0]?.message;
-      if (message) {
-        // Check for refusal
-        if (message.refusal) {
-          const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
-          
-          // Structured error log for model refusal
-          const logData: any = {
-            attempt: attempt + 1,
-            status: responseStatus || "unknown",
-            fail_type: "parse",
-            fail_reason: "Model refusal",
-          };
-          if (refusalResponseId) logData.response_id = refusalResponseId;
-          console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, refusalResponseId ? `response_id=${refusalResponseId}` : "");
-          
-          // Also log refusal details (safe, no PII)
-          console.log("[AI Ranking] Model refused to generate structured output");
-          
-          lastError = new Error("Model refused to generate structured output");
-          lastParseFailReason = "Model refusal";
-          continue; // Try again if retries remaining
-        }
-
-        // Check for parsed field (may be present in some SDK versions)
-        if (message.parsed && typeof message.parsed === "object") {
-          structuredResult = message.parsed as StructuredRankingResult | StructuredBundleResult;
-        }
-        // Check if content is already an object (parsed) rather than a string
-        else if (message.content && typeof message.content === "object" && !Array.isArray(message.content)) {
-          structuredResult = message.content as StructuredRankingResult | StructuredBundleResult;
-        }
-        // For json_schema mode, content is a JSON string that needs parsing
-        else if (message.content && typeof message.content === "string" && supportsJsonSchema) {
-          try {
-            structuredResult = parseStructuredRanking(message.content);
-          } catch (parseError) {
-            // Parse error will be handled below
-            console.warn("[AI Ranking] Failed to parse json_schema content:", parseError instanceof Error ? parseError.message : String(parseError));
-          }
-        }
+      if (!message) {
+        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=No message in choices", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("No message in choices array");
+        lastParseFailReason = "No message in choices array";
+        continue;
+      }
+      
+      // Check for refusal
+      if (message.refusal) {
+        const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Model refusal", refusalResponseId ? `response_id=${refusalResponseId}` : "");
+        console.log("[AI Ranking] Model refused to generate structured output");
+        lastError = new Error("Model refused to generate structured output");
+        lastParseFailReason = "Model refusal";
+        continue; // Try again if retries remaining
       }
 
-      // If parsed output is missing from SDK's documented location, treat as hard failure
-      // Retry once with smaller candidate set if this is first attempt
-      if (!structuredResult) {
-        // Log response shape for debugging (no PII)
-        const responseKeys = Object.keys(data);
-        
-        // Extract response/request ID from response if present
-        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
-        
-        // Structured error log for parse failure
-        const logData: any = {
-          attempt: attempt + 1,
-          status: responseStatus || "unknown",
-          fail_type: "parse",
-          fail_reason: "Missing parsed output in SDK response",
-        };
-        if (parseResponseId) logData.response_id = parseResponseId;
-        console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, parseResponseId ? `response_id=${parseResponseId}` : "");
-        
-        // Also log detailed debug info (separate log line)
-        console.log("[AI Ranking] structured_outputs missing parsed output", {
-          model,
-          apiUsed,
-          keys: responseKeys.join(","),
-          attempt
-        });
-        
-        lastError = new Error("Structured outputs missing parsed output from SDK");
-        lastParseFailReason = "Missing parsed output in SDK response";
-        
-        // If first attempt and we have many candidates, retry with smaller set
-        // (currentCandidates will be updated at start of next iteration)
-        if (attempt === 0 && currentCandidates.length > 20) {
-          // Continue to retry - currentCandidates will be reduced in next iteration
-          continue;
+      // Parse from message.content (always a string with json_schema strict mode)
+      if (message.content && typeof message.content === "string") {
+        try {
+          structuredResult = parseStructuredRanking(message.content);
+          // Success - log with proper format
+          console.log("[AI Ranking] structured_outputs=true api=chat_completions parsed_from=message.content");
+        } catch (parseError) {
+          // Parse failed - log first 300 chars of content (redact product data if needed)
+          const contentPreview = message.content.substring(0, 300);
+          // Redact potential product data (handles, titles) - simple heuristic
+          const redactedPreview = contentPreview
+            .replace(/"handle"\s*:\s*"[^"]+"/gi, '"handle":"[REDACTED]"')
+            .replace(/"title"\s*:\s*"[^"]+"/gi, '"title":"[REDACTED]"');
+          
+          console.warn("[AI Ranking] Failed to parse json_schema content:", parseError instanceof Error ? parseError.message : String(parseError));
+          console.log("[AI Ranking] Content preview (first 300 chars):", redactedPreview);
+          
+          lastError = parseError instanceof Error ? parseError : new Error(String(parseError));
+          lastParseFailReason = parseError instanceof Error ? parseError.message : String(parseError);
+          
+          // If first attempt and we have many candidates, retry with smaller set
+          if (attempt === 0 && currentCandidates.length > 20) {
+            continue; // Retry with smaller candidate set
+          }
+          
+          // If retry already attempted or too few candidates, proceed to fallback
+          continue; // This will eventually fallback after MAX_RETRIES
         }
-        
-        // If retry already attempted or too few candidates, proceed to fallback
-        continue; // This will eventually fallback after MAX_RETRIES
+      } else {
+        // message.content is missing or not a string
+        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        const contentType = message.content ? typeof message.content : "missing";
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=message.content is not a string (type: " + contentType + ")", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error(`message.content is not a string (type: ${contentType})`);
+        lastParseFailReason = `message.content is not a string (type: ${contentType})`;
+        continue;
+      }
+
+      // If we still don't have a structured result, this is an error
+      if (!structuredResult) {
+        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Failed to parse structured output", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("Failed to parse structured output");
+        lastParseFailReason = "Failed to parse structured output";
+        continue;
       }
 
       console.log("[AI Ranking] Successfully parsed structured output (strict mode)");
