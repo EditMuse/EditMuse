@@ -114,6 +114,187 @@ function extractSearchText(candidate: any): string {
 }
 
 /**
+ * Check if product matches hard facet constraints (size/color/material)
+ * Industry-agnostic: checks variant availability and option values
+ */
+function productMatchesHardFacets(
+  product: any,
+  hardFacets: { size: string | null; color: string | null; material: string | null },
+  knownOptionNames: string[]
+): boolean {
+  // Check variant availability (must have at least one available variant)
+  const hasAvailableVariant = product.available === true || 
+    (product.variants && Array.isArray(product.variants) && product.variants.some((v: any) => 
+      v.available === true || v.availableForSale === true
+    ));
+  
+  if (!hasAvailableVariant) {
+    return false;
+  }
+  
+  // Normalize option names (case-insensitive)
+  const sizeKey = knownOptionNames.find(n => n.toLowerCase() === "size") ?? null;
+  const colorKey = knownOptionNames.find(n => ["color","colour","shade"].includes(n.toLowerCase())) ?? null;
+  const materialKey = knownOptionNames.find(n => ["material","fabric"].includes(n.toLowerCase())) ?? null;
+  
+  // Helper to normalize option values for comparison
+  const normalizeValue = (val: string): string => {
+    return val.toLowerCase().trim();
+  };
+  
+  // Helper to check if a value matches (case-insensitive, with common aliases)
+  const valueMatches = (productValue: string | null | undefined, constraintValue: string | null): boolean => {
+    if (!constraintValue) return true; // No constraint means match
+    if (!productValue) return false; // Constraint exists but product doesn't have it
+    
+    const normalizedProduct = normalizeValue(productValue);
+    const normalizedConstraint = normalizeValue(constraintValue);
+    
+    // Exact match
+    if (normalizedProduct === normalizedConstraint) return true;
+    
+    // Common size aliases (industry-agnostic: works for clothing, but also other products with size)
+    const sizeAliases: Record<string, string[]> = {
+      "s": ["small", "s"],
+      "m": ["medium", "m"],
+      "l": ["large", "l"],
+      "xl": ["extra large", "x-large", "xl"],
+      "xxl": ["extra extra large", "xx-large", "xxl"],
+    };
+    
+    // Check aliases for size
+    if (sizeKey && normalizedConstraint.length <= 3) {
+      const aliases = sizeAliases[normalizedConstraint] || [];
+      if (aliases.some(alias => normalizeValue(alias) === normalizedProduct)) return true;
+    }
+    
+    // Partial match (e.g., "Medium" contains "M")
+    if (normalizedProduct.includes(normalizedConstraint) || normalizedConstraint.includes(normalizedProduct)) {
+      return true;
+    }
+    
+    return false;
+  };
+  
+  // Check size constraint
+  if (hardFacets.size && sizeKey) {
+    const productSizes = product.sizes || [];
+    const hasSizeMatch = productSizes.some((s: string) => valueMatches(s, hardFacets.size));
+    if (!hasSizeMatch) return false;
+  }
+  
+  // Check color constraint
+  if (hardFacets.color && colorKey) {
+    const productColors = product.colors || [];
+    const hasColorMatch = productColors.some((c: string) => valueMatches(c, hardFacets.color));
+    if (!hasColorMatch) return false;
+  }
+  
+  // Check material constraint
+  if (hardFacets.material && materialKey) {
+    const productMaterials = product.materials || [];
+    const hasMaterialMatch = productMaterials.some((m: string) => valueMatches(m, hardFacets.material));
+    if (!hasMaterialMatch) return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Token-based slot scoring: score how well a product matches a slot descriptor
+ * Industry-agnostic: uses token overlap across title, handle, productType, tags, vendor, description
+ */
+function scoreProductForSlot(
+  product: any,
+  slotDescriptor: string,
+  stopwords: Set<string> = new Set(["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"])
+): number {
+  // Normalize and tokenize slot descriptor
+  const normalizeToken = (text: string): string => {
+    return text.toLowerCase()
+      .replace(/[^\w\s]/g, " ") // Replace punctuation with space
+      .replace(/\s+/g, " ") // Normalize whitespace
+      .trim();
+  };
+  
+  const tokenize = (text: string): string[] => {
+    return normalizeToken(text)
+      .split(/\s+/)
+      .filter(token => token.length > 0 && !stopwords.has(token));
+  };
+  
+  const slotTokens = new Set(tokenize(slotDescriptor));
+  if (slotTokens.size === 0) return 0;
+  
+  // Build product text from multiple fields
+  const productText = extractSearchText(product);
+  const productTokens = new Set(tokenize(productText));
+  
+  // Calculate token overlap score
+  let matchCount = 0;
+  for (const token of slotTokens) {
+    if (productTokens.has(token)) {
+      matchCount++;
+    }
+  }
+  
+  // Score = percentage of slot tokens found in product
+  const score = matchCount / slotTokens.size;
+  
+  // Bonus for exact phrase match (if slot descriptor appears as phrase in product text)
+  const normalizedSlot = normalizeToken(slotDescriptor);
+  const normalizedProduct = normalizeToken(productText);
+  if (normalizedProduct.includes(normalizedSlot)) {
+    return Math.min(1.0, score + 0.3); // Cap at 1.0
+  }
+  
+  return score;
+}
+
+/**
+ * Assign products to slots using token-based scoring
+ * Returns Map<slotIndex, Array<{product, score}>>
+ */
+function assignProductsToSlots(
+  products: any[],
+  slotDescriptors: string[],
+  minScoreThreshold: number = 0.1
+): Map<number, Array<{ product: any; score: number }>> {
+  const slotAssignments = new Map<number, Array<{ product: any; score: number }>>();
+  
+  // Initialize slots
+  for (let i = 0; i < slotDescriptors.length; i++) {
+    slotAssignments.set(i, []);
+  }
+  
+  // Score each product against each slot
+  for (const product of products) {
+    let bestSlot = -1;
+    let bestScore = 0;
+    
+    for (let slotIdx = 0; slotIdx < slotDescriptors.length; slotIdx++) {
+      const score = scoreProductForSlot(product, slotDescriptors[slotIdx]);
+      if (score > bestScore && score >= minScoreThreshold) {
+        bestScore = score;
+        bestSlot = slotIdx;
+      }
+    }
+    
+    // Assign to best slot if score meets threshold
+    if (bestSlot >= 0) {
+      slotAssignments.get(bestSlot)!.push({ product, score: bestScore });
+    }
+  }
+  
+  // Sort each slot by score (descending)
+  for (const [slotIdx, assignments] of slotAssignments.entries()) {
+    assignments.sort((a, b) => b.score - a.score);
+  }
+  
+  return slotAssignments;
+}
+
+/**
  * Get non-facet hard terms (excludes color/size/material from hardTerms)
  * Industry-agnostic: only filters out terms that match facets exactly (case-insensitive)
  */
@@ -3984,7 +4165,12 @@ async function processSessionInBackground({
       console.log("[App Proxy] [Layer 2] Applying hard gating");
       
       // Gate 1: Hard facets (size/color/material must match) - with OR allow-list support
+      const beforeFacetGating = allCandidatesEnriched.length;
       let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+        // Use productMatchesHardFacets helper for consistent facet checking
+        const matchesFacets = productMatchesHardFacets(c, hardFacets, knownOptionNames);
+        if (!matchesFacets) return false;
+        
         const allowValues = variantConstraints2.allowValues;
         
         // Size constraint: check allowValues first (OR logic - match any), then single value
@@ -4047,7 +4233,13 @@ async function processSessionInBackground({
         return true;
       });
       
-      console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+      const afterFacetGating = gatedCandidates.length;
+      const facetGatingReduction = beforeFacetGating - afterFacetGating;
+      if (hardFacets.size || hardFacets.color || hardFacets.material) {
+        console.log(`[App Proxy] [Layer 2] After facet gating: ${afterFacetGating} candidates (reduced by ${facetGatingReduction} from ${beforeFacetGating})`);
+      } else {
+        console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+      }
       
       // Denylist for common false positives (word that contains the term but isn't the term)
       const DENYLIST: Record<string, string[]> = {
@@ -4446,31 +4638,24 @@ async function processSessionInBackground({
               }
             }
             
-            // Apply hard term matching for this item
-            const haystack = [
-              c.title || "",
-              c.productType || "",
-              (c.tags || []).join(" "),
-              c.vendor || "",
-              c.searchText || "",
-            ].join(" ");
+            // Apply token-based slot matching for this item (industry-agnostic)
+            // Build slot descriptor from item hardTerms
+            const slotDescriptor = itemHardTerms.join(" ");
+            const slotScore = scoreProductForSlot(c, slotDescriptor);
+            // Require minimum score threshold (0.1 = at least 10% token overlap)
+            if (slotScore < 0.1) return false;
             
-            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-            if (!hasItemMatch) return false;
-            
-            // Apply item-specific include/exclude terms if present
+            // Apply item-specific include/exclude terms if present (use token-based scoring)
             if (itemConstraints?.includeTerms && itemConstraints.includeTerms.length > 0) {
-              const hasIncludeTerm = itemConstraints.includeTerms.some(term => 
-                matchesHardTermWithBoundary(haystack, term)
-              );
-              if (!hasIncludeTerm) return false;
+              const includeDescriptor = itemConstraints.includeTerms.join(" ");
+              const includeScore = scoreProductForSlot(c, includeDescriptor);
+              if (includeScore < 0.1) return false;
             }
             
             if (itemConstraints?.excludeTerms && itemConstraints.excludeTerms.length > 0) {
-              const hasExcludeTerm = itemConstraints.excludeTerms.some(term => 
-                matchesHardTermWithBoundary(haystack, term)
-              );
-              if (hasExcludeTerm) return false; // Exclude if matches exclude term
+              const excludeDescriptor = itemConstraints.excludeTerms.join(" ");
+              const excludeScore = scoreProductForSlot(c, excludeDescriptor);
+              if (excludeScore >= 0.1) return false; // Exclude if matches exclude term
             }
             
             return true;
@@ -5401,6 +5586,11 @@ async function processSessionInBackground({
         }
         
         return validHandles;
+      }
+      
+      // Log before validation (especially important for bundles)
+      if (isBundleMode) {
+        console.log(`[Bundle] handles_before_validation count=${finalHandlesGuaranteed.length} preview=[${finalHandlesGuaranteed.slice(0, 5).join(", ")}${finalHandlesGuaranteed.length > 5 ? "..." : ""}]`);
       }
       
       // Validate final handles (use enriched candidates)

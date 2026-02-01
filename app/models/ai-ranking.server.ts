@@ -1146,9 +1146,11 @@ BUNDLE REQUIREMENTS:
 - Each selection in selected_by_item MUST include itemIndex matching the candidate's group
 
 BUDGET CONSTRAINT:
-${bundleItems.some(item => item.budgetMax) ? `- Total budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)}
-- Prefer selections where sum(price) <= totalBudget
-- If impossible to stay within budget, set trustFallback=true and label alternatives` : "- No budget constraint specified"}
+${bundleItems.some(item => item.budgetMax) ? `- Total budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)} for ONE complete set (1 item per itemIndex)
+- Budget applies ONLY to primaries (one candidate per itemIndex), NOT to alternatives
+- Prefer primaries where sum(price of one per itemIndex) <= totalBudget
+- If impossible to stay within budget for primaries, set trustFallback=true but still return primaries
+- Alternatives (beyond one per itemIndex) are NOT counted toward budget` : "- No budget constraint specified"}
 
 HARD CONSTRAINT RULES:
 ${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact", "good", or "fallback"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
@@ -1267,7 +1269,7 @@ REQUIREMENTS:
       }).join("\n");
       
       const totalBudgetText = bundleItems.some(item => item.budgetMax)
-        ? `\nTotal Budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)}`
+        ? `\nTotal Budget: $${bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0).toFixed(2)} (applies to ONE complete set: 1 item per itemIndex, NOT to all ${resultCount} returned items)`
         : "";
       
       // Build candidate groups by itemIndex
@@ -1318,7 +1320,7 @@ TASK:
 1. For each bundle item, choose exactly 1 primary selection from that item's candidate group
 2. After selecting 1 primary per item, add alternates to fill ${resultCount} total selections
 3. Distribute alternates evenly across items (round-robin)
-4. Enforce budget: prefer selections where sum(price) <= totalBudget; if impossible, set trustFallback=true and label alternatives
+4. Enforce budget: budget applies ONLY to primaries (one per itemIndex). Prefer primaries where sum(price of one per itemIndex) <= totalBudget. Alternatives are NOT counted toward budget. If impossible to stay within budget for primaries, set trustFallback=true but still return primaries.
 
 For each selected item in selected_by_item:
    - itemIndex: Must match the candidate's group (0, 1, 2, ...)
@@ -1554,7 +1556,15 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         }
         
         // Add the current product ranking task as the final user message
-        const taskContent = useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt;
+        let taskContent = useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt;
+        
+        // If this is a retry after empty selection, add stronger instruction
+        if (lastParseFailReason?.includes("empty selected array") || lastParseFailReason?.includes("AI returned empty")) {
+          const strongerInstruction = `\n\nCRITICAL: You must select exactly ${resultCount} items (or all candidates if fewer than ${resultCount}). Never return an empty selected array. If candidates are available, you MUST select at least one item.`;
+          taskContent = taskContent + strongerInstruction;
+          console.log("[AI Ranking] Adding stronger instruction for retry after empty selection");
+        }
+        
         if (taskContent && taskContent.trim().length > 0) {
           messages.push({
             role: "user",
@@ -1881,31 +1891,146 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           "missingItemIndices=", missingIndices.length > 0 ? missingIndices.join(",") : "none",
           "trustFallback=", bundleResult.trustFallback);
         
-        // Calculate total price for budget check
+        // Build candidate map for price lookups
         const candidateMap = new Map(candidates.map(p => [p.handle, p]));
-        const totalPrice = bundleResult.selected_by_item.reduce((sum, item) => {
-          const candidate = candidateMap.get(item.handle);
+        
+        // Helper to get price (returns Infinity if unknown)
+        const getPrice = (handle: string): number => {
+          const candidate = candidateMap.get(handle);
           if (candidate && candidate.price) {
             const price = parseFloat(String(candidate.price));
-            return sum + (Number.isFinite(price) ? price : 0);
+            return Number.isFinite(price) ? price : Infinity;
           }
-          return sum;
-        }, 0);
+          return Infinity; // Unknown price
+        };
         
+        // Step A: Extract primaries (exactly one per itemIndex - best match by score)
+        const primaries = new Map<number, BundleSelectedItem>();
+        const alternatives: BundleSelectedItem[] = [];
+        
+        // Group by itemIndex and select primary (highest score) for each
+        const itemsByIndex = new Map<number, BundleSelectedItem[]>();
+        for (const item of bundleResult.selected_by_item) {
+          if (!itemsByIndex.has(item.itemIndex)) {
+            itemsByIndex.set(item.itemIndex, []);
+          }
+          itemsByIndex.get(item.itemIndex)!.push(item);
+        }
+        
+        // Select primary for each itemIndex (highest score, then highest price if score tied)
+        for (const [itemIdx, items] of itemsByIndex.entries()) {
+          const sorted = [...items].sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score; // Higher score first
+            // If scores equal, prefer known price over unknown
+            const priceA = getPrice(a.handle);
+            const priceB = getPrice(b.handle);
+            if (priceA === Infinity && priceB !== Infinity) return 1;
+            if (priceB === Infinity && priceA !== Infinity) return -1;
+            return priceB - priceA; // Higher price first if both known
+          });
+          
+          primaries.set(itemIdx, sorted[0]);
+          // Add rest as alternatives
+          alternatives.push(...sorted.slice(1));
+        }
+        
+        // Step B: Calculate primariesTotal (sum of ONE candidate per itemIndex)
+        let primariesTotal = 0;
+        const primariesList: Array<{ itemIndex: number; handle: string; price: number }> = [];
+        for (const [itemIdx, primary] of primaries.entries()) {
+          const price = getPrice(primary.handle);
+          primariesList.push({ itemIndex: itemIdx, handle: primary.handle, price: price === Infinity ? 0 : price });
+          if (price !== Infinity) {
+            primariesTotal += price;
+          }
+        }
+        
+        // Step C: Check budget against primaries only (not all returned items)
         const totalBudget = bundleItems.reduce((sum, item) => sum + (item.budgetMax || 0), 0);
-        const budgetOk = totalBudget === 0 || totalPrice <= totalBudget;
+        let budgetOk = totalBudget === 0 || primariesTotal <= totalBudget;
+        let finalTrustFallback = bundleResult.trustFallback;
         
-        console.log("[AI Bundle] budgetOk=", budgetOk, "totalPrice=", totalPrice.toFixed(2), "totalBudget=", totalBudget.toFixed(2));
+        // Step C.1: If budget exceeded, try to swap primaries with cheaper alternatives
+        if (!budgetOk && totalBudget > 0) {
+          console.log(`[Bundle Budget] primariesTotal=${primariesTotal.toFixed(2)} exceeds totalBudget=${totalBudget.toFixed(2)}, attempting swap-down`);
+          
+          let swapped = false;
+          for (const [itemIdx, primary] of primaries.entries()) {
+            const primaryPrice = getPrice(primary.handle);
+            if (primaryPrice === Infinity || primaryPrice <= totalBudget / bundleItems.length) continue; // Skip if unknown or already cheap
+            
+            // Find cheaper alternative in same itemIndex
+            const itemAlternatives = alternatives.filter(alt => alt.itemIndex === itemIdx);
+            for (const alt of itemAlternatives) {
+              const altPrice = getPrice(alt.handle);
+              if (altPrice !== Infinity && altPrice < primaryPrice) {
+                // Check if swapping would help
+                const newTotal = primariesTotal - primaryPrice + altPrice;
+                if (newTotal <= totalBudget || newTotal < primariesTotal) {
+                  // Swap
+                  primaries.set(itemIdx, alt);
+                  alternatives.push(primary);
+                  alternatives.splice(alternatives.indexOf(alt), 1);
+                  primariesTotal = newTotal;
+                  swapped = true;
+                  console.log(`[Bundle Budget] swapped item${itemIdx}: ${primary.handle} ($${primaryPrice.toFixed(2)}) -> ${alt.handle} ($${altPrice.toFixed(2)})`);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Recalculate budgetOk after swaps
+          budgetOk = totalBudget === 0 || primariesTotal <= totalBudget;
+          if (!budgetOk) {
+            finalTrustFallback = true;
+            console.log(`[Bundle Budget] Still over budget after swaps: primariesTotal=${primariesTotal.toFixed(2)} > totalBudget=${totalBudget.toFixed(2)}, setting trustFallback=true`);
+          } else if (swapped) {
+            console.log(`[Bundle Budget] Swaps successful: primariesTotal=${primariesTotal.toFixed(2)} <= totalBudget=${totalBudget.toFixed(2)}`);
+          }
+        }
         
-        // Convert bundle result to ranked handles
-        const rankedHandles = bundleResult.selected_by_item
+        // Log primaries and budget status
+        console.log(`[Bundle Budget] totalBudget=${totalBudget > 0 ? totalBudget.toFixed(2) : "none"} primariesTotal=${primariesTotal.toFixed(2)} budgetOk=${budgetOk} trustFallback=${finalTrustFallback}`);
+        console.log(`[Bundle Budget] primaries_by_item=[${primariesList.map(p => `{itemIndex:${p.itemIndex}, handle:${p.handle}, price:$${p.price.toFixed(2)}}`).join(", ")}]`);
+        
+        // Step D: Build final handles array with primaries first, then alternatives
+        // Primaries: one per itemIndex, sorted by itemIndex
+        const primaryHandles = Array.from(primaries.entries())
+          .sort((a, b) => a[0] - b[0]) // Sort by itemIndex
+          .map(([_, item]) => item.handle);
+        
+        // Alternatives: fill remaining slots, sorted by (itemIndex asc, score desc, price asc, handle)
+        const alternativeHandles = alternatives
           .sort((a, b) => {
-            // Sort by itemIndex first, then by score descending
-            if (a.itemIndex !== b.itemIndex) return a.itemIndex - b.itemIndex;
-            return b.score - a.score;
+            if (a.itemIndex !== b.itemIndex) return a.itemIndex - b.itemIndex; // itemIndex asc
+            if (b.score !== a.score) return b.score - a.score; // score desc
+            const priceA = getPrice(a.handle);
+            const priceB = getPrice(b.handle);
+            if (priceA !== priceB) {
+              if (priceA === Infinity) return 1; // Unknown price last
+              if (priceB === Infinity) return -1;
+              return priceA - priceB; // price asc
+            }
+            return a.handle.localeCompare(b.handle); // handle asc (deterministic)
           })
           .map(item => item.handle)
-          .slice(0, resultCount);
+          .slice(0, Math.max(0, resultCount - primaryHandles.length)); // Fill remaining slots
+        
+        const rankedHandles = [...primaryHandles, ...alternativeHandles];
+        
+        // Log fill status
+        const perItemCounts = new Map<number, number>();
+        for (const handle of rankedHandles) {
+          const item = [...bundleResult.selected_by_item].find(i => i.handle === handle);
+          if (item) {
+            perItemCounts.set(item.itemIndex, (perItemCounts.get(item.itemIndex) || 0) + 1);
+          }
+        }
+        console.log(`[Bundle Fill] returnedCount=${rankedHandles.length} per_item_counts=[${Array.from(perItemCounts.entries()).map(([idx, count]) => `item${idx}:${count}`).join(", ")}]`);
+        
+        // Log before returning (to help debug if handles become empty)
+        console.log(`[Bundle] handles_before_return count=${rankedHandles.length} preview=[${rankedHandles.slice(0, 5).join(", ")}${rankedHandles.length > 5 ? "..." : ""}]`);
         
         // Build reasoning from bundle items
         const reasoningParts = bundleResult.selected_by_item
@@ -1918,11 +2043,11 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           : `Built a bundle with ${bundleResult.selected_by_item.length} items.`;
         
         // Bundle mode: AI succeeded (structured output parsed and validated)
-        console.log("[AI Ranking] source=ai trustFallback=", bundleResult.trustFallback);
+        console.log("[AI Ranking] source=ai trustFallback=", finalTrustFallback);
         return {
           selectedHandles: rankedHandles,
           reasoning,
-          trustFallback: bundleResult.trustFallback,
+          trustFallback: finalTrustFallback,
           source: "ai",
           parseFailReason: null,
         };
@@ -2085,6 +2210,15 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
       
         console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", singleItemResult.selected.length, "selected items");
+      
+      // CRITICAL: Enforce "must return results" - treat empty selected array as retryable failure
+      if (singleItemResult.selected.length === 0 && candidates.length > 0) {
+        console.error("[AI Ranking] ❌ AI returned 0 selected items despite", candidates.length, "candidates available - treating as retryable failure");
+        lastError = new Error("AI returned empty selected array");
+        lastParseFailReason = "AI returned empty selected array - must select at least one item";
+        // Trigger retry with stronger instruction
+        continue; // Will retry with updated prompt
+      }
       
       if (validSelectedItems.length === 0) {
           console.error("[AI Ranking] No valid selected items after runtime validation");
