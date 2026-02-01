@@ -81,7 +81,8 @@ function buildIntentSchema() {
           color: { type: ["string", "null"], description: "Color constraint if specified (e.g., 'Blue', 'Red')" },
           material: { type: ["string", "null"], description: "Material constraint if specified (e.g., 'Cotton', 'Leather')" }
         },
-        required: ["size", "color", "material"]
+        required: ["size", "color", "material"],
+        additionalProperties: false
       },
       bundleItems: {
         type: "array",
@@ -106,15 +107,18 @@ function buildIntentSchema() {
                     size: { type: ["string", "null"] },
                     color: { type: ["string", "null"] },
                     material: { type: ["string", "null"] }
-                  }
+                  },
+                  additionalProperties: false
                 },
                 priceCeiling: { type: ["number", "null"] },
                 includeTerms: { type: "array", items: { type: "string" } },
                 excludeTerms: { type: "array", items: { type: "string" } }
-              }
+              },
+              additionalProperties: false
             }
           },
-          required: ["hardTerms", "quantity"]
+          required: ["hardTerms", "quantity"],
+          additionalProperties: false
         },
         description: "Array of bundle items (only populated if isBundle is true)"
       },
@@ -132,7 +136,8 @@ function buildIntentSchema() {
         description: "Style or preference terms that guide selection but aren't hard requirements (e.g., 'plain', 'wireless', 'organic', 'eco-friendly')"
       }
     },
-    required: ["isBundle", "hardTerms", "softTerms", "avoidTerms", "hardFacets"]
+    required: ["isBundle", "hardTerms", "softTerms", "avoidTerms", "hardFacets"],
+    additionalProperties: false
   };
 }
 
