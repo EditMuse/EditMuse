@@ -1690,12 +1690,31 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         max_tokens: 1400, // Increased to 1400 for all ranking to reduce truncation risk
       };
 
-      let completion: OpenAI.Chat.Completions.ChatCompletion;
+      let completion: any; // Use 'any' since parse() returns a different type with parsed output
       try {
-        // Use chat.completions.create with structured outputs
+        // Use chat.completions.parse() for structured outputs - this ensures message.parsed is populated
         console.log("[AI Ranking] max_tokens=1400");
         console.log("[AI Ranking] include_description_snippets=true snippet_max_chars=400");
-        completion = await openai.chat.completions.create(sdkRequestParams);
+        if (supportsJsonSchema) {
+          // Use parse() method for structured outputs with json_schema
+          completion = await openai.chat.completions.parse({
+            model: model,
+            messages: messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+            response_format: {
+              type: "json_schema" as const,
+              json_schema: {
+                name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
+                strict: true,
+                schema: buildJsonSchema(isBundle),
+              },
+            },
+            temperature: 0,
+            max_tokens: 1400,
+          });
+        } else {
+          // Fallback to create() for json_object mode (parse() requires json_schema)
+          completion = await openai.chat.completions.create(sdkRequestParams);
+        }
       } catch (sdkError: any) {
         clearTimeout(timeoutId);
         
@@ -1759,23 +1778,28 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       // Use parsed output from SDK (structured outputs with strict schema)
-      // With strict JSON schema, the SDK provides parsed output in message.parsed
-      // Access parsed property (may not be in TypeScript types but exists at runtime with structured outputs)
+      // When using parse() method, message.parsed is guaranteed to be populated for json_schema mode
       const messageWithParsed = message as any; // Type assertion to access parsed property
       
       if (messageWithParsed.parsed) {
-        // SDK provides parsed output directly (structured outputs with strict schema)
+        // SDK parse() method provides parsed output directly (structured outputs with strict schema)
         structuredResult = messageWithParsed.parsed as StructuredRankingResult | StructuredBundleResult;
         console.log("[AI Ranking] structured_outputs=true");
         console.log("[AI Ranking] parsed_output=true");
-      } else {
-        // Parsed output is missing - treat as failure and use existing fallback
-        // Do NOT attempt JSON.parse or JSON repair - if SDK didn't parse it, we shouldn't either
+      } else if (supportsJsonSchema) {
+        // This should not happen with parse() method - treat as failure
         const parseResponseId = bodyResponseId || responseId || null;
-        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Missing parsed output from SDK (structured outputs)", parseResponseId ? `response_id=${parseResponseId}` : "");
-        lastError = new Error("Missing parsed output from SDK");
-        lastParseFailReason = "Missing parsed output from SDK";
-        // Do NOT retry for parsing failures - proceed directly to fallback
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Missing parsed output from SDK parse() method", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("Missing parsed output from SDK parse() method");
+        lastParseFailReason = "Missing parsed output from SDK parse() method";
+        continue; // This will eventually fallback after MAX_RETRIES
+      } else {
+        // For json_object fallback mode, we used create() not parse(), so parsed won't exist
+        // This is an extreme safety fallback - should not normally reach here
+        const parseResponseId = bodyResponseId || responseId || null;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=No parsed output (json_object fallback mode)", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("No parsed output (json_object fallback mode)");
+        lastParseFailReason = "No parsed output (json_object fallback mode)";
         continue; // This will eventually fallback after MAX_RETRIES
       }
 
