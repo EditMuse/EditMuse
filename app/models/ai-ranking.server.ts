@@ -61,10 +61,10 @@ interface Evidence {
 
 interface SelectedItem {
   handle: string;
-  label: "exact" | "alternative";
+  label: "exact" | "good" | "fallback";
   score: number;
-  evidence: Evidence;
-  reason: string;
+  evidence?: Evidence; // Optional in minimal schema
+  reason?: string; // Optional in minimal schema
 }
 
 interface RejectedCandidate {
@@ -565,31 +565,31 @@ function validateRankingSchema(
       return { valid: false, reason: `Handle ${item.handle} not in candidates` };
     }
     
-    if (item.label !== "exact" && item.label !== "alternative") {
-      return { valid: false, reason: `Invalid label: ${item.label}` };
+    if (item.label !== "exact" && item.label !== "good" && item.label !== "fallback") {
+      return { valid: false, reason: `Invalid label: ${item.label} (must be "exact", "good", or "fallback")` };
     }
     
     if (typeof item.score !== "number" || item.score < 0 || item.score > 100) {
       return { valid: false, reason: `Invalid score: ${item.score}` };
     }
     
-    if (!item.evidence || typeof item.evidence !== "object") {
-      return { valid: false, reason: "Missing or invalid evidence" };
-    }
-    
-    if (!Array.isArray(item.evidence.matchedHardTerms)) {
-      return { valid: false, reason: "Invalid matchedHardTerms array" };
-    }
-    
-    // If trustFallback=false AND hardTerms exist, require at least one matchedHardTerm
-    // If hardTerms.length===0, allow matchedHardTerms to be empty
-    const allowEmptyMatchedHardTerms = hardTermsCount === 0;
-    if (!trustFallback && !allowEmptyMatchedHardTerms && item.evidence.matchedHardTerms.length === 0) {
-      return { valid: false, reason: "No matchedHardTerms when trustFallback=false and hardTerms exist" };
-    }
-    
-    if (typeof item.reason !== "string") {
-      return { valid: false, reason: "Missing or invalid reason" };
+    // Evidence and reason are optional in minimal schema - skip validation if not present
+    // If evidence is provided, validate it (for backward compatibility)
+    if (item.evidence !== undefined) {
+      if (typeof item.evidence !== "object" || !item.evidence) {
+        return { valid: false, reason: "Invalid evidence (if provided, must be object)" };
+      }
+      
+      if (!Array.isArray(item.evidence.matchedHardTerms)) {
+        return { valid: false, reason: "Invalid matchedHardTerms array" };
+      }
+      
+      // If trustFallback=false AND hardTerms exist, require at least one matchedHardTerm
+      // If hardTerms.length===0, allow matchedHardTerms to be empty
+      const allowEmptyMatchedHardTerms = hardTermsCount === 0;
+      if (!trustFallback && !allowEmptyMatchedHardTerms && item.evidence.matchedHardTerms.length === 0) {
+        return { valid: false, reason: "No matchedHardTerms when trustFallback=false and hardTerms exist" };
+      }
     }
   }
   
@@ -1130,18 +1130,13 @@ Rules:
   const systemPrompt = isBundle
     ? `You are an expert product recommendation assistant for an e-commerce store. Your task is to build a BUNDLE of products across multiple categories from pre-filtered candidate lists.
 
-CRITICAL OUTPUT FORMAT:
+CRITICAL OUTPUT FORMAT (MINIMAL):
+- Return ONLY the fields required by the schema - no extra keys, no explanations, no evidence, no reasons
+- Do not include explanations, reasons, evidence, or extra keys
+- Keep output concise to avoid truncation
 - Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
 - Output must be parseable JSON.parse() directly
 - Use the exact bundle schema provided below - no deviations
-
-REASONING QUALITY (CRITICAL):
-- Each product's "reason" field must be written in natural, professional, conversational language
-- Write as if you're a knowledgeable sales associate explaining to a customer why this product matches their needs
-- Be specific and helpful: mention how it fits their request, style, occasion, or preferences
-- Avoid technical jargon or robotic phrases like "Product matches hardTerm X" or "This item satisfies criteria Y"
-- Instead use human-like language: "This elegant navy suit is perfect for formal occasions and professional settings" not "Matches suit category and navy color"
-- Each reason should be ONE sentence maximum, engaging, and customer-facing
 
 BUNDLE REQUIREMENTS:
 - You will receive ${bundleItems.length} bundle items, each with its own candidate group
@@ -1156,28 +1151,21 @@ ${bundleItems.some(item => item.budgetMax) ? `- Total budget: $${bundleItems.red
 - If impossible to stay within budget, set trustFallback=true and label alternatives` : "- No budget constraint specified"}
 
 HARD CONSTRAINT RULES:
-${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
+${trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact", "good", or "fallback"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
   a) At least one hardTerm match for its itemIndex in (title OR productType OR tags OR descriptionSnippet)
   b) ALL hardFacets must match when provided (size, color, material)
   c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)
-  d) Evidence must not be empty - must specify which hardTerms matched and which fields were used
-  e) Handle MUST exist in that itemIndex's candidate group`}
+  d) Handle MUST exist in that itemIndex's candidate group`}
 
-OUTPUT SCHEMA (MUST be exactly this structure):
+OUTPUT SCHEMA (MUST be exactly this structure - MINIMAL):
 {
   "trustFallback": ${trustFallback},
   "selected_by_item": [
     {
       "itemIndex": 0,
       "handle": "exact-handle-from-item-0-candidates",
-      "label": "exact" | "alternative",
-      "score": 85,
-      "evidence": {
-        "matchedHardTerms": ["suit"],
-        "matchedFacets": { "size": [], "color": ["navy"], "material": [] },
-        "fieldsUsed": ["title", "productType", "tags", "descriptionSnippet"]
-      },
-      "reason": "Navy suit matches category and color requirements."
+      "label": "exact",
+      "score": 85
     }
   ]
 }
@@ -1187,41 +1175,26 @@ REQUIREMENTS:
 - After primaries, add alternates to reach ${resultCount} total, distributing evenly across items
 - All handles must exist in their itemIndex's candidate group (copy exactly as shown)
 - No duplicate handles
-- evidence.matchedHardTerms must not be empty when trustFallback=false
-- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "descriptionSnippet"]
-- CRITICAL: Each "reason" must be professional, human-like, and conversational:
-  * Write as if you're a knowledgeable sales associate speaking directly to the customer
-  * Use natural language that highlights benefits, style, occasion, or fit
-  * Be specific: mention colors, materials, occasions, or use cases when relevant
-  * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
+- label must be one of: "exact", "good", "fallback"
+- score must be 0-100 (higher = better match)
   * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
   * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
 `
     : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
-CRITICAL OUTPUT FORMAT (HIGHEST PRIORITY):
+CRITICAL OUTPUT FORMAT (MINIMAL):
+- Return ONLY the fields required by the schema - no extra keys, no explanations, no evidence, no reasons
+- Do not include explanations, reasons, evidence, or extra keys
+- Keep output concise to avoid truncation
 - Return ONLY valid JSON (no markdown, no prose, no explanations outside JSON)
-- Output must be parseable JSON.parse() directly - test your JSON before returning
+- Output must be parseable JSON.parse() directly
 - Use the exact schema provided below - no deviations
-- CRITICAL: Ensure all arrays have proper commas between elements (e.g., ["item1", "item2"] not ["item1" "item2"])
-- CRITICAL: Ensure all objects have proper commas between properties
-- CRITICAL: Close all brackets and braces properly
-- Double-check your JSON is valid before returning - invalid JSON will cause errors
-
-REASONING QUALITY (CRITICAL):
-- Each product's "reason" field must be written in natural, professional, conversational language
-- Write as if you're a knowledgeable sales associate explaining to a customer why this product matches their needs
-- Be specific and helpful: mention how it fits their request, style, occasion, preferences, or use case
-- Avoid technical jargon or robotic phrases like "Product matches hardTerm X" or "This item satisfies criteria Y"
-- Instead use human-like language: "This elegant navy suit is perfect for formal occasions and professional settings" not "Matches suit category and navy color"
-- Each reason should be ONE sentence maximum, engaging, and customer-facing
 
 HARD CONSTRAINT RULES:
-${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + overall relevance. Do NOT reject products for missing hardTerms since none were specified. Prioritize products that match soft terms, variant preferences, and overall relevance to the user's intent.` : trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact" or "alternative"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
+${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + overall relevance. Do NOT reject products for missing hardTerms since none were specified. Prioritize products that match soft terms, variant preferences, and overall relevance to the user's intent.` : trustFallback ? `- trustFallback=true: You may show alternatives when exact matches are insufficient, but MUST label each as "exact", "good", or "fallback"` : `- trustFallback=false: EVERY returned product MUST satisfy ALL of the following:
   a) At least one hardTerm match in (title OR productType OR tags OR descriptionSnippet)
   b) ALL hardFacets must match when provided (size, color, material)
-  c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)
-  d) Evidence must not be empty - must specify which hardTerms matched and which fields were used`}
+  c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)`}
 
 CATEGORY DRIFT PREVENTION:
 - If hardTerm includes a specific category (e.g., "suit", "sofa", "treadmill", "serum"), do NOT return adjacent categories:
@@ -1238,20 +1211,14 @@ MATCHING REQUIREMENTS:
 3. Exclude products containing avoidTerms in title/tags/descriptionSnippet
 5. Score 0-100 based on relevance (higher = better match)
 
-OUTPUT SCHEMA (MUST be exactly this structure):
+OUTPUT SCHEMA (MUST be exactly this structure - MINIMAL):
 {
   "trustFallback": ${trustFallback},
   "selected": [
     {
       "handle": "exact-handle-from-candidate-list",
-      "label": "exact" | "alternative",
-      "score": 85,
-      "evidence": {
-        "matchedHardTerms": ["suit"],
-        "matchedFacets": { "color": ["navy", "blue"] },
-        "fieldsUsed": ["title", "productType", "tags", "descriptionSnippet"]
-      },
-      "reason": "Navy blue suit matches category and color requirements."
+      "label": "exact",
+      "score": 85
     }
   ]
 }
@@ -1260,16 +1227,8 @@ REQUIREMENTS:
 - "selected" array MUST contain exactly ${resultCount} items
 - All handles must exist in the candidate list (copy exactly as shown)
 - No duplicate handles
-- evidence.matchedHardTerms must not be empty when trustFallback=false
-- evidence.fieldsUsed must include at least one of: ["title", "productType", "tags", "descriptionSnippet"]
-- CRITICAL: Each "reason" must be professional, human-like, and conversational:
-  * Write as if you're a knowledgeable sales associate speaking directly to the customer
-  * Use natural language that highlights benefits, style, occasion, or fit
-  * Be specific: mention colors, materials, occasions, or use cases when relevant
-  * Avoid robotic phrases: NO "Product matches X", NO "Satisfies criteria Y", NO technical jargon
-  * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
-  * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
-  * Each reason should be ONE sentence maximum, engaging, and customer-facing`;
+- label must be one of: "exact", "good", "fallback"
+- score must be 0-100 (higher = better match)`;
 
   // Build hard constraints object for prompt
   const hardConstraintsJson = JSON.stringify({
@@ -1416,42 +1375,21 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   let userPrompt = buildUserPrompt(false);
 
   // Build JSON schema for StructuredRankingResult or StructuredBundleResult if supported
+  // MINIMAL SCHEMA: Only essential fields to reduce output size and prevent truncation
   function buildJsonSchema(isBundle: boolean = false) {
-    const evidenceSchema = {
-      type: "object",
-      properties: {
-        matchedHardTerms: { type: "array", items: { type: "string" } },
-        matchedFacets: {
-          type: "object",
-          properties: {
-            size: { type: "array", items: { type: "string" } },
-            color: { type: "array", items: { type: "string" } },
-            material: { type: "array", items: { type: "string" } },
-          },
-          required: ["size", "color", "material"],
-          additionalProperties: false,
-        },
-        fieldsUsed: { type: "array", items: { type: "string" } },
-      },
-      required: ["matchedHardTerms", "matchedFacets", "fieldsUsed"],
-      additionalProperties: false,
-    };
-    
-    const selectedItemSchema = {
+    const minimalItemSchema = {
       type: "object",
       properties: {
         handle: { type: "string" },
-        label: { type: "string", enum: ["exact", "alternative"] },
         score: { type: "number", minimum: 0, maximum: 100 },
-        evidence: evidenceSchema,
-        reason: { type: "string" },
+        label: { type: "string", enum: ["exact", "good", "fallback"] },
       },
-      required: ["handle", "label", "score", "evidence", "reason"],
+      required: ["handle", "score", "label"],
       additionalProperties: false,
     };
     
     if (isBundle) {
-      // Bundle schema: strict - only trustFallback and selected_by_item
+      // Bundle schema: minimal - only trustFallback and selected_by_item
       return {
         type: "object",
         properties: {
@@ -1463,12 +1401,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
               properties: {
                 itemIndex: { type: "number" },
                 handle: { type: "string" },
-                label: { type: "string", enum: ["exact", "alternative"] },
                 score: { type: "number", minimum: 0, maximum: 100 },
-                evidence: evidenceSchema,
-                reason: { type: "string" },
+                label: { type: "string", enum: ["exact", "good", "fallback"] },
               },
-              required: ["itemIndex", "handle", "label", "score", "evidence", "reason"],
+              required: ["itemIndex", "handle", "score", "label"],
               additionalProperties: false,
             },
           },
@@ -1477,14 +1413,14 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         additionalProperties: false,
       };
     } else {
-      // Single-item schema: strict - only trustFallback and selected
+      // Single-item schema: minimal - only trustFallback and selected
       return {
         type: "object",
         properties: {
           trustFallback: { type: "boolean" },
           selected: {
             type: "array",
-            items: selectedItemSchema,
+            items: minimalItemSchema,
           },
         },
         required: ["trustFallback", "selected"],
@@ -1695,6 +1631,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         // Use chat.completions.parse() for structured outputs - this ensures message.parsed is populated
         console.log("[AI Ranking] max_tokens=1400");
         console.log("[AI Ranking] include_description_snippets=true snippet_max_chars=400");
+        console.log("[AI Ranking] schema=minimal_v1");
         if (supportsJsonSchema) {
           // Use parse() method for structured outputs with json_schema
           completion = await openai.chat.completions.parse({
@@ -1934,7 +1871,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         // Build reasoning from bundle items
         const reasoningParts = bundleResult.selected_by_item
           .filter((item, idx, arr) => arr.findIndex(i => i.itemIndex === item.itemIndex) === idx) // One per itemIndex
-          .map(item => item.reason)
+          .map(item => item.reason || "")
           .filter(Boolean);
         
         const reasoning = reasoningParts.length > 0
@@ -2022,7 +1959,10 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           
           // RELAXED VALIDATION: Use fuzzy matching instead of exact substring matching
           // This allows AI results to pass more often while still ensuring relevance
-          const hasHardTermMatch = item.evidence.matchedHardTerms.some((term: string) => {
+          // In minimal schema, evidence is optional - if not present, assume match (trust the AI)
+          const hasHardTermMatch = !item.evidence || item.evidence.matchedHardTerms.length === 0 
+            ? true // If no evidence, trust the AI's selection
+            : item.evidence.matchedHardTerms.some((term: string) => {
             const termLower = term.toLowerCase();
             // Exact match
             if (candidateText.includes(termLower)) return true;
@@ -2109,7 +2049,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         // Build human-like reasoning from AI's item reasons (prioritize AI feedback)
         const itemReasons = validSelectedItems
           .slice(0, resultCount)
-          .map(item => item.reason)
+          .map(item => item.reason || "")
           .filter(Boolean);
         
       let reasoning: string;
