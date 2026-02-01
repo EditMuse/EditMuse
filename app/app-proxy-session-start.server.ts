@@ -1046,6 +1046,30 @@ function parseBundleIntentGeneric(userIntent: string): {
         
         for (let segIdx = 0; segIdx < segments.length; segIdx++) {
           const segment = segments[segIdx];
+          
+          // CRITICAL FIX: Skip segments that contain negative/avoid patterns (industry-agnostic)
+          // These should be handled by avoid terms extraction, not bundle item extraction
+          // Industry-agnostic examples: "no patterns", "not red", "without logos", "avoid floral", "don't want prints"
+          // Works for any industry: "no batteries", "not wireless", "without warranty", "avoid plastic", etc.
+          const negativePatterns = [
+            /\bno\s+/i,                    // "no X" - any industry
+            /\bnot\s+/i,                   // "not X" - any industry
+            /\bwithout\s+/i,                // "without X" - any industry
+            /\bavoid\s+/i,                 // "avoid X" - any industry
+            /\bdon'?t\s+(?:want|like|need|prefer)\s+/i,  // "don't want/like/need/prefer X" - any industry
+            /\bexclude\s+/i,               // "exclude X" - any industry
+            /\bexcept\s+/i,                // "except X" - any industry (when used as exclusion)
+            /\bexcluding\s+/i,             // "excluding X" - any industry
+          ];
+          const hasNegativePattern = negativePatterns.some(pattern => pattern.test(segment));
+          if (hasNegativePattern) {
+            // This segment contains negative/avoid patterns - skip it for bundle extraction
+            // The avoid terms will be extracted by parseIntentGeneric (industry-agnostic)
+            console.log(`[Bundle] Skipping segment "${segment}" - contains negative/avoid patterns`);
+            currentPos += segment.length + 10;
+            continue;
+          }
+          
           // Check if segment is an abstract collection term (skip it, but count it for bundle detection)
           let isAbstract = false;
           for (const pattern of abstractCollectionPatterns) {
@@ -5086,25 +5110,62 @@ async function processSessionInBackground({
       let validatedHandles: string[];
       if (isBundleMode && !trustFallback) {
         // Bundle validation: ensure each handle belongs to correct item's pool
+        // CRITICAL FIX: Use proper matching logic instead of metadata (industry-agnostic)
+        // Build item pools using proper matching (same as bundle selection)
         const itemPools = new Map<number, Set<string>>();
-        for (const c of sortedCandidates) {
-          const itemIdx = (c as any)._bundleItemIndex;
-          if (typeof itemIdx === "number") {
-            if (!itemPools.has(itemIdx)) {
-              itemPools.set(itemIdx, new Set());
+        const candidateMap = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        
+        // Build pools using proper matching logic (not metadata)
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+          const bundleItem = bundleIntent.items[itemIdx];
+          const itemHardTerms = bundleItem.hardTerms;
+          const pool = new Set<string>();
+          
+          // Check all candidates to see if they match this item's hard terms
+          for (const c of allCandidatesEnriched) {
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              pool.add(c.handle);
             }
-            itemPools.get(itemIdx)!.add(c.handle);
           }
+          
+          itemPools.set(itemIdx, pool);
         }
         
         validatedHandles = finalHandles.filter(handle => {
-          // Check if handle belongs to any item pool
-          for (const pool of itemPools.values()) {
-            if (pool.has(handle)) return true;
+          // Check if handle belongs to any item pool using proper matching
+          const candidate = candidateMap.get(handle);
+          if (!candidate) return false; // Handle not found in candidates
+          
+          // Check if handle matches any item's hard terms
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const bundleItem = bundleIntent.items[itemIdx];
+            const itemHardTerms = bundleItem.hardTerms;
+            
+            const haystack = [
+              candidate.title || "",
+              candidate.productType || "",
+              (candidate.tags || []).join(" "),
+              candidate.vendor || "",
+              candidate.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              return true; // Handle matches at least one item type
+            }
           }
           return false;
         });
-        console.log("[Bundle] validated", validatedHandles.length, "handles (all from item pools)");
+        console.log("[Bundle] validated", validatedHandles.length, "handles (all from item pools, using proper matching)");
       } else {
         validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
       }
@@ -5157,8 +5218,14 @@ async function processSessionInBackground({
 
       // Hard guarantee: top-up after AI ranking (intent-safe enforcement)
       // Ensure validatedHandles is always an array to prevent errors
-      // finalHandlesGuaranteed is already declared above, just initialize it here
-      finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+      // CRITICAL FIX: If validation filtered out all handles, use original finalHandles as fallback
+      // This prevents 0 handles when validation is too strict (e.g., bundle item has 0 candidates)
+      if (validatedHandles.length === 0 && finalHandles.length > 0) {
+        console.log("[App Proxy] [Layer 3] Validation filtered out all handles, using original finalHandles as fallback");
+        finalHandlesGuaranteed = uniq(finalHandles);
+      } else {
+        finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+      }
 
       // Bundle-safe top-up: only from bundle item pools
       if (isBundleMode && bundleIntent.items.length >= 2) {
@@ -5459,8 +5526,9 @@ async function processSessionInBackground({
 
       // Ensure result diversity (vendor, type, price variety)
       // This improves user experience by avoiding too many similar products
+      // CRITICAL FIX: Use allCandidatesEnriched (not just gatedCandidates) to ensure handles from bundle selection are found
       // Convert enriched candidates to format expected by ensureResultDiversity
-      const candidatesForDiversity = gatedCandidates.map(c => ({
+      const candidatesForDiversity = allCandidatesEnriched.map(c => ({
         handle: c.handle,
         title: c.title,
         tags: c.tags,
@@ -5474,12 +5542,14 @@ async function processSessionInBackground({
         materials: c.materials,
         optionValues: c.optionValues,
       }));
-      const diverseHandles = ensureResultDiversity(
-        finalHandlesGuaranteed.slice(0, targetCount),
-        candidatesForDiversity,
-        finalResultCount
-      );
-      console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandlesGuaranteed.slice(0, targetCount).length, ")");
+      
+      // Only apply diversity if we have handles to diversify
+      const handlesToDiversify = finalHandlesGuaranteed.slice(0, targetCount);
+      const diverseHandles = handlesToDiversify.length > 0
+        ? ensureResultDiversity(handlesToDiversify, candidatesForDiversity, finalResultCount)
+        : handlesToDiversify; // If empty, return as-is (diversity check will return empty anyway)
+      
+      console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", handlesToDiversify.length, ")");
 
       // Final reasoning string (prioritize AI reasoning, make notes customer-friendly)
       // Check if reasoningParts contains AI-generated reasoning (human-like, professional)

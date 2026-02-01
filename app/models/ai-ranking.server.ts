@@ -319,6 +319,25 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
     // Second attempt: try to fix common issues
     let fixed = jsonSlice;
     
+    // CRITICAL FIX: Handle "Expected ',' or ']' after array element" errors
+    // Fix missing commas between array elements (most common issue)
+    // Pattern: Object/array element followed by another element without comma
+    // Must be careful to only fix within arrays, not within object properties
+    
+    // Fix: Missing comma between array elements (object in array)
+    // Pattern: "}" followed by "{" (object element in array) - but only if not inside a string
+    fixed = fixed.replace(/([^,\s])\s*}\s*{/g, '$1}, {'); // Object before object in array
+    fixed = fixed.replace(/([^,\s])\s*]\s*\[/g, '$1], ['); // Array before array
+    fixed = fixed.replace(/([^,\s])\s*}\s*\[/g, '$1}, ['); // Object before array
+    fixed = fixed.replace(/([^,\s])\s*]\s*{/g, '$1], {'); // Array before object
+    
+    // Fix: Missing comma between array elements of any type
+    // Pattern: Value followed by value without comma (within array context)
+    fixed = fixed.replace(/([^,\s\]}])\s+(["{[\d])/g, '$1, $2'); // Any value before bracket/brace/quote/digit
+    fixed = fixed.replace(/([^,\s\]}]")\s*"([^,\s\]}])/g, '$1, "$2'); // String before string
+    fixed = fixed.replace(/(\d+)\s+(["{[\d])/g, '$1, $2'); // Number before value
+    fixed = fixed.replace(/(true|false|null)\s+(["{[\d])/g, '$1, $2'); // Boolean/null before value
+    
     // Fix: missing comma between array elements (e.g., "]" "{" should be "], {")
     fixed = fixed.replace(/([}\]"])\s*([{["])/g, '$1, $2');
     
@@ -344,13 +363,37 @@ function parseStructuredRanking(content: string): StructuredRankingResult | Stru
       // CRITICAL FIX: Handle "Expected ',' or '}' after property value" errors
       // Pattern: Property value followed by another property or closing brace without comma
       // Example: "key": "value" "key2": ... or "key": "value" }
+      // Also handle nested structures: "material": [] } or "color": ["Blue"] }
       repaired = repaired.replace(/("(?:[^"\\]|\\.)*")\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // String value before string property
       repaired = repaired.replace(/(\d+)\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Number before property
       repaired = repaired.replace(/(true|false|null)\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Boolean/null before property
       repaired = repaired.replace(/([}\]"])\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Closing bracket/brace/quote before property
       
+      // CRITICAL FIX: Handle missing comma after array/object value before closing brace
+      // Pattern: "material": [] } or "color": ["Blue"] } or "size": [] }
+      // This is a common error where array/object values are followed by closing brace without comma
+      repaired = repaired.replace(/(\])\s*([}])/g, '$1$2'); // Array before closing brace (no comma needed, but ensure no space issues)
+      repaired = repaired.replace(/(\])\s*("(?:[^"\\]|\\.)*":)/g, '$1, $2'); // Array before property (needs comma)
+      repaired = repaired.replace(/(\[(?:[^\]]*)\]\s*)\s*([}])/g, '$1$2'); // Array value before closing brace
+      
       // Fix missing commas in arrays - more aggressive patterns
-      // Pattern 1: Value followed by value without comma (any type)
+      // CRITICAL FIX: Handle "Expected ',' or ']' after array element" errors
+      // Pattern: Array element followed by another element or closing bracket without comma
+      // Example: { "key": "value" } { "key2": "value2" } or { "key": "value" }]
+      
+      // Fix: Missing comma between array elements (object in array)
+      // Pattern: "}" followed by "{" (object element in array)
+      repaired = repaired.replace(/([^,\s])\s*}\s*{/g, '$1}, {'); // Object before object in array
+      repaired = repaired.replace(/([^,\s])\s*]\s*\[/g, '$1], ['); // Array before array
+      repaired = repaired.replace(/([^,\s])\s*}\s*\[/g, '$1}, ['); // Object before array
+      repaired = repaired.replace(/([^,\s])\s*]\s*{/g, '$1], {'); // Array before object
+      
+      // Fix: Missing comma after array element before closing bracket
+      // Pattern: "}" or "]" followed by "]" (element before closing bracket)
+      repaired = repaired.replace(/([^,\s])\s*}\s*]/g, '$1}]'); // Object element before closing bracket (no comma needed)
+      repaired = repaired.replace(/([^,\s])\s*]\s*]/g, '$1]]'); // Array element before closing bracket (no comma needed)
+      
+      // Fix: Missing comma between array elements (any type)
       repaired = repaired.replace(/([^,\s\]}])\s+(["{[\d])/g, '$1, $2'); // Any value before bracket/brace/quote/digit
       repaired = repaired.replace(/([^,\s\]}]")\s*"([^,\s\]}])/g, '$1, "$2'); // String before string
       repaired = repaired.replace(/(\d+)\s+(["{[\d])/g, '$1, $2'); // Number before value
