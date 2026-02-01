@@ -4,6 +4,7 @@ import prisma from "~/db.server";
 import { createConciergeSession, saveConciergeResult, addConciergeMessage } from "~/models/concierge.server";
 import { getAccessTokenForShop, fetchShopifyProducts, fetchShopifyProductDescriptionsByHandles } from "~/shopify-admin.server";
 import { rankProductsWithAI, fallbackRanking } from "~/models/ai-ranking.server";
+import { parseIntentWithLLM } from "~/models/intent-parsing.server";
 import { ConciergeSessionStatus, ConciergeRole } from "@prisma/client";
 import { trackUsageEvent, chargeConciergeSessionOnce, getEntitlements } from "~/models/billing.server";
 import { createOverageUsageCharge } from "~/models/shopify-billing.server";
@@ -1070,6 +1071,30 @@ function parseBundleIntentGeneric(userIntent: string): {
             continue;
           }
           
+          // CRITICAL FIX: Skip segments that contain preference phrases (industry-agnostic)
+          // These express preferences/constraints on the main item, not separate bundle items
+          // Industry-agnostic examples: "i want plain", "i need wireless", "looking for organic", "prefer blue"
+          // Works for any industry: "i want rechargeable", "i need waterproof", "looking for eco-friendly", etc.
+          const segmentLower = segment.toLowerCase().trim();
+          const preferencePatterns = [
+            /^i\s+(?:want|need|prefer|like)\s+/i,        // "i want X", "i need X", "i prefer X", "i like X" (at start)
+            /\b(?:want|need|prefer|like)\s+(?:a|an|the)?\s*\w+/i,  // "want X", "need X", "prefer X", "like X" (anywhere)
+            /\blooking\s+for\s+/i,         // "looking for X"
+            /^prefer\s+/i,                 // "prefer X" (at start)
+            /\bwould\s+like\s+/i,          // "would like X"
+            /\bhoping\s+for\s+/i,          // "hoping for X"
+            /\bseeking\s+/i,               // "seeking X"
+          ];
+          const hasPreferencePattern = preferencePatterns.some(pattern => pattern.test(segmentLower));
+          if (hasPreferencePattern) {
+            // This segment contains preference phrases - skip it for bundle extraction
+            // The preference terms will be extracted by parseIntentGeneric as constraints/preferences
+            // This prevents "i want plain" from being treated as a bundle item "plain"
+            console.log(`[Bundle] Skipping segment "${segment}" - contains preference/constraint patterns`);
+            currentPos += segment.length + 10;
+            continue;
+          }
+          
           // Check if segment is an abstract collection term (skip it, but count it for bundle detection)
           let isAbstract = false;
           for (const pattern of abstractCollectionPatterns) {
@@ -1217,7 +1242,8 @@ function parseBundleIntentGeneric(userIntent: string): {
   }
   
   // Bundle detected if: ≥2 distinct items found (either from categories or extracted segments)
-  // OR: ≥1 item found with bundle indicators (handles "blue suit and complete outfit" case)
+  // CRITICAL FIX: Require at least 2 concrete product items for bundle detection
+  // This prevents single-item queries with preferences (e.g., "blue shirt, i want plain") from being treated as bundles
   const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
   const categoryCounts = new Map<string, number>();
   for (const { term } of foundCategories) {
@@ -1226,10 +1252,10 @@ function parseBundleIntentGeneric(userIntent: string): {
   const hasRepeatedMentions = Array.from(categoryCounts.values()).some(count => count >= 2);
   
   // Bundle if: (≥2 items found) AND (bundle indicators present OR repeated mentions)
-  // OR: (≥1 item found) AND (bundle indicators present) - handles abstract term cases
-  // For industry-agnostic: if user says "X and Y" but Y is abstract, we still treat as bundle with X
-  const isBundle = (uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions)) ||
-                   (uniqueCategories.length >= 1 && hasBundleIndicator);
+  // Industry-agnostic: requires at least 2 concrete product items to be a bundle
+  // This ensures "blue shirt, i want plain" is NOT treated as a bundle (only 1 product item)
+  // But "blue shirt, trousers" IS treated as a bundle (2 product items)
+  const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
 
   if (!isBundle) {
     return { isBundle: false, items: [], totalBudget: null, totalBudgetCurrency: null };
@@ -2497,7 +2523,8 @@ async function processSessionInBackground({
   }
   
   let productHandles: string[] = [];
-  let aiCallCount = 0; // Track AI calls per session (should be 0 or 1)
+  let aiCallCount = 0; // Track AI ranking calls per session (should be 0 or 1)
+  let intentParseCallCount = 0; // Track intent parsing calls per session (should be 0 or 1)
   
   // Performance timing variables
   let shopifyFetchMs = 0;
@@ -2858,23 +2885,113 @@ async function processSessionInBackground({
       enrichmentMs = Math.round(performance.now() - enrichmentStart);
       
       // LAYER 2: Intent Parsing + Local Indexing + Gating
-      // Parse intent into hard/soft/avoid terms and facets
+      // LLM-FIRST APPROACH: Use OpenAI to understand intent, fallback to pattern-based if needed
       const gatingStart = performance.now();
       console.log("[App Proxy] [Layer 2] Parsing intent and building local index");
       
-      // Get variant constraints for intent parsing
-      const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
-      const fromTextForIntent = parseConstraintsFromText(userIntent);
-      const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
+      // Try LLM intent parsing first (industry-agnostic, understands context)
+      let hardTerms: string[] = [];
+      let softTerms: string[] = [];
+      let avoidTerms: string[] = [];
+      let hardFacets: { size: string | null; color: string | null; material: string | null } = {
+        size: null,
+        color: null,
+        material: null
+      };
+      let bundleIntent: {
+        isBundle: boolean;
+        items: Array<{ 
+          hardTerms: string[]; 
+          quantity: number;
+          constraints?: any;
+        }>;
+        totalBudget: number | null;
+        totalBudgetCurrency: string | null;
+      } = {
+        isBundle: false,
+        items: [],
+        totalBudget: null,
+        totalBudgetCurrency: null
+      };
+      let llmIntentUsed = false;
       
-      // Parse intent (will update includeTerms/avoidTerms)
-      const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
-      const { hardTerms, softTerms, avoidTerms, hardFacets } = intentParse;
+      // Prepare conversation history for LLM (if available)
+      const conversationHistoryForIntent = conversationMessages.length > 0
+        ? conversationMessages.map(m => ({ role: m.role, content: m.content }))
+        : undefined;
       
-      // Parse bundle intent
-      const bundleIntent = parseBundleIntentGeneric(userIntent);
-      // Bundle detection already logged in parseBundleIntentGeneric
-      // Additional log for reference: bundleIntent.isBundle, items.length, totalBudget
+      // Try LLM intent parsing
+      const llmIntentResult = await parseIntentWithLLM(userIntent, conversationHistoryForIntent);
+      intentParseCallCount = llmIntentResult.fallbackUsed ? 0 : 1; // Track if LLM was used (not fallback)
+      
+      if (llmIntentResult.success && llmIntentResult.intent) {
+        // Use LLM-parsed intent
+        llmIntentUsed = true;
+        const intent = llmIntentResult.intent;
+        
+        hardTerms = intent.hardTerms || [];
+        softTerms = intent.softTerms || [];
+        avoidTerms = intent.avoidTerms || [];
+        
+        // Merge LLM-extracted facets with variant constraints from answers
+        // This ensures we capture both LLM understanding and explicit user selections
+        const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
+        const fromTextForIntent = parseConstraintsFromText(userIntent);
+        const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
+        
+        // Merge LLM facets with variant constraints (variant constraints take precedence)
+        hardFacets = {
+          size: variantConstraintsForIntent.size || intent.hardFacets?.size || null,
+          color: variantConstraintsForIntent.color || intent.hardFacets?.color || null,
+          material: variantConstraintsForIntent.material || intent.hardFacets?.material || null
+        };
+        
+        // Convert LLM bundle structure to existing format
+        bundleIntent = {
+          isBundle: intent.isBundle || false,
+          items: intent.bundleItems?.map(item => ({
+            hardTerms: item.hardTerms || [],
+            quantity: item.quantity || 1,
+            constraints: item.constraints
+          })) || [],
+          totalBudget: intent.totalBudget || null,
+          totalBudgetCurrency: intent.totalBudgetCurrency || null
+        };
+        
+        // Merge preferences into softTerms if not already present
+        if (intent.preferences && intent.preferences.length > 0) {
+          for (const pref of intent.preferences) {
+            if (!softTerms.includes(pref) && !hardTerms.includes(pref)) {
+              softTerms.push(pref);
+            }
+          }
+        }
+        
+        console.log("[Intent Parsing] ✅ Using LLM-parsed intent (industry-agnostic)");
+      } else {
+        // Fallback to pattern-based parsing
+        console.log("[Intent Parsing] ⚠️  LLM parsing failed, using pattern-based fallback:", llmIntentResult.error || "unknown error");
+        
+        // Get variant constraints for pattern-based parsing
+        const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
+        const fromTextForIntent = parseConstraintsFromText(userIntent);
+        const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
+        
+        // Parse intent using pattern-based approach (fallback)
+        const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
+        hardTerms = intentParse.hardTerms;
+        softTerms = intentParse.softTerms;
+        avoidTerms = intentParse.avoidTerms;
+        hardFacets = intentParse.hardFacets;
+        
+        // Parse bundle intent using pattern-based approach
+        bundleIntent = parseBundleIntentGeneric(userIntent);
+      }
+      
+      // Log intent parsing method used
+      console.log(`[Intent Parsing] Method: ${llmIntentUsed ? "LLM" : "pattern-based"}, isBundle: ${bundleIntent.isBundle}, hardTerms: ${hardTerms.length}, avoidTerms: ${avoidTerms.length}`);
+      
+      // Bundle detection already logged above or in parseBundleIntentGeneric
       
       // Log requested groups (normalized) for bundle mode
       if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
@@ -6260,8 +6377,12 @@ async function processSessionInBackground({
       // Log 3-layer pipeline metrics
       console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
       
-      // Log AI call count (should be 0 or 1)
-      console.log("[Perf] ai_calls", { total: aiCallCount });
+      // Log AI call counts
+      console.log("[Perf] ai_calls", { 
+        intentParsing: intentParseCallCount,
+        productRanking: aiCallCount,
+        total: intentParseCallCount + aiCallCount
+      });
       
       // Safety clamp: aiMs should never exceed total duration
       const totalDurationMs = Math.round(performance.now() - processStartTime);
@@ -6301,7 +6422,11 @@ async function processSessionInBackground({
       }).catch(() => {});
       
       // Log AI call count (should be 0)
-      console.log("[Perf] ai_calls", { total: aiCallCount });
+      console.log("[Perf] ai_calls", { 
+        intentParsing: intentParseCallCount,
+        productRanking: aiCallCount,
+        total: intentParseCallCount + aiCallCount
+      });
     }
   } catch (error: any) {
       console.error("[App Proxy] Background processing failed:", error);
