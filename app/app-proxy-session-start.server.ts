@@ -1244,16 +1244,41 @@ function parseBundleIntentGeneric(userIntent: string): {
   // Bundle detected if: ≥2 distinct items found (either from categories or extracted segments)
   // CRITICAL FIX: Require at least 2 concrete product items for bundle detection
   // This prevents single-item queries with preferences (e.g., "blue shirt, i want plain") from being treated as bundles
-  const uniqueCategories = Array.from(new Set(foundCategories.map(c => c.term)));
+  
+  // FINAL GUARD: Filter out items that came from avoid/preference segments
+  // Never treat negative constraints ("no X", "without X", "avoid X", "not X") or preference adjectives as bundle items
+  const preferenceAdjectives = new Set(["plain", "simple", "classic", "minimal", "basic", "standard", "regular", "normal", "typical", "common", "usual"]);
+  const validCategories = foundCategories.filter(cat => {
+    const termLower = cat.term.toLowerCase();
+    // Filter out preference adjectives
+    if (preferenceAdjectives.has(termLower)) {
+      return false;
+    }
+    // Filter out avoid terms (these should be in avoidTerms, not bundle items)
+    // Check if the term appears in negative context in the original query
+    const termIndex = userIntent.toLowerCase().indexOf(termLower);
+    if (termIndex >= 0) {
+      const beforeTerm = userIntent.substring(Math.max(0, termIndex - 20), termIndex).toLowerCase();
+      const afterTerm = userIntent.substring(termIndex + termLower.length, Math.min(userIntent.length, termIndex + termLower.length + 20)).toLowerCase();
+      // Check for negative patterns before/after the term
+      if (/\b(no|not|without|avoid|don't|dont|exclude|excluding|except)\s+/i.test(beforeTerm) ||
+          /\b(no|not|without|avoid|don't|dont|exclude|excluding|except)\s+/i.test(afterTerm)) {
+        return false; // This is an avoid term, not a bundle item
+      }
+    }
+    return true;
+  });
+  
+  const uniqueCategories = Array.from(new Set(validCategories.map(c => c.term)));
   const categoryCounts = new Map<string, number>();
-  for (const { term } of foundCategories) {
+  for (const { term } of validCategories) {
     categoryCounts.set(term.toLowerCase(), (categoryCounts.get(term.toLowerCase()) || 0) + 1);
   }
   const hasRepeatedMentions = Array.from(categoryCounts.values()).some(count => count >= 2);
   
-  // Bundle if: (≥2 items found) AND (bundle indicators present OR repeated mentions)
+  // Bundle if: (≥2 REAL product items found) AND (bundle indicators present OR repeated mentions)
   // Industry-agnostic: requires at least 2 concrete product items to be a bundle
-  // This ensures "blue shirt, i want plain" is NOT treated as a bundle (only 1 product item)
+  // This ensures "blue shirt, i want plain" is NOT treated as a bundle (only 1 product item, "plain" is filtered)
   // But "blue shirt, trousers" IS treated as a bundle (2 product items)
   const isBundle = uniqueCategories.length >= 2 && (hasBundleIndicator || hasRepeatedMentions);
 
@@ -1280,7 +1305,8 @@ function parseBundleIntentGeneric(userIntent: string): {
   }> = [];
   const seenTerms = new Set<string>();
   
-  for (const { term, position } of foundCategories) {
+  // Use validCategories (filtered to exclude avoid/preference terms) instead of foundCategories
+  for (const { term, position } of validCategories) {
     if (seenTerms.has(term.toLowerCase())) continue;
     seenTerms.add(term.toLowerCase());
     
@@ -2929,17 +2955,19 @@ async function processSessionInBackground({
         llmIntentUsed = true;
         const intent = llmIntentResult.intent;
         
-        hardTerms = intent.hardTerms || [];
-        softTerms = intent.softTerms || [];
-        avoidTerms = intent.avoidTerms || [];
+        // Validate and normalize LLM output
+        hardTerms = Array.isArray(intent.hardTerms) ? intent.hardTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
+        softTerms = Array.isArray(intent.softTerms) ? intent.softTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
+        avoidTerms = Array.isArray(intent.avoidTerms) ? intent.avoidTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         
         // Merge LLM-extracted facets with variant constraints from answers
         // This ensures we capture both LLM understanding and explicit user selections
+        // EXPLICIT USER SELECTIONS ALWAYS WIN (variant constraints take precedence)
         const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
         const fromTextForIntent = parseConstraintsFromText(userIntent);
         const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
         
-        // Merge LLM facets with variant constraints (variant constraints take precedence)
+        // Merge LLM facets with variant constraints (variant constraints take precedence - explicit user selection wins)
         hardFacets = {
           size: variantConstraintsForIntent.size || intent.hardFacets?.size || null,
           color: variantConstraintsForIntent.color || intent.hardFacets?.color || null,
@@ -2947,27 +2975,48 @@ async function processSessionInBackground({
         };
         
         // Convert LLM bundle structure to existing format
+        const isValidBundle = intent.isBundle === true && Array.isArray(intent.bundleItems) && intent.bundleItems.length >= 2;
         bundleIntent = {
-          isBundle: intent.isBundle || false,
-          items: intent.bundleItems?.map(item => ({
-            hardTerms: item.hardTerms || [],
-            quantity: item.quantity || 1,
-            constraints: item.constraints
-          })) || [],
-          totalBudget: intent.totalBudget || null,
-          totalBudgetCurrency: intent.totalBudgetCurrency || null
+          isBundle: isValidBundle,
+          items: isValidBundle ? (intent.bundleItems || [])
+            .filter(item => item && Array.isArray(item.hardTerms) && item.hardTerms.length > 0)
+            .map(item => ({
+              hardTerms: item.hardTerms.filter((t: string) => typeof t === "string" && t.trim().length > 0),
+              quantity: typeof item.quantity === "number" && item.quantity > 0 ? item.quantity : 1,
+              constraints: item.constraints && typeof item.constraints === "object" ? item.constraints : undefined
+            })) : [],
+          totalBudget: typeof intent.totalBudget === "number" && intent.totalBudget > 0 ? intent.totalBudget : null,
+          totalBudgetCurrency: typeof intent.totalBudgetCurrency === "string" ? intent.totalBudgetCurrency : null
         };
         
+        // If bundle validation failed, ensure isBundle is false
+        if (bundleIntent.isBundle && bundleIntent.items.length < 2) {
+          bundleIntent.isBundle = false;
+          bundleIntent.items = [];
+          console.log("[Intent Parsing] ⚠️  Bundle validation failed: less than 2 valid items, treating as single item");
+        }
+        
         // Merge preferences into softTerms if not already present
-        if (intent.preferences && intent.preferences.length > 0) {
+        if (Array.isArray(intent.preferences) && intent.preferences.length > 0) {
           for (const pref of intent.preferences) {
-            if (!softTerms.includes(pref) && !hardTerms.includes(pref)) {
-              softTerms.push(pref);
+            if (typeof pref === "string" && pref.trim().length > 0) {
+              const normalizedPref = pref.trim();
+              if (!softTerms.includes(normalizedPref) && !hardTerms.includes(normalizedPref)) {
+                softTerms.push(normalizedPref);
+              }
             }
           }
         }
         
-        console.log("[Intent Parsing] ✅ Using LLM-parsed intent (industry-agnostic)");
+        console.log("[Intent Parsing] ✅ Using LLM-parsed intent (industry-agnostic)", {
+          isBundle: bundleIntent.isBundle,
+          bundleItemsCount: bundleIntent.items.length,
+          hardTermsCount: hardTerms.length,
+          softTermsCount: softTerms.length,
+          avoidTermsCount: avoidTerms.length,
+          preferencesCount: intent.preferences?.length || 0,
+          explicitSelectionsWin: true // Log that explicit user selections take precedence
+        });
       } else {
         // Fallback to pattern-based parsing
         console.log("[Intent Parsing] ⚠️  LLM parsing failed, using pattern-based fallback:", llmIntentResult.error || "unknown error");

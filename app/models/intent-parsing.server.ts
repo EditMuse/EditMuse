@@ -95,7 +95,8 @@ function buildIntentSchema() {
               description: "Product terms for this bundle item (e.g., ['suit'], ['laptop'], ['sofa']). Industry-agnostic - works for any product type."
             },
             quantity: {
-              type: "number",
+              type: "integer",
+              minimum: 1,
               description: "Quantity requested for this item (default: 1)"
             },
             constraints: {
@@ -108,16 +109,18 @@ function buildIntentSchema() {
                     color: { type: ["string", "null"] },
                     material: { type: ["string", "null"] }
                   },
+                  required: ["size", "color", "material"],
                   additionalProperties: false
                 },
                 priceCeiling: { type: ["number", "null"] },
                 includeTerms: { type: "array", items: { type: "string" } },
                 excludeTerms: { type: "array", items: { type: "string" } }
               },
+              required: ["optionConstraints", "priceCeiling", "includeTerms", "excludeTerms"],
               additionalProperties: false
             }
           },
-          required: ["hardTerms", "quantity"],
+          required: ["hardTerms", "quantity", "constraints"],
           additionalProperties: false
         },
         description: "Array of bundle items (only populated if isBundle is true)"
@@ -136,7 +139,7 @@ function buildIntentSchema() {
         description: "Style or preference terms that guide selection but aren't hard requirements (e.g., 'plain', 'wireless', 'organic', 'eco-friendly')"
       }
     },
-    required: ["isBundle", "hardTerms", "softTerms", "avoidTerms", "hardFacets"],
+    required: ["isBundle", "hardTerms", "softTerms", "avoidTerms", "hardFacets", "bundleItems", "totalBudget", "totalBudgetCurrency", "preferences"],
     additionalProperties: false
   };
 }
@@ -161,31 +164,70 @@ export async function parseIntentWithLLM(
   const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
 
   // Build system prompt for intent understanding
-  const systemPrompt = `You are an expert at understanding user shopping queries and extracting structured intent.
+  const systemPrompt = `You are an expert at understanding user shopping queries and extracting structured intent. You work for ANY industry (fashion, electronics, home goods, beauty, health, automotive, food, sports, etc.).
 
 Your task is to analyze the user's query and extract:
-1. **Hard Terms**: Concrete, searchable product terms and attributes (e.g., "blue", "shirt", "laptop", "sofa", "cotton", "wireless", "large")
-2. **Soft Terms**: Abstract concepts, context, or style preferences (e.g., "formal", "casual", "work", "wedding", "eco-friendly")
-3. **Avoid Terms**: Things the user wants to exclude (e.g., "no prints", "avoid plastic", "not red", "without batteries")
+1. **Hard Terms**: Concrete, searchable product terms and attributes (e.g., "blue", "shirt", "laptop", "sofa", "cotton", "wireless", "large", "organic", "rechargeable")
+2. **Soft Terms**: Abstract concepts, context, or style preferences (e.g., "formal", "casual", "work", "wedding", "eco-friendly", "comfortable", "stylish")
+3. **Avoid Terms**: Things the user wants to exclude (e.g., "no prints", "avoid plastic", "not red", "without batteries", "no floral", "don't want X")
 4. **Hard Facets**: Specific size, color, or material constraints if mentioned (works for any industry)
-5. **Bundle Detection**: Whether the user wants multiple distinct items (e.g., "laptop and mouse", "sofa and table", "suit and shirt") vs a single item
-6. **Preferences**: Style or feature preferences that guide selection (e.g., "plain", "wireless", "organic", "rechargeable", "waterproof")
+5. **Bundle Detection**: Whether the user wants MULTIPLE DISTINCT products (e.g., "laptop and mouse", "sofa and table", "suit and shirt") vs a single item
+6. **Preferences**: Style or feature preferences that guide selection (e.g., "plain", "wireless", "organic", "rechargeable", "waterproof", "eco-friendly")
 
-**Critical Rules:**
-1. **Product vs Preference**: "i want plain" = preference for plain style, NOT a product. "plain shirt" = product with "plain" attribute. "i want wireless" = preference, "wireless headphones" = product.
-2. **Avoid Terms**: "no X", "avoid X", "not X", "without X" → extract X to avoidTerms (works for any industry)
-3. **Bundle Detection**: Only true if user wants MULTIPLE DISTINCT products (e.g., "laptop and mouse", "sofa and chair", "suit and shirt"). Single item with preferences is NOT a bundle.
+**CRITICAL RULES (MUST FOLLOW):**
+1. **Product vs Preference**: 
+   - "i want plain" = preference ["plain"], NOT a product
+   - "plain shirt" = product with hardTerms ["plain", "shirt"]
+   - "i want wireless" = preference ["wireless"]
+   - "wireless headphones" = product with hardTerms ["wireless", "headphones"]
+   - "i want it plain" = preference ["plain"], NOT a product
+   - "i need organic" = preference ["organic"]
+   - "organic face cream" = product with hardTerms ["organic", "face", "cream"]
+
+2. **Avoid Terms Extraction**:
+   - "no X", "avoid X", "not X", "without X", "don't want X", "exclude X" → extract X to avoidTerms
+   - "no prints or floral" → avoidTerms: ["prints", "floral"]
+   - "not red" → avoidTerms: ["red"]
+   - "without parabens" → avoidTerms: ["parabens"]
+   - Works for ANY industry
+
+3. **Bundle Detection (STRICT)**:
+   - ONLY true if user wants MULTIPLE DISTINCT products
+   - "laptop and mouse" → isBundle: true (2 products)
+   - "sofa and chair" → isBundle: true (2 products)
+   - "suit, shirt and trousers" → isBundle: true (3 products)
+   - "blue shirt, no prints, i want plain" → isBundle: false (single item with preferences/constraints)
+   - "i want a blue shirt, no floral or print, i want it plain" → isBundle: false (single item)
+   - "outfit" or "set" alone → isBundle: false (abstract collection term, not multiple distinct items)
+   - Single item with multiple preferences/constraints is NOT a bundle
+
 4. **Exact Terms**: Extract terms exactly as user wrote them - NO synonym expansion, NO assumptions, NO industry-specific knowledge
-5. **Industry Agnostic**: Work for ANY industry (fashion, electronics, home goods, beauty, health, automotive, etc.) - do NOT hardcode categories or assume any specific industry
+
+5. **Industry Agnostic**: Work for ANY industry - do NOT hardcode categories or assume any specific industry
+
 6. **Context Awareness**: Use conversation history to understand context (e.g., follow-up questions)
 
-**Examples (diverse industries):**
-- Fashion: "Blue shirt but no prints or floral, i want plain" → isBundle: false, hardTerms: ["blue", "shirt"], avoidTerms: ["prints", "floral"], preferences: ["plain"]
-- Electronics: "Wireless headphones under $100" → isBundle: false, hardTerms: ["wireless", "headphones"], totalBudget: 100, preferences: ["wireless"]
-- Home: "Sofa and coffee table" → isBundle: true, bundleItems: [{"hardTerms": ["sofa"]}, {"hardTerms": ["coffee", "table"]}]
-- Beauty: "Organic face cream without parabens" → isBundle: false, hardTerms: ["organic", "face", "cream"], avoidTerms: ["parabens"], preferences: ["organic"]
+**EXAMPLES (diverse industries and query types):**
+- Fashion Single: "Blue shirt but no prints or floral, i want plain" → isBundle: false, hardTerms: ["blue", "shirt"], avoidTerms: ["prints", "floral"], preferences: ["plain"]
+- Fashion Single: "i want a blue shirt, no floral or print, i want it plain" → isBundle: false, hardTerms: ["blue", "shirt"], avoidTerms: ["floral", "print"], preferences: ["plain"]
+- Electronics Single: "Wireless headphones under $100" → isBundle: false, hardTerms: ["wireless", "headphones"], totalBudget: 100, preferences: ["wireless"]
+- Electronics Single: "I need a laptop for work" → isBundle: false, hardTerms: ["laptop"], softTerms: ["work"]
+- Home Single: "Comfortable sofa in gray" → isBundle: false, hardTerms: ["sofa"], softTerms: ["comfortable"], hardFacets: {color: "gray", size: null, material: null}
+- Home Bundle: "Sofa and coffee table" → isBundle: true, bundleItems: [{"hardTerms": ["sofa"]}, {"hardTerms": ["coffee", "table"]}]
+- Beauty Single: "Organic face cream without parabens" → isBundle: false, hardTerms: ["organic", "face", "cream"], avoidTerms: ["parabens"], preferences: ["organic"]
 - Fashion Bundle: "Suit, shirt and trousers for $500" → isBundle: true, bundleItems: [{"hardTerms": ["suit"]}, {"hardTerms": ["shirt"]}, {"hardTerms": ["trousers"]}], totalBudget: 500
-- Electronics Bundle: "Laptop, mouse and keyboard" → isBundle: true, bundleItems: [{"hardTerms": ["laptop"]}, {"hardTerms": ["mouse"]}, {"hardTerms": ["keyboard"]}]`;
+- Electronics Bundle: "Laptop, mouse and keyboard" → isBundle: true, bundleItems: [{"hardTerms": ["laptop"]}, {"hardTerms": ["mouse"]}, {"hardTerms": ["keyboard"]}]
+- Health Bundle: "Protein powder and shaker bottle" → isBundle: true, bundleItems: [{"hardTerms": ["protein", "powder"]}, {"hardTerms": ["shaker", "bottle"]}]
+- Sports Bundle: "Running shoes and workout clothes" → isBundle: true, bundleItems: [{"hardTerms": ["running", "shoes"]}, {"hardTerms": ["workout", "clothes"]}]
+- Food Single: "Organic coffee beans" → isBundle: false, hardTerms: ["organic", "coffee", "beans"], preferences: ["organic"]
+- Automotive Single: "Car phone mount" → isBundle: false, hardTerms: ["car", "phone", "mount"]
+
+**OUTPUT REQUIREMENTS:**
+- Always return valid JSON matching the schema exactly
+- All arrays must be arrays (even if empty)
+- All objects must have required fields (can be null)
+- Bundle items only populated if isBundle is true
+- Preferences array can be empty if none detected`;
 
   // Build messages array
   const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
@@ -257,28 +299,34 @@ Your task is to analyze the user's query and extract:
     const data = await response.json();
     const message = data.choices?.[0]?.message;
     
-    if (!message || !message.content) {
-      return {
-        success: false,
-        error: "No message content in response",
-        fallbackUsed: true
-      };
-    }
-
-    // Parse JSON from message.content
+    // Try to use parsed output first (if available from structured outputs)
     let parsedIntent: ParsedIntent;
-    try {
-      parsedIntent = JSON.parse(message.content);
-    } catch (parseError) {
-      console.warn("[Intent Parsing] JSON parse error:", parseError);
+    if (message?.parsed) {
+      // Use parsed output directly (structured outputs with strict schema)
+      parsedIntent = message.parsed as ParsedIntent;
+      console.log("[Intent Parsing] structured_outputs=true (using parsed output)");
+    } else if (message?.content) {
+      // Fallback to parsing JSON from content
+      try {
+        parsedIntent = JSON.parse(message.content);
+        console.log("[Intent Parsing] structured_outputs=true (parsed from content)");
+      } catch (parseError) {
+        console.warn("[Intent Parsing] JSON parse error:", parseError);
+        return {
+          success: false,
+          error: "Failed to parse JSON response",
+          fallbackUsed: true
+        };
+      }
+    } else {
       return {
         success: false,
-        error: "Failed to parse JSON response",
+        error: "No message content or parsed output in response",
         fallbackUsed: true
       };
     }
 
-    // Validate required fields
+    // Validate and normalize required fields
     if (!parsedIntent.hardTerms || !Array.isArray(parsedIntent.hardTerms)) {
       parsedIntent.hardTerms = [];
     }
@@ -288,18 +336,81 @@ Your task is to analyze the user's query and extract:
     if (!parsedIntent.avoidTerms || !Array.isArray(parsedIntent.avoidTerms)) {
       parsedIntent.avoidTerms = [];
     }
-    if (!parsedIntent.hardFacets) {
+    if (!parsedIntent.hardFacets || typeof parsedIntent.hardFacets !== "object") {
       parsedIntent.hardFacets = { size: null, color: null, material: null };
+    } else {
+      // Ensure all required fields exist
+      if (typeof parsedIntent.hardFacets.size !== "string" && parsedIntent.hardFacets.size !== null) {
+        parsedIntent.hardFacets.size = null;
+      }
+      if (typeof parsedIntent.hardFacets.color !== "string" && parsedIntent.hardFacets.color !== null) {
+        parsedIntent.hardFacets.color = null;
+      }
+      if (typeof parsedIntent.hardFacets.material !== "string" && parsedIntent.hardFacets.material !== null) {
+        parsedIntent.hardFacets.material = null;
+      }
     }
-    if (parsedIntent.isBundle && (!parsedIntent.bundleItems || !Array.isArray(parsedIntent.bundleItems))) {
+    
+    // Validate bundle structure
+    if (parsedIntent.isBundle === true) {
+      if (!parsedIntent.bundleItems || !Array.isArray(parsedIntent.bundleItems)) {
+        parsedIntent.bundleItems = [];
+      }
+      // Validate each bundle item
+      parsedIntent.bundleItems = parsedIntent.bundleItems
+        .filter(item => item && typeof item === "object")
+        .map(item => ({
+          hardTerms: Array.isArray(item.hardTerms) ? item.hardTerms.filter(t => typeof t === "string") : [],
+          quantity: typeof item.quantity === "number" && item.quantity > 0 ? item.quantity : 1,
+          constraints: item.constraints && typeof item.constraints === "object" ? {
+            optionConstraints: item.constraints.optionConstraints && typeof item.constraints.optionConstraints === "object" ? {
+              size: typeof item.constraints.optionConstraints.size === "string" ? item.constraints.optionConstraints.size : null,
+              color: typeof item.constraints.optionConstraints.color === "string" ? item.constraints.optionConstraints.color : null,
+              material: typeof item.constraints.optionConstraints.material === "string" ? item.constraints.optionConstraints.material : null
+            } : undefined,
+            priceCeiling: typeof item.constraints.priceCeiling === "number" ? item.constraints.priceCeiling : null,
+            includeTerms: Array.isArray(item.constraints.includeTerms) ? item.constraints.includeTerms.filter(t => typeof t === "string") : undefined,
+            excludeTerms: Array.isArray(item.constraints.excludeTerms) ? item.constraints.excludeTerms.filter(t => typeof t === "string") : undefined
+          } : undefined
+        }))
+        .filter(item => item.hardTerms.length > 0); // Remove items with no hard terms
+      
+      // If bundle has less than 2 valid items, it's not a bundle
+      if (parsedIntent.bundleItems.length < 2) {
+        parsedIntent.isBundle = false;
+        parsedIntent.bundleItems = [];
+      }
+    } else {
       parsedIntent.bundleItems = [];
     }
+    
+    // Validate preferences
+    if (!parsedIntent.preferences || !Array.isArray(parsedIntent.preferences)) {
+      parsedIntent.preferences = [];
+    }
+    
+    // Validate budget
+    if (parsedIntent.totalBudget !== null && (typeof parsedIntent.totalBudget !== "number" || parsedIntent.totalBudget <= 0)) {
+      parsedIntent.totalBudget = null;
+    }
+    if (parsedIntent.totalBudgetCurrency !== null && typeof parsedIntent.totalBudgetCurrency !== "string") {
+      parsedIntent.totalBudgetCurrency = null;
+    }
+    
+    // Normalize string arrays (remove empty strings, trim)
+    parsedIntent.hardTerms = parsedIntent.hardTerms.filter(t => typeof t === "string" && t.trim().length > 0).map(t => t.trim());
+    parsedIntent.softTerms = parsedIntent.softTerms.filter(t => typeof t === "string" && t.trim().length > 0).map(t => t.trim());
+    parsedIntent.avoidTerms = parsedIntent.avoidTerms.filter(t => typeof t === "string" && t.trim().length > 0).map(t => t.trim());
+    parsedIntent.preferences = parsedIntent.preferences.filter(t => typeof t === "string" && t.trim().length > 0).map(t => t.trim());
 
     console.log("[Intent Parsing] ✅ LLM parsed intent:", {
       isBundle: parsedIntent.isBundle,
       hardTermsCount: parsedIntent.hardTerms.length,
+      softTermsCount: parsedIntent.softTerms.length,
       avoidTermsCount: parsedIntent.avoidTerms.length,
-      preferencesCount: parsedIntent.preferences?.length || 0
+      preferencesCount: parsedIntent.preferences.length,
+      bundleItemsCount: parsedIntent.bundleItems?.length || 0,
+      totalBudget: parsedIntent.totalBudget
     });
 
     return {

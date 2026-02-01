@@ -14,6 +14,7 @@
 
 import crypto from "crypto";
 import prisma from "~/db.server";
+import OpenAI from "openai";
 
 interface ProductCandidate {
   handle: string;
@@ -240,9 +241,8 @@ class JSONParseError extends Error {
 }
 
 /**
- * Parses structured ranking JSON from OpenAI response content
- * Handles markdown fences, extracts JSON object, removes trailing commas, and parses
- * @throws {JSONParseError} if parsing fails
+ * @deprecated This function is no longer used. We now use OpenAI SDK structured parsing (message.parsed).
+ * Kept for backward compatibility fallback only.
  */
 function parseStructuredRanking(content: string): StructuredRankingResult | StructuredBundleResult {
   if (!content || typeof content !== "string") {
@@ -1633,7 +1633,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             },
           },
           temperature: 0,
-          max_tokens: 700,
+          max_tokens: isBundle ? 1200 : 700,
         };
         
         console.log("[AI Ranking] structured_outputs=true");
@@ -1644,119 +1644,81 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           model,
           messages,
           temperature: 0,
-          max_tokens: 700,
+          max_tokens: isBundle ? 1200 : 700,
           response_format: { type: "json_object" },
         };
         console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
       }
 
-      // Use Chat Completions API only (no /v1/responses endpoint)
-      let response: Response;
+      // Use OpenAI SDK for structured parsing with strict JSON schema
+      const openai = new OpenAI({
+        apiKey: apiKey,
+        timeout: timeoutMs,
+      });
+
+      let completion: OpenAI.Chat.Completions.ChatCompletion;
       try {
-        response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          signal: controller.signal,
-          body: JSON.stringify(requestBody),
+        // Use chat.completions.create with structured outputs
+        completion = await openai.chat.completions.create({
+          model: model,
+          messages: messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+          response_format: supportsJsonSchema ? {
+            type: "json_schema",
+            json_schema: {
+              name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
+              strict: true,
+              schema: buildJsonSchema(isBundle),
+            },
+          } : { type: "json_object" },
+          temperature: 0,
+          max_tokens: isBundle ? 1200 : 700,
         });
-      } catch (fetchError: any) {
-        // Handle fetch errors (network, abort, timeout)
+      } catch (sdkError: any) {
         clearTimeout(timeoutId);
-        if (fetchError.name === "AbortError" || controller.signal.aborted) {
-          // Timeout occurred - don't try to parse response
+        
+        // Handle timeout/abort
+        if (sdkError.name === "AbortError" || controller.signal.aborted || sdkError.message?.includes("timeout")) {
           lastError = new Error(`Request timeout after ${timeoutMs}ms`);
           lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
           responseStatus = null;
           responseId = null;
           continue; // Try again if retries remaining
         }
-        // Re-throw other fetch errors to be handled by outer catch
-        throw fetchError;
+        
+        // Handle API errors
+        if (sdkError.status) {
+          responseStatus = sdkError.status;
+          responseId = sdkError.request_id || null;
+          const errorType = sdkError.type || null;
+          const errorCode = sdkError.code || null;
+          let failReason = `HTTP ${responseStatus}`;
+          if (errorType) failReason += ` ${errorType}`;
+          if (errorCode) failReason += ` (${errorCode})`;
+          
+          console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus, "fail_type=http fail_reason=", failReason, responseId ? `response_id=${responseId}` : "");
+          lastError = sdkError;
+          lastParseFailReason = failReason;
+          continue; // Try again if retries remaining
+        }
+        
+        // Re-throw other errors
+        throw sdkError;
       }
 
       clearTimeout(timeoutId);
-
-      // Extract response metadata before consuming body
-      responseStatus = response.status;
-      responseId = response.headers.get("x-request-id") || response.headers.get("openai-request-id") || null;
       
-      if (!response.ok) {
-        let errorData: any = null;
-        try {
-          const errorText = await response.text();
-          // Try to parse error JSON if possible (no PII expected)
-          try {
-            errorData = JSON.parse(errorText);
-          } catch {
-            // Keep as text if not JSON
-            errorData = { raw: errorText.substring(0, 200) }; // Truncate for safety
-          }
-        } catch {
-          // Ignore errors reading response body
-        }
-        
-        // Extract error type/code from response if available
-        const errorType = errorData?.error?.type || errorData?.type || null;
-        const errorCode = errorData?.error?.code || errorData?.code || null;
-        
-        // Determine fail reason (short description, no PII)
-        let failReason = `HTTP ${responseStatus}`;
-        if (errorType) failReason += ` ${errorType}`;
-        if (errorCode) failReason += ` (${errorCode})`;
-        
-        // Structured error log
-        const logData: any = {
-          attempt: attempt + 1,
-          status: responseStatus,
-          fail_type: "http",
-          fail_reason: failReason,
-        };
-        if (responseId) logData.response_id = responseId;
-        if (errorType) logData.error_type = errorType;
-        if (errorCode) logData.error_code = errorCode;
-        console.log("[AI Ranking] attempt=", logData.attempt, "status=", logData.status, "fail_type=", logData.fail_type, "fail_reason=", logData.fail_reason, responseId ? `response_id=${responseId}` : "");
-        
-        lastError = new Error(`OpenAI API error: ${responseStatus}`);
-        lastParseFailReason = failReason;
-        continue; // Try again if retries remaining
-      }
-
-      // Parse response JSON - handle potential timeout/incomplete responses
-      let data: any;
-      try {
-        const responseText = await response.text();
-        if (!responseText || responseText.trim() === "") {
-          throw new Error("Empty response body");
-        }
-        data = JSON.parse(responseText);
-      } catch (parseError: any) {
-        // If parsing fails, check if it was due to timeout/abort
-        if (controller.signal.aborted) {
-          lastError = new Error(`Request timeout after ${timeoutMs}ms`);
-          lastParseFailReason = `Request timeout after ${timeoutMs}ms`;
-          responseStatus = null;
-          responseId = null;
-          continue; // Try again if retries remaining
-        }
-        // Re-throw parse errors to be handled by outer catch
-        throw new Error(`Failed to parse response: ${parseError.message || String(parseError)}`);
-      }
+      // Extract response metadata
+      responseStatus = 200; // SDK handles HTTP, assume success if we got here
+      responseId = completion.id || null;
+      bodyResponseId = completion.id || null;
       
-      // Extract response ID from response body if present (OpenAI sometimes includes this)
-      bodyResponseId = data.id || data.request_id || null;
-      
-      // Parse structured output from Chat Completions API
-      // For json_schema mode with strict:true, the response is in choices[0].message.content as a JSON string
-      // We parse it directly - do NOT reference message.parsed or data.output_parsed (SDK helpers, not in raw fetch)
+      // Parse structured output from SDK
+      // With strict JSON schema, the SDK provides parsed output in message.parsed
       let structuredResult: StructuredRankingResult | StructuredBundleResult | null = null;
       
-      // Chat Completions API: extract message from choices[0].message
-      const message = data.choices?.[0]?.message;
+      const message = completion.choices?.[0]?.message;
       if (!message) {
-        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        const parseResponseId = completion.id || responseId || bodyResponseId || null;
         console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=No message in choices", parseResponseId ? `response_id=${parseResponseId}` : "");
         lastError = new Error("No message in choices array");
         lastParseFailReason = "No message in choices array";
@@ -1765,7 +1727,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       
       // Check for refusal
       if (message.refusal) {
-        const refusalResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        const refusalResponseId = completion.id || responseId || bodyResponseId || null;
         console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Model refusal", refusalResponseId ? `response_id=${refusalResponseId}` : "");
         console.log("[AI Ranking] Model refused to generate structured output");
         lastError = new Error("Model refused to generate structured output");
@@ -1773,21 +1735,21 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         continue; // Try again if retries remaining
       }
 
-      // Parse from message.content (always a string with json_schema strict mode)
+      // Use parsed output from SDK (structured outputs with strict schema)
+      // With strict JSON schema, parse message.content directly (strict schema guarantees valid JSON, no repair needed)
       if (message.content && typeof message.content === "string") {
+        // Parse content directly - strict schema guarantees valid JSON
         try {
-          structuredResult = parseStructuredRanking(message.content);
-          // Success - log with proper format
+          structuredResult = JSON.parse(message.content) as StructuredRankingResult | StructuredBundleResult;
           console.log("[AI Ranking] structured_outputs=true api=chat_completions parsed_from=message.content");
         } catch (parseError) {
-          // Parse failed - log first 300 chars of content (redact product data if needed)
+          // Parse failed - this should be very rare with strict schema
           const contentPreview = message.content.substring(0, 300);
-          // Redact potential product data (handles, titles) - simple heuristic
           const redactedPreview = contentPreview
             .replace(/"handle"\s*:\s*"[^"]+"/gi, '"handle":"[REDACTED]"')
             .replace(/"title"\s*:\s*"[^"]+"/gi, '"title":"[REDACTED]"');
           
-          console.warn("[AI Ranking] Failed to parse json_schema content:", parseError instanceof Error ? parseError.message : String(parseError));
+          console.warn("[AI Ranking] Failed to parse json_schema content (unexpected with strict schema):", parseError instanceof Error ? parseError.message : String(parseError));
           console.log("[AI Ranking] Content preview (first 300 chars):", redactedPreview);
           
           lastError = parseError instanceof Error ? parseError : new Error(String(parseError));
@@ -1802,18 +1764,17 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           continue; // This will eventually fallback after MAX_RETRIES
         }
       } else {
-        // message.content is missing or not a string
-        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
-        const contentType = message.content ? typeof message.content : "missing";
-        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=message.content is not a string (type: " + contentType + ")", parseResponseId ? `response_id=${parseResponseId}` : "");
-        lastError = new Error(`message.content is not a string (type: ${contentType})`);
-        lastParseFailReason = `message.content is not a string (type: ${contentType})`;
+        // message.parsed and message.content are both missing - this should be very rare with strict schema
+        const parseResponseId = bodyResponseId || responseId || null;
+        console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=No parsed output or content in message", parseResponseId ? `response_id=${parseResponseId}` : "");
+        lastError = new Error("No parsed output or content in message");
+        lastParseFailReason = "No parsed output or content in message";
         continue;
       }
 
       // If we still don't have a structured result, this is an error
       if (!structuredResult) {
-        const parseResponseId = data.id || data.request_id || responseId || bodyResponseId || null;
+        const parseResponseId = bodyResponseId || responseId || null;
         console.log("[AI Ranking] attempt=", attempt + 1, "status=", responseStatus || "unknown", "fail_type=parse fail_reason=Failed to parse structured output", parseResponseId ? `response_id=${parseResponseId}` : "");
         lastError = new Error("Failed to parse structured output");
         lastParseFailReason = "Failed to parse structured output";
