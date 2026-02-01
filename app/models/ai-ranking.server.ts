@@ -1633,7 +1633,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             },
           },
           temperature: 0,
-          max_tokens: isBundle ? 1200 : 700,
+          max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
         };
         
         console.log("[AI Ranking] structured_outputs=true");
@@ -1644,7 +1644,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           model,
           messages,
           temperature: 0,
-          max_tokens: isBundle ? 1200 : 700,
+          max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
           response_format: { type: "json_object" },
         };
         console.warn("[AI Ranking] Model does not support json_schema, falling back to json_object mode");
@@ -1656,23 +1656,26 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         timeout: timeoutMs,
       });
 
+      // Build SDK request parameters (matching requestBody for logging consistency)
+      const sdkRequestParams = {
+        model: model,
+        messages: messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+        response_format: supportsJsonSchema ? {
+          type: "json_schema" as const,
+          json_schema: {
+            name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
+            strict: true,
+            schema: buildJsonSchema(isBundle),
+          },
+        } : { type: "json_object" as const },
+        temperature: 0,
+        max_tokens: 1200, // Increased to 1200 for all ranking to reduce truncation risk
+      };
+
       let completion: OpenAI.Chat.Completions.ChatCompletion;
       try {
         // Use chat.completions.create with structured outputs
-        completion = await openai.chat.completions.create({
-          model: model,
-          messages: messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-          response_format: supportsJsonSchema ? {
-            type: "json_schema",
-            json_schema: {
-              name: isBundle ? "structured_bundle_result" : "structured_ranking_result",
-              strict: true,
-              schema: buildJsonSchema(isBundle),
-            },
-          } : { type: "json_object" },
-          temperature: 0,
-          max_tokens: isBundle ? 1200 : 700,
-        });
+        completion = await openai.chat.completions.create(sdkRequestParams);
       } catch (sdkError: any) {
         clearTimeout(timeoutId);
         
@@ -1736,14 +1739,25 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       }
 
       // Use parsed output from SDK (structured outputs with strict schema)
-      // With strict JSON schema, parse message.content directly (strict schema guarantees valid JSON, no repair needed)
-      if (message.content && typeof message.content === "string") {
-        // Parse content directly - strict schema guarantees valid JSON
+      // With strict JSON schema, the SDK provides parsed output in message.parsed
+      // Access parsed property (may not be in TypeScript types but exists at runtime with structured outputs)
+      const messageWithParsed = message as any; // Type assertion to access parsed property
+      
+      if (messageWithParsed.parsed) {
+        // SDK provides parsed output directly (structured outputs with strict schema)
+        structuredResult = messageWithParsed.parsed as StructuredRankingResult | StructuredBundleResult;
+        console.log("[AI Ranking] structured_outputs=true");
+        console.log("[AI Ranking] parsed_output=true");
+      } else if (message.content && typeof message.content === "string") {
+        // Fallback: if parsed is not available, parse content directly
+        // Strict schema guarantees valid JSON, so simple JSON.parse should work
         try {
           structuredResult = JSON.parse(message.content) as StructuredRankingResult | StructuredBundleResult;
-          console.log("[AI Ranking] structured_outputs=true api=chat_completions parsed_from=message.content");
+          console.log("[AI Ranking] structured_outputs=true");
+          console.log("[AI Ranking] parsed_output=false (using JSON.parse fallback)");
         } catch (parseError) {
           // Parse failed - this should be very rare with strict schema
+          // This indicates a serious issue with the API response
           const contentPreview = message.content.substring(0, 300);
           const redactedPreview = contentPreview
             .replace(/"handle"\s*:\s*"[^"]+"/gi, '"handle":"[REDACTED]"')
@@ -2170,6 +2184,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       const errorParam = error?.param || error?.error?.param || null;
       
       // Get request payload keys for debugging (without logging full content)
+      // Use requestBody for logging (built above, matches SDK request)
       const requestPayloadKeys = requestBody ? Object.keys(requestBody) : [];
       const responseFormatKeys = requestBody?.response_format ? Object.keys(requestBody.response_format) : [];
       
