@@ -85,6 +85,85 @@ function normalizeGroupKey(key: string): string {
 }
 
 /**
+ * Derive a coarse family key from a product (industry-agnostic)
+ * Uses productType/category/collections/title/vendor with generic stopword removal
+ */
+function deriveFamilyKey(candidate: any): { key: string; source: "productType" | "category" | "title" | "vendor" | "unknown" } {
+  // Base: productType > category > collections[0] > vendor > title
+  let base = "";
+  let source: "productType" | "category" | "title" | "vendor" | "unknown" = "unknown";
+  
+  if (candidate.productType && typeof candidate.productType === "string") {
+    base = candidate.productType;
+    source = "productType";
+  } else if (candidate.product_type && typeof candidate.product_type === "string") {
+    base = candidate.product_type;
+    source = "productType";
+  } else if (candidate.category && typeof candidate.category === "string") {
+    base = candidate.category;
+    source = "category";
+  } else if (candidate.collections && Array.isArray(candidate.collections) && candidate.collections.length > 0) {
+    const firstColl = candidate.collections[0];
+    base = typeof firstColl === "string" ? firstColl : (firstColl.title || firstColl.handle || "");
+    source = "category";
+  } else if (candidate.vendor && typeof candidate.vendor === "string") {
+    base = candidate.vendor;
+    source = "vendor";
+  } else if (candidate.title && typeof candidate.title === "string") {
+    base = candidate.title;
+    source = "title";
+  }
+  
+  if (!base || base.trim().length === 0) {
+    return { key: "unknown", source: "unknown" };
+  }
+  
+  // Normalize: lowercase, replace non-alphanum with space, collapse whitespace
+  let normalized = base.toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  
+  // Generic stopwords (NOT category nouns - industry-agnostic)
+  const stopwords = new Set([
+    "new", "sale", "best", "top", "premium", "classic", "basic", "limited", "edition", "bundle", "set", "pack",
+    "mens", "men", "women", "womens", "kids", "child", "unisex",
+    "small", "medium", "large", "xl", "xxl", "xxxl", "one", "size",
+    "and", "or", "for", "with", "without", "the", "a", "an", "of",
+    "cotton", "satin", "silk", "poly", "polyester", "linen", "leather", "wool", "denim",
+    "red", "blue", "black", "white", "green", "yellow", "pink", "grey", "gray", "brown", "beige", "navy",
+    "print", "printed", "plain", "striped", "floral", "pattern", "patterns"
+  ]);
+  
+  // Split into tokens, filter stopwords, numbers, and short tokens
+  const tokens = normalized.split(/\s+/)
+    .filter(t => {
+      const cleaned = t.trim();
+      return cleaned.length > 2 && 
+             !stopwords.has(cleaned) && 
+             !/^\d+$/.test(cleaned); // Drop pure numbers
+    });
+  
+  if (tokens.length === 0) {
+    return { key: "unknown", source: "unknown" };
+  }
+  
+  // Family key selection (generic heuristic):
+  // Prefer last token, else prefer longest token, else first token
+  let familyKey = tokens[tokens.length - 1]; // Last token
+  
+  // If last token is too short or common, try longest
+  if (familyKey.length < 4) {
+    const longest = tokens.reduce((a, b) => a.length > b.length ? a : b);
+    if (longest.length >= 4) {
+      familyKey = longest;
+    }
+  }
+  
+  return { key: familyKey, source };
+}
+
+/**
  * Assign a group key to a product (industry-agnostic, coarse grouping)
  * Strict priority: productType > collection > vendor > "unknown"
  * DO NOT derive from title/tags noun phrases
@@ -4616,43 +4695,45 @@ async function processSessionInBackground({
       let topCandidates: EnrichedCandidate[];
       
       if (collectionIntent && !bundleIntent.isBundle) {
-        // Assign group keys to all ranked candidates
-        const candidatesWithGroups = rankedCandidates.map(r => {
-          const groupInfo = assignGroupKey(r.candidate);
+        // ============================================
+        // FAMILY-BASED GROUPING (coarse, industry-agnostic)
+        // ============================================
+        // Derive family keys for all ranked candidates
+        const candidatesWithFamilies = rankedCandidates.map(r => {
+          const familyInfo = deriveFamilyKey(r.candidate);
           return {
             ...r,
-            groupKey: groupInfo.key,
-            groupSource: groupInfo.source
+            familyKey: familyInfo.key,
+            familySource: familyInfo.source
           };
         });
         
-        // Log groupKey source for a few items (sample)
-        const sampleGroupSources: Record<string, number> = {};
-        candidatesWithGroups.slice(0, 10).forEach(c => {
-          sampleGroupSources[c.groupSource] = (sampleGroupSources[c.groupSource] || 0) + 1;
+        // Log familyKey source for a few items (sample)
+        const sampleFamilySources: Record<string, number> = {};
+        candidatesWithFamilies.slice(0, 10).forEach(c => {
+          sampleFamilySources[c.familySource] = (sampleFamilySources[c.familySource] || 0) + 1;
         });
-        console.log(`[CollectionIntent] groupKey_source sample=${JSON.stringify(sampleGroupSources)}`);
+        console.log(`[CollectionIntent] familyKey_source sample=${JSON.stringify(sampleFamilySources)}`);
         
-        // Build groupStats: count + top BM25 score per group
-        const groupStats = new Map<string, { count: number; topBM25: number; source: string }>();
-        candidatesWithGroups.forEach(c => {
-          const existing = groupStats.get(c.groupKey);
+        // Build groupsByFamilyKey: count + top BM25 score per family
+        const familyStats = new Map<string, { count: number; topBM25: number }>();
+        candidatesWithFamilies.forEach(c => {
+          const existing = familyStats.get(c.familyKey);
           if (!existing || c.score > existing.topBM25) {
-            groupStats.set(c.groupKey, {
+            familyStats.set(c.familyKey, {
               count: (existing?.count || 0) + 1,
-              topBM25: c.score,
-              source: c.groupSource
+              topBM25: c.score
             });
           } else {
-            groupStats.set(c.groupKey, {
+            familyStats.set(c.familyKey, {
               ...existing,
               count: existing.count + 1
             });
           }
         });
         
-        // Rank groups by (top BM25 score) first, then count
-        const rankedGroups = Array.from(groupStats.entries())
+        // Score each family: maxBM25 (or avgBM25 + count) - using maxBM25 for simplicity
+        const familyGroups = Array.from(familyStats.entries())
           .map(([key, stats]) => ({ key, ...stats }))
           .sort((a, b) => {
             // First by top BM25 score (descending)
@@ -4663,155 +4744,178 @@ async function processSessionInBackground({
             return b.count - a.count;
           });
         
-        // Filter out trivial groups (only 1-2 items)
-        const nonTrivialGroups = rankedGroups.filter(g => g.count >= 3);
+        console.log(`[CollectionIntent] family_groups=${JSON.stringify(familyGroups.slice(0, 10).map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25.toFixed(2) })))}`);
         
-        // Helper: Check if two groups are similar (substring or Jaccard similarity > 0.6)
-        function areGroupsSimilar(key1: string, key2: string): boolean {
-          // Substring check
-          if (key1.includes(key2) || key2.includes(key1)) {
-            return true;
-          }
+        // Choose up to 4 families with highest score, enforce at least 2 distinct families
+        let chosenFamilies: Array<{ key: string; count: number; topBM25: number }> = [];
+        const candidatePool = familyGroups;
+        const totalCount = candidatesWithFamilies.length;
+        
+        for (const family of candidatePool) {
+          if (chosenFamilies.length >= 4) break;
           
-          // Jaccard similarity check
-          const tokens1 = new Set(key1.split(/\s+/).filter(t => t.length > 0));
-          const tokens2 = new Set(key2.split(/\s+/).filter(t => t.length > 0));
-          
-          const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
-          const union = new Set([...tokens1, ...tokens2]);
-          
-          const jaccard = union.size > 0 ? intersection.size / union.size : 0;
-          return jaccard > 0.6;
-        }
-        
-        // Pick up to G=3 groups, enforcing distinctness
-        let chosenGroups: Array<{ key: string; count: number; topBM25: number; source: string }> = [];
-        const candidatePool = nonTrivialGroups.length > 0 ? nonTrivialGroups : rankedGroups;
-        
-        for (const group of candidatePool) {
-          if (chosenGroups.length >= 3) break;
-          
-          // Check if this group is similar to any already chosen
-          const isSimilar = chosenGroups.some(chosen => areGroupsSimilar(chosen.key, group.key));
-          
-          if (!isSimilar) {
-            chosenGroups.push(group);
-          }
-        }
-        
-        // If we don't have enough distinct groups, include all groups (fallback)
-        if (chosenGroups.length < 2) {
-          const allGroups = rankedGroups.slice(0, 2 - chosenGroups.length);
-          chosenGroups.push(...allGroups);
-        }
-        
-        // Single-family collapse detector
-        // Check if >70% of items share the same coarse family token
-        const groupKeys = chosenGroups.map(g => g.key);
-        const familyTokens = new Map<string, number>();
-        
-        candidatesWithGroups.forEach(c => {
-          if (groupKeys.includes(c.groupKey)) {
-            // Extract family token from groupKey or productType
-            const tokens = c.groupKey.split(/\s+/);
-            tokens.forEach(token => {
-              if (token.length >= 3) {
-                familyTokens.set(token, (familyTokens.get(token) || 0) + 1);
-              }
-            });
-            
-            // Also check productType
-            if (c.candidate.productType) {
-              const typeTokens = String(c.candidate.productType).toLowerCase().split(/\s+/);
-              typeTokens.forEach(token => {
-                if (token.length >= 3) {
-                  familyTokens.set(token, (familyTokens.get(token) || 0) + 1);
-                }
-              });
-            }
-          }
-        });
-        
-        const totalItems = candidatesWithGroups.filter(c => groupKeys.includes(c.groupKey)).length;
-        const dominantToken = Array.from(familyTokens.entries())
-          .sort((a, b) => b[1] - a[1])[0];
-        
-        const dominantShare = dominantToken && totalItems > 0 ? dominantToken[1] / totalItems : 0;
-        
-        if (dominantShare > 0.7 && dominantToken) {
-          console.log(`[CollectionIntent] dominant_family_detected=true token=${dominantToken[0]} share=${dominantShare.toFixed(2)}`);
-          
-          // Expand G up to 4 and force-pick the next most distinct groups
-          const remainingGroups = rankedGroups.filter(g => 
-            !chosenGroups.some(chosen => chosen.key === g.key) &&
-            !chosenGroups.some(chosen => areGroupsSimilar(chosen.key, g.key))
+          // Check if this family is similar to any already chosen (simple substring check)
+          const isSimilar = chosenFamilies.some(chosen => 
+            chosen.key.includes(family.key) || family.key.includes(chosen.key)
           );
           
-          // Force-pick groups that don't contain the dominant token
-          const distinctGroups = remainingGroups.filter(g => {
-            const groupTokens = g.key.split(/\s+/);
-            return !groupTokens.some(t => t === dominantToken[0]);
-          });
-          
-          // Add up to 4 total groups (expand from 3 to 4)
-          const toAdd = Math.min(4 - chosenGroups.length, distinctGroups.length);
-          chosenGroups.push(...distinctGroups.slice(0, toAdd));
-          
-          // If still not enough, add any remaining distinct groups
-          if (chosenGroups.length < 4) {
-            const moreDistinct = remainingGroups
-              .filter(g => !chosenGroups.some(chosen => areGroupsSimilar(chosen.key, g.key)))
-              .slice(0, 4 - chosenGroups.length);
-            chosenGroups.push(...moreDistinct);
+          if (!isSimilar) {
+            chosenFamilies.push(family);
           }
         }
         
-        // Check if catalog is limited (only one group available)
-        if (rankedGroups.length <= 1) {
-          console.log(`[CollectionIntent] limited_catalog=true reason=only_one_group_available`);
+        // If we don't have enough distinct families, include all families (fallback)
+        if (chosenFamilies.length < 2) {
+          const allFamilies = candidatePool.slice(0, 2 - chosenFamilies.length);
+          chosenFamilies.push(...allFamilies);
         }
         
-        const chosenGroupKeys = chosenGroups.map(g => g.key);
-        console.log(`[CollectionIntent] chosenGroups=${JSON.stringify(chosenGroups.map(g => ({ key: g.key, count: g.count, topBM25: g.topBM25.toFixed(2), source: g.source })))}`);
+        // ============================================
+        // DOMINANT FAMILY DETECTION (fixed calculation)
+        // ============================================
+        const dominantFamilyKey = chosenFamilies.length > 0 ? chosenFamilies[0].key : null;
+        let dominantCount = 0;
         
-        // Pick top candidates per group using BM25 scores, then interleave
-        const perGroupCandidates = new Map<string, typeof candidatesWithGroups>();
-        chosenGroupKeys.forEach(groupKey => {
-          const groupItems = candidatesWithGroups
-            .filter(c => c.groupKey === groupKey)
-            .slice(0, Math.ceil(aiWindow / chosenGroupKeys.length) + 2); // Take a few extra per group for interleaving
-          perGroupCandidates.set(groupKey, groupItems);
+        if (dominantFamilyKey) {
+          dominantCount = candidatesWithFamilies.filter(c => c.familyKey === dominantFamilyKey).length;
+        }
+        
+        const share = totalCount > 0 ? Math.min(1.0, Math.max(0.0, dominantCount / totalCount)) : 0;
+        const dominantDetected = totalCount >= 12 && share >= 0.70;
+        
+        if (dominantDetected && dominantFamilyKey) {
+          console.log(`[CollectionIntent] dominant_family_detected=true token=${dominantFamilyKey} share=${share.toFixed(2)} dominantCount=${dominantCount} total=${totalCount}`);
+          
+          // Force inclusion of at least 2 families (expand if needed)
+          const remainingFamilies = candidatePool.filter(f => 
+            !chosenFamilies.some(chosen => chosen.key === f.key) &&
+            !chosenFamilies.some(chosen => chosen.key.includes(f.key) || f.key.includes(chosen.key))
+          );
+          
+          // Force-pick families that don't match the dominant family
+          const distinctFamilies = remainingFamilies.filter(f => f.key !== dominantFamilyKey);
+          
+          // Expand to at least 2 families, up to 4
+          const toAdd = Math.min(4 - chosenFamilies.length, distinctFamilies.length);
+          chosenFamilies.push(...distinctFamilies.slice(0, toAdd));
+          
+          // If still not enough, add any remaining distinct families
+          if (chosenFamilies.length < 2) {
+            const moreDistinct = remainingFamilies.slice(0, 2 - chosenFamilies.length);
+            chosenFamilies.push(...moreDistinct);
+          }
+        } else if (dominantFamilyKey) {
+          console.log(`[CollectionIntent] dominant_family_detected=false token=${dominantFamilyKey} share=${share.toFixed(2)} dominantCount=${dominantCount} total=${totalCount}`);
+        }
+        
+        // Check if catalog is limited (only one family available)
+        if (familyGroups.length <= 1) {
+          console.log(`[CollectionIntent] limited_catalog=true reason=only_one_family_available`);
+        }
+        
+        const chosenFamilyKeys = chosenFamilies.map(f => f.key);
+        console.log(`[CollectionIntent] chosenFamilies=${JSON.stringify(chosenFamilies.map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25.toFixed(2) })))}`);
+        
+        // ============================================
+        // ROUND-ROBIN BALANCED WINDOW (30 candidates)
+        // ============================================
+        // Partition into buckets per chosen familyKey (preserve BM25 order inside each bucket)
+        const familyBuckets = new Map<string, typeof candidatesWithFamilies>();
+        chosenFamilyKeys.forEach(familyKey => {
+          const bucket = candidatesWithFamilies
+            .filter(c => c.familyKey === familyKey)
+            .slice(0, Math.ceil(aiWindow / chosenFamilyKeys.length) + 5); // Take extra for round-robin
+          familyBuckets.set(familyKey, bucket);
         });
         
-        // Interleave candidates from each group
-        const interleaved: typeof candidatesWithGroups = [];
-        const maxPerGroup = Math.ceil(aiWindow / chosenGroupKeys.length);
-        for (let i = 0; i < maxPerGroup && interleaved.length < aiWindow; i++) {
-          chosenGroupKeys.forEach(groupKey => {
-            const groupItems = perGroupCandidates.get(groupKey) || [];
-            if (groupItems.length > 0 && interleaved.length < aiWindow) {
-              interleaved.push(groupItems.shift()!);
+        // Fill windowSize=30 via round-robin cycling buckets
+        const balanced30: typeof candidatesWithFamilies = [];
+        const windowSize30 = Math.min(30, aiWindow * 1.5); // Use 30 or 1.5x aiWindow, whichever is smaller
+        let roundRobinIndex = 0;
+        
+        while (balanced30.length < windowSize30) {
+          let addedThisRound = false;
+          
+          chosenFamilyKeys.forEach(familyKey => {
+            if (balanced30.length >= windowSize30) return;
+            
+            const bucket = familyBuckets.get(familyKey) || [];
+            if (bucket.length > roundRobinIndex) {
+              balanced30.push(bucket[roundRobinIndex]);
+              addedThisRound = true;
             }
           });
+          
+          if (!addedThisRound) break; // All buckets exhausted
+          roundRobinIndex++;
         }
         
-        // Fill remaining slots with highest-scored candidates from any group
-        if (interleaved.length < aiWindow) {
-          const remaining = candidatesWithGroups
-            .filter(c => !interleaved.some(il => il.candidate.handle === c.candidate.handle))
-            .slice(0, aiWindow - interleaved.length);
-          interleaved.push(...remaining);
+        // Fill remaining slots with highest-scored candidates from any family
+        if (balanced30.length < windowSize30) {
+          const remaining = candidatesWithFamilies
+            .filter(c => !balanced30.some(b => b.candidate.handle === c.candidate.handle))
+            .slice(0, windowSize30 - balanced30.length);
+          balanced30.push(...remaining);
         }
         
-        topCandidates = interleaved.slice(0, aiWindow).map(r => r.candidate);
-        
-        // Log per-group counts
-        const perGroupCounts: Record<string, number> = {};
-        topCandidates.forEach(c => {
-          const groupInfo = assignGroupKey(c);
-          perGroupCounts[groupInfo.key] = (perGroupCounts[groupInfo.key] || 0) + 1;
+        // Log per-family counts for balanced 30
+        const perFamilyCounts30: Record<string, number> = {};
+        balanced30.forEach(c => {
+          perFamilyCounts30[c.familyKey] = (perFamilyCounts30[c.familyKey] || 0) + 1;
         });
-        console.log(`[CollectionIntent] ai_window_balanced perGroupCounts=${JSON.stringify(perGroupCounts)}`);
+        console.log(`[CollectionIntent] ai_window_balanced windowSize=30 perFamilyCounts=${JSON.stringify(perFamilyCounts30)}`);
+        
+        // ============================================
+        // SAFETY GUARD: Force at least 2 families in final 20
+        // ============================================
+        // Check if query contains outfit-like phrases
+        const lowerIntent = userIntent.toLowerCase();
+        const hasOutfitPhrase = lowerIntent.includes("outfit") || lowerIntent.includes("ensemble") || lowerIntent.includes("set");
+        
+        let final20: typeof candidatesWithFamilies = [];
+        
+        if (hasOutfitPhrase && dominantDetected && chosenFamilyKeys.length >= 2) {
+          // Force inclusion of at least 2 families, each contributing at least 2 items if possible
+          const minFamilies = Math.min(4, chosenFamilyKeys.length);
+          const familiesToUse = chosenFamilyKeys.slice(0, minFamilies);
+          const itemsPerFamily = Math.floor(20 / familiesToUse.length);
+          const extraItems = 20 % familiesToUse.length;
+          
+          familiesToUse.forEach((familyKey, idx) => {
+            const targetCount = itemsPerFamily + (idx < extraItems ? 1 : 0);
+            const familyItems = balanced30
+              .filter(c => c.familyKey === familyKey)
+              .slice(0, targetCount);
+            final20.push(...familyItems);
+          });
+          
+          // Fill remaining slots from balanced30 if needed
+          if (final20.length < 20) {
+            const remaining = balanced30
+              .filter(c => !final20.some(f => f.candidate.handle === c.candidate.handle))
+              .slice(0, 20 - final20.length);
+            final20.push(...remaining);
+          }
+          
+          // Log per-family counts for final 20
+          const perFamilyCounts20: Record<string, number> = {};
+          final20.forEach(c => {
+            perFamilyCounts20[c.familyKey] = (perFamilyCounts20[c.familyKey] || 0) + 1;
+          });
+          console.log(`[CollectionIntent] ai_candidates20_perFamily=${JSON.stringify(perFamilyCounts20)}`);
+        } else {
+          // Standard: take first 20 from balanced 30
+          final20 = balanced30.slice(0, 20);
+          
+          // Log per-family counts for final 20
+          const perFamilyCounts20: Record<string, number> = {};
+          final20.forEach(c => {
+            perFamilyCounts20[c.familyKey] = (perFamilyCounts20[c.familyKey] || 0) + 1;
+          });
+          console.log(`[CollectionIntent] ai_candidates20_perFamily=${JSON.stringify(perFamilyCounts20)}`);
+        }
+        
+        topCandidates = final20.slice(0, aiWindow).map(r => r.candidate);
       } else {
         // Standard behavior: take top aiWindow candidates
         topCandidates = rankedCandidates.slice(0, aiWindow).map(r => r.candidate);
@@ -5685,41 +5789,38 @@ async function processSessionInBackground({
         }
         
         // ============================================
-        // COVERAGE GUARDRAIL (for collection intent)
+        // COVERAGE GUARDRAIL (for collection intent - uses family keys)
         // ============================================
         if (collectionIntent && !bundleIntent.isBundle && finalHandles.length > 0) {
-          // Reconstruct chosen groups using the same logic as window selection
-          // We need to use the same complementary group selection logic
-          const candidatesWithGroups = rankedCandidates.map(r => {
-            const groupInfo = assignGroupKey(r.candidate);
+          // Reconstruct chosen families using the same logic as window selection
+          const candidatesWithFamilies = rankedCandidates.map(r => {
+            const familyInfo = deriveFamilyKey(r.candidate);
             return {
               candidate: r.candidate,
               score: r.score,
-              groupKey: groupInfo.key,
-              groupSource: groupInfo.source
+              familyKey: familyInfo.key
             };
           });
           
-          // Build groupStats (same as window selection)
-          const groupStats = new Map<string, { count: number; topBM25: number; source: string }>();
-          candidatesWithGroups.forEach(c => {
-            const existing = groupStats.get(c.groupKey);
+          // Build familyStats (same as window selection)
+          const familyStats = new Map<string, { count: number; topBM25: number }>();
+          candidatesWithFamilies.forEach(c => {
+            const existing = familyStats.get(c.familyKey);
             if (!existing || c.score > existing.topBM25) {
-              groupStats.set(c.groupKey, {
+              familyStats.set(c.familyKey, {
                 count: (existing?.count || 0) + 1,
-                topBM25: c.score,
-                source: c.groupSource
+                topBM25: c.score
               });
             } else {
-              groupStats.set(c.groupKey, {
+              familyStats.set(c.familyKey, {
                 ...existing,
                 count: existing.count + 1
               });
             }
           });
           
-          // Rank groups by top BM25, then count (same as window selection)
-          const rankedGroups = Array.from(groupStats.entries())
+          // Rank families by top BM25, then count (same as window selection)
+          const rankedFamilies = Array.from(familyStats.entries())
             .map(([key, stats]) => ({ key, ...stats }))
             .sort((a, b) => {
               if (Math.abs(b.topBM25 - a.topBM25) > 0.01) {
@@ -5728,77 +5829,64 @@ async function processSessionInBackground({
               return b.count - a.count;
             });
           
-          const nonTrivialGroups = rankedGroups.filter(g => g.count >= 3);
+          // Pick distinct families (same as window selection)
+          const candidatePool = rankedFamilies;
+          const chosenFamilies: Array<{ key: string; count: number; topBM25: number }> = [];
           
-          // Helper: Check if two groups are similar (same as window selection)
-          function areGroupsSimilar(key1: string, key2: string): boolean {
-            if (key1.includes(key2) || key2.includes(key1)) {
-              return true;
-            }
-            const tokens1 = new Set(key1.split(/\s+/).filter(t => t.length > 0));
-            const tokens2 = new Set(key2.split(/\s+/).filter(t => t.length > 0));
-            const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
-            const union = new Set([...tokens1, ...tokens2]);
-            const jaccard = union.size > 0 ? intersection.size / union.size : 0;
-            return jaccard > 0.6;
-          }
-          
-          // Pick distinct groups (same as window selection)
-          const candidatePool = nonTrivialGroups.length > 0 ? nonTrivialGroups : rankedGroups;
-          const chosenGroups: Array<{ key: string; count: number; topBM25: number; source: string }> = [];
-          
-          for (const group of candidatePool) {
-            if (chosenGroups.length >= 3) break;
-            const isSimilar = chosenGroups.some(chosen => areGroupsSimilar(chosen.key, group.key));
+          for (const family of candidatePool) {
+            if (chosenFamilies.length >= 4) break;
+            const isSimilar = chosenFamilies.some(chosen => 
+              chosen.key.includes(family.key) || family.key.includes(chosen.key)
+            );
             if (!isSimilar) {
-              chosenGroups.push(group);
+              chosenFamilies.push(family);
             }
           }
           
-          if (chosenGroups.length < 2) {
-            const allGroups = rankedGroups.slice(0, 2 - chosenGroups.length);
-            chosenGroups.push(...allGroups);
+          if (chosenFamilies.length < 2) {
+            const allFamilies = rankedFamilies.slice(0, 2 - chosenFamilies.length);
+            chosenFamilies.push(...allFamilies);
           }
           
-          const chosenGroupKeys = chosenGroups.map(g => g.key);
+          const chosenFamilyKeys = chosenFamilies.map(f => f.key);
           
-          // Check which groups are represented in finalHandles
+          // Check which families are represented in finalHandles
           const coverageBefore: Record<string, number> = {};
           finalHandles.forEach(handle => {
             const candidate = sortedCandidates.find(c => c.handle === handle);
             if (candidate) {
-              const groupInfo = assignGroupKey(candidate);
-              coverageBefore[groupInfo.key] = (coverageBefore[groupInfo.key] || 0) + 1;
+              const familyInfo = deriveFamilyKey(candidate);
+              coverageBefore[familyInfo.key] = (coverageBefore[familyInfo.key] || 0) + 1;
             }
           });
           
-          // Find missing groups
-          const missingGroups = chosenGroupKeys.filter(groupKey => !coverageBefore[groupKey] || coverageBefore[groupKey] === 0);
+          // Find missing families
+          const missingFamilies = chosenFamilyKeys.filter(familyKey => !coverageBefore[familyKey] || coverageBefore[familyKey] === 0);
           
-          if (missingGroups.length > 0) {
-            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} missingGroups=[${missingGroups.join(", ")}]`);
+          if (missingFamilies.length > 0) {
+            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} missingFamilies=[${missingFamilies.join(", ")}]`);
             
-            // Refill missing groups by pulling best unused candidates from those groups
+            // Refill missing families by pulling best unused candidates from those families
             let swaps = 0;
             const finalHandlesSet = new Set(finalHandles);
             
-            for (const missingGroup of missingGroups) {
-              // Find best unused candidate from this group
-              const groupCandidates = candidatesWithGroups
-                .filter(c => c.groupKey === missingGroup && !finalHandlesSet.has(c.candidate.handle))
+            for (const missingFamily of missingFamilies) {
+              // Find best unused candidate from this family
+              const familyCandidates = candidatesWithFamilies
+                .filter(c => c.familyKey === missingFamily && !finalHandlesSet.has(c.candidate.handle))
                 .sort((a, b) => b.score - a.score);
               
-              if (groupCandidates.length > 0) {
+              if (familyCandidates.length > 0) {
                 // Find weakest item in finalHandles to swap out (lowest BM25 score)
                 const finalWithScores = finalHandles.map(handle => {
-                  const candidate = candidatesWithGroups.find(c => c.candidate.handle === handle);
+                  const candidate = candidatesWithFamilies.find(c => c.candidate.handle === handle);
                   return { handle, score: candidate?.score || 0 };
                 }).sort((a, b) => a.score - b.score);
                 
                 if (finalWithScores.length > 0) {
                   // Swap out weakest item
                   const weakestHandle = finalWithScores[0].handle;
-                  const newHandle = groupCandidates[0].candidate.handle;
+                  const newHandle = familyCandidates[0].candidate.handle;
                   
                   const weakestIdx = finalHandles.indexOf(weakestHandle);
                   if (weakestIdx >= 0) {
@@ -5806,7 +5894,7 @@ async function processSessionInBackground({
                     finalHandlesSet.delete(weakestHandle);
                     finalHandlesSet.add(newHandle);
                     swaps++;
-                    console.log(`[CollectionIntent] coverage_swap group=${missingGroup} removed=${weakestHandle} added=${newHandle}`);
+                    console.log(`[CollectionIntent] coverage_swap family=${missingFamily} removed=${weakestHandle} added=${newHandle}`);
                   }
                 }
               }
@@ -5817,14 +5905,14 @@ async function processSessionInBackground({
             finalHandles.forEach(handle => {
               const candidate = sortedCandidates.find(c => c.handle === handle);
               if (candidate) {
-                const groupInfo = assignGroupKey(candidate);
-                coverageAfter[groupInfo.key] = (coverageAfter[groupInfo.key] || 0) + 1;
+                const familyInfo = deriveFamilyKey(candidate);
+                coverageAfter[familyInfo.key] = (coverageAfter[familyInfo.key] || 0) + 1;
               }
             });
             
             console.log(`[CollectionIntent] coverage_after=${JSON.stringify(coverageAfter)} swaps=${swaps}`);
           } else {
-            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} all_groups_represented=true`);
+            console.log(`[CollectionIntent] coverage_before=${JSON.stringify(coverageBefore)} all_families_represented=true`);
           }
         }
       } else {
@@ -7177,58 +7265,64 @@ async function processSessionInBackground({
                 return true;
               });
             
-            // If collectionIntent=true, preserve group coverage when refilling
+            // If collectionIntent=true, preserve family coverage when refilling
             if (collectionIntent && !bundleIntent.isBundle) {
-              // Get current group coverage
-              const currentGroups = new Set<string>();
+              // Get current family coverage
+              const currentFamilies = new Set<string>();
               filteredHandles.forEach(handle => {
                 const candidate = candidateMapForCheck.get(handle);
                 if (candidate) {
-                  const groupInfo = assignGroupKey(candidate);
-                  currentGroups.add(groupInfo.key);
+                  const familyInfo = deriveFamilyKey(candidate);
+                  currentFamilies.add(familyInfo.key);
                 }
               });
               
-              // Get the chosen groups from earlier (same logic as window selection)
-              const candidatesWithGroups = remainingCandidates.map(c => {
-                const groupInfo = assignGroupKey(c);
+              // Get the chosen families from earlier (same logic as window selection)
+              const candidatesWithFamilies = remainingCandidates.map(c => {
+                const familyInfo = deriveFamilyKey(c);
                 return {
                   candidate: c,
-                  groupKey: groupInfo.key
+                  familyKey: familyInfo.key
                 };
               });
               
-              const groupFreq = new Map<string, number>();
-              candidatesWithGroups.forEach(c => {
-                groupFreq.set(c.groupKey, (groupFreq.get(c.groupKey) || 0) + 1);
+              const familyFreq = new Map<string, number>();
+              candidatesWithFamilies.forEach(c => {
+                familyFreq.set(c.familyKey, (familyFreq.get(c.familyKey) || 0) + 1);
               });
               
-              const nonTrivialGroups = Array.from(groupFreq.entries())
-                .filter(([_, count]) => count >= 3)
-                .sort((a, b) => b[1] - a[1]);
+              const rankedFamilies = Array.from(familyFreq.entries())
+                .map(([key, count]) => ({ key, count }))
+                .sort((a, b) => b.count - a.count);
               
-              const targetGroups = Math.min(3, nonTrivialGroups.length || 2);
-              const chosenGroups = nonTrivialGroups.slice(0, targetGroups).map(([key]) => key);
-              
-              if (chosenGroups.length < 2) {
-                const allGroups = Array.from(groupFreq.keys()).sort((a, b) => 
-                  (groupFreq.get(b) || 0) - (groupFreq.get(a) || 0)
+              // Pick distinct families (up to 4)
+              const chosenFamilies: string[] = [];
+              for (const family of rankedFamilies) {
+                if (chosenFamilies.length >= 4) break;
+                const isSimilar = chosenFamilies.some(chosen => 
+                  chosen.includes(family.key) || family.key.includes(chosen)
                 );
-                chosenGroups.push(...allGroups.slice(0, 2 - chosenGroups.length));
+                if (!isSimilar) {
+                  chosenFamilies.push(family.key);
+                }
               }
               
-              // Prioritize refilling missing groups first, then fill remaining slots
-              const refillHandles: string[] = [];
-              const missingGroups = chosenGroups.filter(g => !currentGroups.has(g));
+              if (chosenFamilies.length < 2) {
+                chosenFamilies.push(...rankedFamilies.slice(0, 2 - chosenFamilies.length).map(f => f.key));
+              }
               
-              // First, refill missing groups (one per missing group)
-              for (const missingGroup of missingGroups) {
+              // Prioritize refilling missing families first, then fill remaining slots
+              const refillHandles: string[] = [];
+              const missingFamilies = chosenFamilies.filter((f: string) => !currentFamilies.has(f));
+              
+              // First, refill missing families (one per missing family)
+              for (const missingFamily of missingFamilies) {
                 if (refillHandles.length >= handlesToRefill) break;
                 
-                const groupCandidates = remainingCandidates
+                const familyCandidates = remainingCandidates
                   .filter(c => {
-                    const groupInfo = assignGroupKey(c);
-                    return groupInfo.key === missingGroup && !usedHandlesSet.has(c.handle);
+                    const familyInfo = deriveFamilyKey(c);
+                    return familyInfo.key === missingFamily && !usedHandlesSet.has(c.handle);
                   })
                   .sort((a, b) => {
                     // Sort by BM25-like score (use searchText match with hardTerms)
@@ -7237,9 +7331,9 @@ async function processSessionInBackground({
                     return bScore - aScore;
                   });
                 
-                if (groupCandidates.length > 0) {
-                  refillHandles.push(groupCandidates[0].handle);
-                  usedHandlesSet.add(groupCandidates[0].handle);
+                if (familyCandidates.length > 0) {
+                  refillHandles.push(familyCandidates[0].handle);
+                  usedHandlesSet.add(familyCandidates[0].handle);
                 }
               }
               
