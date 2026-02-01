@@ -4784,6 +4784,7 @@ async function processSessionInBackground({
       const targetCount = Math.min(finalResultCount, sortedCandidates.length);
 
       let finalHandles: string[] = [];
+      let finalSource: "ai" | "legacy" | "topup" = "legacy" as "ai" | "legacy" | "topup";
       let reasoningParts: string[] = [];
 
       // helper to get next window excluding already used handles
@@ -4945,14 +4946,21 @@ async function processSessionInBackground({
             // DO NOT overwrite with legacy selectBundleWithinBudget() - it uses incorrect budget semantics
             if (bundleAiSucceeded && aiBundle.selectedHandles.length > 0) {
               console.log(`[Bundle] ✅ AI bundle succeeded with ${aiBundle.selectedHandles.length} handles - using AI result directly (skipping legacy selection)`);
-              finalHandles = aiBundle.selectedHandles;
+              finalHandles = aiBundle.selectedHandles.slice(0, finalResultCount);
+              finalSource = "ai";
               bundleFinalHandles = finalHandles; // Store for top-up check
               if (aiBundle.trustFallback) {
                 trustFallback = true;
               }
               
               // Log AI result (budget already checked in ai-ranking.server.ts)
-              console.log(`[Bundle] AI result: ${finalHandles.length} handles, trustFallback=${aiBundle.trustFallback}`);
+              console.log(`[Bundle] AI result: ${finalHandles.length} handles, trustFallback=${aiBundle.trustFallback}, finalSource=${finalSource}`);
+              
+              // Hard guard: prevent empty handles when AI succeeded
+              if (finalSource === "ai" && finalHandles.length === 0) {
+                console.warn("[Bundle] ERROR: AI source but finalHandles empty - aborting to prevent empty diversity");
+                // This should never happen, but if it does, we need to investigate
+              }
               
               // Build reasoning from AI
               let reasoningText = "";
@@ -5024,7 +5032,11 @@ async function processSessionInBackground({
                 slotPlan
               );
               
-              finalHandles = selectionResult.handles;
+              // Only set if not already set by AI (guard against overwriting)
+              if (finalSource !== "ai") {
+                finalHandles = selectionResult.handles;
+                finalSource = "legacy";
+              }
               bundleFinalHandles = finalHandles; // Store for top-up check
               if (selectionResult.trustFallback) {
                 trustFallback = true;
@@ -5116,7 +5128,11 @@ async function processSessionInBackground({
               slotPlan
             );
             
-            finalHandles = selectionResult.handles;
+            // Only set if not already set by AI (guard against overwriting)
+            if (finalSource !== "ai") {
+              finalHandles = selectionResult.handles;
+              finalSource = "legacy";
+            }
             bundleFinalHandles = finalHandles; // Store for top-up check
             if (selectionResult.trustFallback) {
               trustFallback = true;
@@ -5182,7 +5198,11 @@ async function processSessionInBackground({
             slotPlan
           );
           
-          finalHandles = selectionResult.handles;
+          // Only set if not already set by AI (guard against overwriting)
+          if (finalSource !== "ai") {
+            finalHandles = selectionResult.handles;
+            finalSource = "legacy";
+          }
           bundleFinalHandles = finalHandles; // Store for top-up check
           if (selectionResult.trustFallback) {
             trustFallback = true;
@@ -6051,7 +6071,31 @@ async function processSessionInBackground({
       // Logging will happen AFTER validation/dedupe/availability/budget enforcement are complete
       // See deliveredHandlesFinal logging below
 
-      finalHandles = finalHandlesGuaranteed;
+      // CRITICAL: Only update finalHandles if it wasn't set by AI (preserve AI result)
+      if (finalSource !== "ai") {
+        finalHandles = finalHandlesGuaranteed;
+      } else {
+        // AI source: ensure finalHandlesGuaranteed uses AI handles if validation didn't filter them all
+        if (finalHandlesGuaranteed.length === 0 && finalHandles.length > 0) {
+          console.log("[Bundle] Validation filtered all handles, but AI source - using AI handles as fallback");
+          finalHandlesGuaranteed = finalHandles;
+        } else if (finalHandlesGuaranteed.length > 0) {
+          // Use validated handles if available (validation may have filtered some)
+          finalHandles = finalHandlesGuaranteed;
+        }
+        // If finalHandles already has AI handles and finalHandlesGuaranteed is empty, keep finalHandles
+      }
+      
+      // Hard guard: prevent empty handles when AI succeeded
+      if (finalSource === "ai" && finalHandles.length === 0) {
+        console.warn("[Bundle] ERROR: AI source but finalHandles empty after top-up/validation - using AI handles directly");
+        // Restore from bundleFinalHandles if available
+        if (bundleFinalHandles.length > 0) {
+          finalHandles = bundleFinalHandles;
+          finalHandlesGuaranteed = bundleFinalHandles;
+          console.log(`[Bundle] Restored ${finalHandles.length} handles from bundleFinalHandles`);
+        }
+      }
 
       // Prioritize AI reasoning over technical matching details
       // Only add trust signals if AI didn't provide reasoning (fallback case)
@@ -6078,18 +6122,43 @@ async function processSessionInBackground({
       }));
       
       // Only apply diversity if we have handles to diversify
-      const handlesToDiversify = finalHandlesGuaranteed.slice(0, targetCount);
+      // CRITICAL: Use finalHandles (which contains AI result) for diversity, not finalHandlesGuaranteed
+      // finalHandlesGuaranteed might be empty if validation filtered everything, but AI handles should be preserved
+      const handlesToDiversify = (finalSource === "ai" && finalHandles.length > 0) 
+        ? finalHandles.slice(0, targetCount)
+        : finalHandlesGuaranteed.slice(0, targetCount);
       
       // Log before diversity (especially important for bundles)
       if (isBundleMode) {
-        console.log(`[Bundle] handles_before_diversity count=${handlesToDiversify.length} preview=[${handlesToDiversify.slice(0, 5).join(", ")}${handlesToDiversify.length > 5 ? "..." : ""}]`);
+        console.log(`[Bundle] handles_before_diversity count=${handlesToDiversify.length} preview=[${handlesToDiversify.slice(0, 5).join(", ")}${handlesToDiversify.length > 5 ? "..." : ""}] finalSource=${finalSource}`);
       }
       
-      const diverseHandles = handlesToDiversify.length > 0
-        ? ensureResultDiversity(handlesToDiversify, candidatesForDiversity, finalResultCount)
-        : handlesToDiversify; // If empty, return as-is (diversity check will return empty anyway)
+      // Declare diverseHandles outside if/else for scope
+      let diverseHandles: string[] = [];
       
-      console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", handlesToDiversify.length, ")");
+      // Hard guard: prevent empty diversity input when AI succeeded
+      if (finalSource === "ai" && handlesToDiversify.length === 0) {
+        console.warn("[Bundle] ERROR: AI source but handlesToDiversify empty before diversity - using finalHandles directly");
+        // Use finalHandles if available
+        if (finalHandles.length > 0) {
+          diverseHandles = ensureResultDiversity(finalHandles.slice(0, targetCount), candidatesForDiversity, finalResultCount);
+          console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", finalHandles.length, ")");
+        } else {
+          console.error("[Bundle] CRITICAL: AI source but both handlesToDiversify and finalHandles are empty");
+          diverseHandles = [];
+          console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", handlesToDiversify.length, ")");
+        }
+      } else {
+        diverseHandles = handlesToDiversify.length > 0
+          ? ensureResultDiversity(handlesToDiversify, candidatesForDiversity, finalResultCount)
+          : handlesToDiversify; // If empty, return as-is (diversity check will return empty anyway)
+        
+        console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", handlesToDiversify.length, ")");
+      }
+      
+      // Update finalHandles with diverse result
+      finalHandles = diverseHandles;
+      finalHandlesGuaranteed = diverseHandles;
 
       // Final reasoning string (prioritize AI reasoning, make notes customer-friendly)
       // Check if reasoningParts contains AI-generated reasoning (human-like, professional)
