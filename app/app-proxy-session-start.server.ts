@@ -2662,12 +2662,13 @@ async function processSessionInBackground({
   modeUsed: string;
   baseAiWindow: number;
 }): Promise<void> {
-  // Track total processing duration for safety clamp
-  const processStartTime = performance.now();
+  try {
+    // Track total processing duration for safety clamp
+    const processStartTime = performance.now();
 
-  // Fetch conversation messages for full context
-  // CRITICAL: Retry fetching messages if none found (handles race condition where messages are still being saved)
-  let session = await prisma.conciergeSession.findUnique({
+    // Fetch conversation messages for full context
+    // CRITICAL: Retry fetching messages if none found (handles race condition where messages are still being saved)
+    let session = await prisma.conciergeSession.findUnique({
     where: { publicToken: sessionToken },
     include: {
       messages: {
@@ -6522,42 +6523,31 @@ async function processSessionInBackground({
         duplicates
       });
       
-      // Final invariant check: if maxPriceCeiling exists, verify finalTotalPrice doesn't exceed it
+      // BUDGET ENFORCEMENT: Apply budget per-item (single) or per-outfit (bundle), NOT per-list-sum
       let constraintExceeded = false;
       const maxPriceCeiling = priceMax; // priceMax is the numeric ceiling extracted from user input
       if (typeof maxPriceCeiling === "number" && maxPriceCeiling > 0 && handlesToSave.length > 0) {
-        // Calculate final total price from handles being saved
         const candidateMapForCheck = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
-        const finalTotalPrice = handlesToSave.reduce((sum, handle) => {
-          const candidate = candidateMapForCheck.get(handle);
-          if (candidate && candidate.price) {
-            const price = parseFloat(String(candidate.price));
-            return sum + (Number.isFinite(price) ? price : 0);
-          }
-          return sum;
-        }, 0);
         
-        if (finalTotalPrice > maxPriceCeiling) {
-          trustFallback = true;
-          constraintExceeded = true;
-          console.log("[Constraints] ceiling_invariant_violation", {
-            finalTotalPrice,
-            maxPriceCeiling,
-            deliveredCount
-          });
-          
-          // ENFORCE BUDGET: Filter out items that exceed budget, starting with most expensive
-          // BUT: For bundles, ensure at least one item per type is kept (budget is soft constraint)
-          // Only reduce if we can still maintain bundle integrity
+        // BUNDLE BUDGET SEMANTICS: For bundles, budget applies to ONE complete outfit (1 per group), not all options
+        // Check if this is a bundle with totalBudget
+        const isBundleWithBudget = isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2 && bundleIntent.totalBudget !== null;
+        
+        // Prepare handles with prices for analysis
+        const handlesWithPrices = handlesToSave.map(handle => {
+          const candidate = candidateMapForCheck.get(handle);
+          const price = candidate && candidate.price ? parseFloat(String(candidate.price)) : 0;
+          return { handle, price: Number.isFinite(price) ? price : 0 };
+        });
+        
+        if (isBundleWithBudget) {
+          // BUNDLE FLOW: Budget applies to one complete outfit (1 per group)
+          // Prepare handles with prices for grouping/analysis
           const handlesWithPrices = handlesToSave.map(handle => {
             const candidate = candidateMapForCheck.get(handle);
             const price = candidate && candidate.price ? parseFloat(String(candidate.price)) : 0;
             return { handle, price: Number.isFinite(price) ? price : 0 };
           });
-          
-          // CRITICAL FIX: Budget enforcement must preserve required categories
-          // For bundles, each requested item group is REQUIRED - ensure >=1 product per group
-          // Use proper matching logic (same as missing types check) instead of relying on metadata
           
           // Step 1: Group handles by matching item type using proper matching logic (industry-agnostic)
           const handlesByType = new Map<number, Array<{ handle: string; price: number }>>();
@@ -6638,91 +6628,77 @@ async function processSessionInBackground({
             }
           }
           
-          console.log("[Bundle] cheapestOnePerGroupTotal", {
-            total: cheapestOnePerGroupTotal,
+          const canMeetBudget = cheapestOnePerGroupTotal <= maxPriceCeiling;
+          
+          console.log("[Bundle Budget] budget_scope=per_outfit", {
+            primariesTotal: cheapestOnePerGroupTotal,
             maxPriceCeiling,
-            canMeetBudget: cheapestOnePerGroupTotal <= maxPriceCeiling,
-            handles: cheapestOnePerGroup,
+            canMeetBudget,
+            primariesHandles: cheapestOnePerGroup,
+            allItemsCount: handlesToSave.length
           });
           
-          // Step 3: If cheapest one-per-group exceeds budget, still return it (budget is soft constraint)
-          // Set budgetExceeded=true and include explanation
-          let filteredHandles: string[] = [];
-          let runningTotal = 0;
-          const usedHandles = new Set<string>();
-          let budgetExceeded = false;
-          
-          // First pass: ALWAYS add at least one item per required group (preserve required categories)
-          if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
-            // For bundles: ensure at least one item per required group is included
-            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-              const groupHandles = handlesByType.get(itemIdx) || [];
-              if (groupHandles.length > 0) {
-                // Add the cheapest item from this required group (always preserve)
-                const sorted = [...groupHandles].sort((a, b) => a.price - b.price);
-                const cheapest = sorted[0];
-                filteredHandles.push(cheapest.handle);
-                usedHandles.add(cheapest.handle);
-                runningTotal += cheapest.price;
+          // BUNDLE BUDGET: Budget applies to one complete outfit (1 per group), NOT sum of all options
+          // If canMeetBudget=true, keep all items (alternatives are not part of budget sum)
+          // If canMeetBudget=false, still keep all items but mark budgetExceeded
+          if (canMeetBudget) {
+            // Budget is satisfied for one complete outfit - keep all items (up to requestedCount)
+            // Reorder so primaries come first, but don't filter
+            const primaryHandlesSet = new Set(cheapestOnePerGroup);
+            const reorderedHandles: string[] = [];
+            const nonPrimaryHandles: string[] = [];
+            
+            for (const handle of handlesToSave) {
+              if (primaryHandlesSet.has(handle)) {
+                reorderedHandles.push(handle);
+              } else {
+                nonPrimaryHandles.push(handle);
               }
-              // If group has zero candidates, mark it missing and continue (partial bundle)
             }
             
-            // If cheapest one-per-group exceeds budget, mark as exceeded but still return it
-            if (cheapestOnePerGroupTotal > maxPriceCeiling) {
-              budgetExceeded = true;
-              console.log("[Constraints] Budget exceeded by cheapest one-per-group set, but preserving required categories", {
-                cheapestOnePerGroupTotal,
-                maxPriceCeiling,
-                difference: cheapestOnePerGroupTotal - maxPriceCeiling,
-              });
-            }
+            // Add primaries first, then alternatives
+            handlesToSave = [...reorderedHandles, ...nonPrimaryHandles].slice(0, finalResultCount);
+            deliveredCount = handlesToSave.length;
+            
+            console.log(`[Bundle Budget] ✅ canMeetBudget=true - keeping all ${handlesToSave.length} items (budget applies to primaries only, not alternatives)`);
           } else {
-            // Single-item: add cheapest item first
-            const sorted = [...handlesWithPrices].sort((a, b) => a.price - b.price);
-            if (sorted.length > 0) {
-              filteredHandles.push(sorted[0].handle);
-              usedHandles.add(sorted[0].handle);
-              runningTotal += sorted[0].price;
-            }
+            // Cannot meet budget even with cheapest one-per-group - still keep all items but mark exceeded
+            constraintExceeded = true;
+            trustFallback = true;
+            console.log("[Bundle Budget] ❌ cannot meet budget - cheapest one-per-group exceeds budget", {
+              cheapestOnePerGroupTotal,
+              maxPriceCeiling,
+              difference: cheapestOnePerGroupTotal - maxPriceCeiling,
+            });
+            // Still keep all items - budget is a soft constraint
           }
+        } else {
+          // SINGLE-ITEM FLOW: Budget applies per item, NOT per list sum
+          // Filter items individually: remove items where price > maxPriceCeiling
+          const beforeCount = handlesToSave.length;
+          const filteredHandles = handlesWithPrices
+            .filter(({ price }) => price <= maxPriceCeiling)
+            .map(({ handle }) => handle)
+            .slice(0, finalResultCount); // Cap at requested count (8, 12, or 16)
           
-          // Step 4: Add remaining items within budget (extra slots, not required)
-          // Only add extra items if they fit within budget
-          const sortedByPrice = handlesWithPrices.sort((a, b) => a.price - b.price); // Cheapest first for extra slots
-          for (const { handle, price } of sortedByPrice) {
-            if (usedHandles.has(handle)) continue; // Already added in first pass (required)
-            if (runningTotal + price <= maxPriceCeiling) {
-              filteredHandles.push(handle);
-              usedHandles.add(handle);
-              runningTotal += price;
-            } else {
-              // Skip this extra item to stay within budget
-              console.log(`[Constraints] Skipping extra item ${handle} (price: $${price.toFixed(2)}) to stay within budget`);
-            }
-          }
+          const removedOverCeiling = beforeCount - filteredHandles.length;
           
-          // Step 5: Apply filtered handles (preserving required categories)
-          const minRequired = isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2
-            ? bundleIntent.items.length // At least one per required group
-            : 1;
-          
-          // Always preserve required categories - only reduce extra slots
-          if (filteredHandles.length >= minRequired) {
-            const originalCount = handlesToSave.length;
+          if (removedOverCeiling > 0 || filteredHandles.length < handlesToSave.length) {
             handlesToSave = filteredHandles;
             deliveredCount = filteredHandles.length;
-            
-            if (budgetExceeded) {
-              console.log(`[Constraints] Budget enforcement: preserved ${minRequired} required items (one per group) even though budget exceeded. Total: ${filteredHandles.length} items, price: $${runningTotal.toFixed(2)} (budget: $${maxPriceCeiling.toFixed(2)})`);
-            } else {
-              console.log(`[Constraints] Budget enforcement: reduced from ${originalCount} to ${filteredHandles.length} items (minRequired: ${minRequired})`);
+            if (removedOverCeiling > 0) {
+              constraintExceeded = true;
+              trustFallback = true;
             }
-          } else {
-            // This should never happen if we have candidates, but handle gracefully
-            console.log(`[Constraints] Budget enforcement: cannot preserve ${minRequired} required items, keeping ${handlesToSave.length} items`);
-            trustFallback = true;
           }
+          
+          console.log("[Constraints] budget_scope=per_item", {
+            ceiling: maxPriceCeiling,
+            removedOverCeiling,
+            kept: filteredHandles.length,
+            beforeCount,
+            requestedCount: finalResultCount
+          });
         }
       }
       
@@ -6920,7 +6896,7 @@ async function processSessionInBackground({
         total: intentParseCallCount + aiCallCount
       });
     }
-  } catch (error: any) {
+    } catch (error: any) {
       console.error("[App Proxy] Background processing failed:", error);
       // Mark session as FAILED
       await prisma.conciergeSession.update({
