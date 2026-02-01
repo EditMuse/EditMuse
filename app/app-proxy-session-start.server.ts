@@ -778,7 +778,7 @@ function parseIntentGeneric(
           
           const classification = classifyTerm(phrase, position, contextBefore, contextAfter);
           if (classification === "hard" && !expandedHardTerms.includes(phrase)) {
-            expandedHardTerms.push(phrase);
+          expandedHardTerms.push(phrase);
           } else if (classification === "soft" && !softTerms.includes(phrase)) {
             softTerms.push(phrase);
           }
@@ -3225,10 +3225,10 @@ async function processSessionInBackground({
         // Merge LLM-extracted facets with variant constraints from answers
         // This ensures we capture both LLM understanding and explicit user selections
         // EXPLICIT USER SELECTIONS ALWAYS WIN (variant constraints take precedence)
-        const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
-        const fromTextForIntent = parseConstraintsFromText(userIntent);
-        const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
-        
+      const fromAnswersForIntent = parseConstraintsFromAnswers(answersJson);
+      const fromTextForIntent = parseConstraintsFromText(userIntent);
+      const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
+      
         // Merge LLM facets with variant constraints (variant constraints take precedence - explicit user selection wins)
         hardFacets = {
           size: variantConstraintsForIntent.size || intent.hardFacets?.size || null,
@@ -3289,7 +3289,7 @@ async function processSessionInBackground({
         const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
         
         // Parse intent using pattern-based approach (fallback)
-        const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
+      const intentParse = parseIntentGeneric(userIntent, answersJson, variantConstraintsForIntent);
         hardTerms = intentParse.hardTerms;
         softTerms = intentParse.softTerms;
         avoidTerms = intentParse.avoidTerms;
@@ -3505,10 +3505,10 @@ async function processSessionInBackground({
           if (selected) {
             const price = getPrice(selected);
             // Always add primary - budget is a soft constraint
-            handles.push(selected.handle);
-            used.add(selected.handle);
-            totalPrice += price;
-            chosenPrimaries.set(itemIdx, selected.handle);
+              handles.push(selected.handle);
+              used.add(selected.handle);
+              totalPrice += price;
+              chosenPrimaries.set(itemIdx, selected.handle);
             
             // Mark budget exceeded if needed, but still add the primary
             if (totalBudget !== null && typeof totalBudget === "number" && totalPrice > totalBudget) {
@@ -3564,20 +3564,20 @@ async function processSessionInBackground({
           // Fill up to target count for this item type
           while (currentHandles.length < targetCount && handles.length < requestedCount) {
             const candidatesToCheck = rankedCandidatesByItem?.get(itemIdx) || pool;
-            let added = false;
+          let added = false;
             
             // First pass: try to find candidates within budget (prefer budget-friendly)
             for (const candidate of candidatesToCheck) {
-              if (used.has(candidate.handle)) continue;
+            if (used.has(candidate.handle)) continue;
               if (currentHandles.length >= targetCount) break;
-              
-              const price = getPrice(candidate);
-              
+            
+            const price = getPrice(candidate);
+            
               // Prefer candidates within allocated budget, but don't require it
-              if (allocatedBudget !== undefined && allocatedBudget !== null) {
+            if (allocatedBudget !== undefined && allocatedBudget !== null) {
                 const currentSpent = currentHandles.reduce((sum, h) => {
-                  const c = pool.find(p => p.handle === h);
-                  return sum + (c ? getPrice(c) : 0);
+                const c = pool.find(p => p.handle === h);
+                return sum + (c ? getPrice(c) : 0);
                 }, 0);
                 const remainingAllocated = allocatedBudget - currentSpent;
                 
@@ -3589,14 +3589,14 @@ async function processSessionInBackground({
               }
               
               // Add candidate (budget is soft - always fill slots)
-              handles.push(candidate.handle);
-              used.add(candidate.handle);
-              totalPrice += price;
+            handles.push(candidate.handle);
+            used.add(candidate.handle);
+            totalPrice += price;
               currentHandles.push(candidate.handle);
-              added = true;
-              break;
-            }
-            
+            added = true;
+            break;
+          }
+          
             // Second pass: if couldn't add within budget, add cheapest available (ensure we fill slots)
             if (!added && currentHandles.length < targetCount) {
               const available = pool.filter(c => !used.has(c.handle));
@@ -3646,7 +3646,7 @@ async function processSessionInBackground({
             }
             
             if (!added) break; // No more candidates available
-            roundRobinIdx++;
+          roundRobinIdx++;
           }
         }
         
@@ -4238,7 +4238,7 @@ async function processSessionInBackground({
       if (hardFacets.size || hardFacets.color || hardFacets.material) {
         console.log(`[App Proxy] [Layer 2] After facet gating: ${afterFacetGating} candidates (reduced by ${facetGatingReduction} from ${beforeFacetGating})`);
       } else {
-        console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+      console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
       }
       
       // Denylist for common false positives (word that contains the term but isn't the term)
@@ -4939,104 +4939,124 @@ async function processSessionInBackground({
             if (aiBundle.source === "fallback") {
               console.log("[AI Ranking] source=fallback parse_fail_reason=", aiBundle.parseFailReason || "unknown");
             }
-            // Build item pools from sortedCandidates
-            const itemPools = new Map<number, EnrichedCandidate[]>();
-            for (const c of sortedCandidates) {
-              const itemIdx = (c as any)._bundleItemIndex;
-              if (typeof itemIdx === "number") {
-                if (!itemPools.has(itemIdx)) {
-                  itemPools.set(itemIdx, []);
-                }
-                itemPools.get(itemIdx)!.push(c);
+            
+            // SINGLE SOURCE OF TRUTH: If AI bundle ranking succeeded, use its handles directly
+            // AI has already done budget-aware selection (primaries + alternatives) in ai-ranking.server.ts
+            // DO NOT overwrite with legacy selectBundleWithinBudget() - it uses incorrect budget semantics
+            if (bundleAiSucceeded && aiBundle.selectedHandles.length > 0) {
+              console.log(`[Bundle] ✅ AI bundle succeeded with ${aiBundle.selectedHandles.length} handles - using AI result directly (skipping legacy selection)`);
+              finalHandles = aiBundle.selectedHandles;
+              bundleFinalHandles = finalHandles; // Store for top-up check
+              if (aiBundle.trustFallback) {
+                trustFallback = true;
               }
-            }
-            
-            // Build ranked candidates by itemIndex from AI handles
-            const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
-            for (const handle of aiBundle.selectedHandles) {
-              const candidate = sortedCandidates.find(c => c.handle === handle);
-              if (candidate) {
-                const itemIdx = (candidate as any)._bundleItemIndex;
-                if (typeof itemIdx === "number") {
-                  if (!rankedCandidatesByItem.has(itemIdx)) {
-                    rankedCandidatesByItem.set(itemIdx, []);
-                  }
-                  rankedCandidatesByItem.get(itemIdx)!.push(candidate);
-                }
-              }
-            }
-            
-            // Build allocated budgets map
-            const allocatedBudgets = new Map<number, number>();
-            bundleItemsWithBudget.forEach((item, idx) => {
-              if (item.budgetMax !== undefined && item.budgetMax !== null) {
-                allocatedBudgets.set(idx, item.budgetMax);
-              }
-            });
-            
-            // Use budget-aware selection helper
-            const selectionResult = selectBundleWithinBudget(
-              itemPools,
-              allocatedBudgets,
-              bundleIntent.totalBudget,
-              finalResultCount,
-              bundleItemsWithBudget.length,
-              rankedCandidatesByItem,
-              slotPlan
-            );
-            
-            finalHandles = selectionResult.handles;
-            bundleFinalHandles = finalHandles; // Store for top-up check
-            if (selectionResult.trustFallback) {
-              trustFallback = true;
-            }
-            
-            // Log budget selection details
-            const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
-              .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
-            console.log("[Bundle Budget] chosenPrimaries", chosenPrimariesText);
-            console.log("[Bundle Budget] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
-              " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
-              " finalCount=" + finalHandles.length + 
-              " trustFallback=" + selectionResult.trustFallback +
-              " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
-            
-            // Build reasoning - prioritize AI's human-like reasons from aiBundle.reasoning
-            let reasoningText = "";
-            if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
-              // Use AI's human-like reasoning as primary source
-              reasoningText = aiBundle.reasoning.trim();
               
-              // Add budget context if needed (but keep it natural) - ONLY when totalBudget is a number
-              if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
-                  (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
+              // Log AI result (budget already checked in ai-ranking.server.ts)
+              console.log(`[Bundle] AI result: ${finalHandles.length} handles, trustFallback=${aiBundle.trustFallback}`);
+              
+              // Build reasoning from AI
+              let reasoningText = "";
+              if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
+                reasoningText = aiBundle.reasoning.trim();
+              } else {
+                // Fallback reasoning
                 const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-                // Only add budget note if AI reasoning doesn't already mention it
-                if (!reasoningText.toLowerCase().includes('budget') && !reasoningText.toLowerCase().includes('$')) {
-                  reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options. ${reasoningText}`;
+                reasoningText = `Built a bundle: ${itemNames}.`;
+              }
+              
+              // Add delivered vs requested count to reasoning (will be finalized after top-up)
+              const deliveredAfterAI = finalHandles.length;
+              if (deliveredAfterAI < finalResultCount) {
+                reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+              }
+              
+              reasoningParts.push(reasoningText);
+              
+              // Skip legacy selection - AI result is the single source of truth
+              // Continue to top-up/diversity/validation with AI handles
+            } else {
+              // AI returned handles but source=fallback or trustFallback=true - use legacy as fallback
+              console.log(`[Bundle] ⚠️  AI returned ${aiBundle.selectedHandles.length} handles but source=${aiBundle.source}, using legacy selection as fallback`);
+              
+              // Build item pools from sortedCandidates
+              const itemPools = new Map<number, EnrichedCandidate[]>();
+              for (const c of sortedCandidates) {
+                const itemIdx = (c as any)._bundleItemIndex;
+                if (typeof itemIdx === "number") {
+                  if (!itemPools.has(itemIdx)) {
+                    itemPools.set(itemIdx, []);
+                  }
+                  itemPools.get(itemIdx)!.push(c);
                 }
               }
-            } else {
-              // Fallback to generic reasoning if AI didn't provide reasons
-              const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-              const budgetText = (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") ? ` under $${bundleIntent.totalBudget}` : "";
               
-              reasoningText = `Built a bundle: ${itemNames}${budgetText}.`;
-              if (bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number" && 
-                  (selectionResult.budgetExceeded === true || selectionResult.totalPrice > bundleIntent.totalBudget)) {
-                reasoningText = `Found matching categories (${itemNames}), but couldn't meet the $${bundleIntent.totalBudget} total budget; showing closest-priced options.`;
+              // Build ranked candidates by itemIndex from AI handles
+              const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
+              for (const handle of aiBundle.selectedHandles) {
+                const candidate = sortedCandidates.find(c => c.handle === handle);
+                if (candidate) {
+                  const itemIdx = (candidate as any)._bundleItemIndex;
+                  if (typeof itemIdx === "number") {
+                    if (!rankedCandidatesByItem.has(itemIdx)) {
+                      rankedCandidatesByItem.set(itemIdx, []);
+                    }
+                    rankedCandidatesByItem.get(itemIdx)!.push(candidate);
+                  }
+                }
               }
+              
+              // Build allocated budgets map
+              const allocatedBudgets = new Map<number, number>();
+              bundleItemsWithBudget.forEach((item, idx) => {
+                if (item.budgetMax !== undefined && item.budgetMax !== null) {
+                  allocatedBudgets.set(idx, item.budgetMax);
+                }
+              });
+              
+              // Use budget-aware selection helper (legacy fallback only)
+              const selectionResult = selectBundleWithinBudget(
+                itemPools,
+                allocatedBudgets,
+                bundleIntent.totalBudget,
+                finalResultCount,
+                bundleItemsWithBudget.length,
+                rankedCandidatesByItem,
+                slotPlan
+              );
+              
+              finalHandles = selectionResult.handles;
+              bundleFinalHandles = finalHandles; // Store for top-up check
+              if (selectionResult.trustFallback) {
+                trustFallback = true;
+              }
+              
+              // Log budget selection details (legacy fallback)
+              const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
+                .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
+              console.log("[Bundle Budget] [LEGACY FALLBACK] chosenPrimaries", chosenPrimariesText);
+              console.log("[Bundle Budget] [LEGACY FALLBACK] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
+                " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
+                " finalCount=" + finalHandles.length + 
+                " trustFallback=" + selectionResult.trustFallback +
+                " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
+              
+              // Build reasoning for legacy fallback
+              let reasoningText = "";
+              if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
+                reasoningText = aiBundle.reasoning.trim();
+              } else {
+                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+                reasoningText = `Built a bundle: ${itemNames}.`;
+              }
+              
+              const deliveredAfterAI = finalHandles.length;
+              if (deliveredAfterAI < finalResultCount) {
+                reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+              }
+              
+              reasoningParts.push(reasoningText);
+              console.log("[Bundle] [LEGACY FALLBACK] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
             }
-            
-            // Add delivered vs requested count to reasoning (will be finalized after top-up)
-            const deliveredAfterAI = finalHandles.length;
-            if (deliveredAfterAI < finalResultCount) {
-              reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
-            }
-            
-            reasoningParts.push(reasoningText);
-            // Log AI success
-            console.log("[Bundle] AI selected", finalHandles.length, "handles (from", aiBundle.selectedHandles.length, "AI-ranked handles) across", bundleItemsWithBudget.length, "items");
           } else {
             // Fallback to deterministic selection if AI fails (no handles returned)
             bundleAiSucceeded = false;
@@ -5192,11 +5212,13 @@ async function processSessionInBackground({
         }
         
         // Log final result with AI success/failure indication
-        if (bundleAiSucceeded) {
-          console.log("[Bundle] AI selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
-        } else {
+        if (bundleAiSucceeded && finalHandles.length > 0) {
+          console.log(`[Bundle] ✅ AI bundle result: ${finalHandles.length} handles across ${bundleItemsWithBudget.length} items (skipped legacy selection)`);
+        } else if (finalHandles.length > 0) {
           const failReasonText = parseFailReason ? ` parse_fail_reason=${parseFailReason}` : "";
-          console.log("[Bundle] Deterministic fallback selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items" + failReasonText);
+          console.log(`[Bundle] ⚠️  Fallback selected: ${finalHandles.length} handles across ${bundleItemsWithBudget.length} items${failReasonText}`);
+        } else {
+          console.log(`[Bundle] ❌ No handles selected - AI failed and fallback returned 0 handles`);
         }
         console.log("[Bundle] trustFallback=", trustFallback);
       } else {
@@ -5589,8 +5611,9 @@ async function processSessionInBackground({
       }
       
       // Log before validation (especially important for bundles)
+      // Use finalHandles (which contains AI result) for logging, not finalHandlesGuaranteed (which is set after validation)
       if (isBundleMode) {
-        console.log(`[Bundle] handles_before_validation count=${finalHandlesGuaranteed.length} preview=[${finalHandlesGuaranteed.slice(0, 5).join(", ")}${finalHandlesGuaranteed.length > 5 ? "..." : ""}]`);
+        console.log(`[Bundle] handles_before_validation count=${finalHandles.length} preview=[${finalHandles.slice(0, 5).join(", ")}${finalHandles.length > 5 ? "..." : ""}]`);
       }
       
       // Validate final handles (use enriched candidates)
@@ -5735,7 +5758,7 @@ async function processSessionInBackground({
         console.log("[App Proxy] [Layer 3] Validation filtered out all handles, using original finalHandles as fallback");
         finalHandlesGuaranteed = uniq(finalHandles);
       } else {
-        finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+      finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
       }
 
       // Bundle-safe top-up: only from bundle item pools
@@ -6056,6 +6079,12 @@ async function processSessionInBackground({
       
       // Only apply diversity if we have handles to diversify
       const handlesToDiversify = finalHandlesGuaranteed.slice(0, targetCount);
+      
+      // Log before diversity (especially important for bundles)
+      if (isBundleMode) {
+        console.log(`[Bundle] handles_before_diversity count=${handlesToDiversify.length} preview=[${handlesToDiversify.slice(0, 5).join(", ")}${handlesToDiversify.length > 5 ? "..." : ""}]`);
+      }
+      
       const diverseHandles = handlesToDiversify.length > 0
         ? ensureResultDiversity(handlesToDiversify, candidatesForDiversity, finalResultCount)
         : handlesToDiversify; // If empty, return as-is (diversity check will return empty anyway)
