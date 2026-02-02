@@ -122,7 +122,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
     // Charge on first delivery with lock-based concurrency safety
     // Only attempt billing when: status === COMPLETE, result exists, deliveredCount > 0
-    if (!chargedAt && deliveredCount > 0) {
+    // DO NOT bill if emergency_fallback_unmatched was used (all gating stages failed)
+    const reasoning = session.result.reasoning || "";
+    const isEmergencyFallbackUnmatched = reasoning.includes("No matches found for your request after searching") || 
+                                         reasoning.includes("emergency_fallback_unmatched") ||
+                                         reasoning.includes("after staged fallback");
+    
+    if (!chargedAt && deliveredCount > 0 && !isEmergencyFallbackUnmatched) {
       // Acquire lock atomically using updateMany
       const lockNow = new Date();
       const locked = await prisma.conciergeSession.updateMany({
@@ -168,6 +174,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             deliveredCount, 
             credits: creditsBurned 
           });
+          
+          // Skip billing if emergency fallback unmatched
+          if (isEmergencyFallbackUnmatched) {
+            console.log("[Billing] Skipping charge - emergency_fallback_unmatched (all gating stages failed)");
+            // Release lock without charging
+            await prisma.conciergeSession.update({
+              where: { id: session.id },
+              data: { chargeLockAt: null } as any,
+            });
+            return; // Exit early without charging
+          }
 
           // Update subscription credits in a transaction
           const subscription = await prisma.$transaction(async (tx) => {
