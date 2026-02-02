@@ -46,7 +46,36 @@ interface IntentParseResult {
 }
 
 const DEFAULT_MODEL = "gpt-4o-mini";
-const INTENT_PARSE_TIMEOUT_MS = 10000; // 10 seconds for intent parsing
+const INTENT_PARSE_TIMEOUT_BASE_MS = 20000; // Base 20 seconds for intent parsing
+const INTENT_PARSE_TIMEOUT_MAX_MS = 30000; // Cap at 30 seconds
+const INTENT_PARSE_RETRY_BACKOFF_MIN_MS = 300; // Minimum backoff for retry
+const INTENT_PARSE_RETRY_BACKOFF_MAX_MS = 800; // Maximum backoff for retry
+
+/**
+ * Calculate dynamic timeout based on conversation length
+ */
+function calculateIntentParseTimeout(conversationHistory?: Array<{ role: string; content: string }>): number {
+  let timeoutMs = INTENT_PARSE_TIMEOUT_BASE_MS;
+  
+  if (conversationHistory && conversationHistory.length > 3) {
+    // Add 5s per message beyond 3 messages
+    const extraMessages = conversationHistory.length - 3;
+    timeoutMs += extraMessages * 5000;
+  }
+  
+  // Cap at maximum
+  return Math.min(timeoutMs, INTENT_PARSE_TIMEOUT_MAX_MS);
+}
+
+/**
+ * Check if an error is a timeout/abort error
+ */
+function isTimeoutError(error: any): boolean {
+  return error?.name === "AbortError" || 
+         error?.message?.toLowerCase().includes("timeout") ||
+         error?.message?.toLowerCase().includes("aborted") ||
+         error?.code === "ECONNABORTED";
+}
 
 /**
  * Build JSON schema for structured intent output
@@ -145,12 +174,12 @@ function buildIntentSchema() {
 }
 
 /**
- * Parse user intent using OpenAI LLM
- * Returns structured intent that replaces pattern-based parsing
+ * Single attempt at parsing intent with OpenAI LLM
  */
-export async function parseIntentWithLLM(
+async function parseIntentAttempt(
   userQuery: string,
-  conversationHistory?: Array<{ role: "system" | "user" | "assistant"; content: string }>
+  conversationHistory: Array<{ role: "system" | "user" | "assistant"; content: string }> | undefined,
+  timeoutMs: number
 ): Promise<IntentParseResult> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -272,7 +301,7 @@ Your task is to analyze the user's query and extract:
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), INTENT_PARSE_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
       method: "POST",
@@ -420,8 +449,8 @@ Your task is to analyze the user's query and extract:
     };
 
   } catch (error: any) {
-    if (error.name === "AbortError") {
-      console.warn("[Intent Parsing] Timeout after", INTENT_PARSE_TIMEOUT_MS, "ms");
+    if (isTimeoutError(error)) {
+      console.warn("[Intent Parsing] Timeout after", timeoutMs, "ms");
       return {
         success: false,
         error: "Request timeout",
@@ -436,5 +465,40 @@ Your task is to analyze the user's query and extract:
       fallbackUsed: true
     };
   }
+}
+
+/**
+ * Parse user intent using OpenAI LLM with retry on timeout
+ * Returns structured intent that replaces pattern-based parsing
+ */
+export async function parseIntentWithLLM(
+  userQuery: string,
+  conversationHistory?: Array<{ role: "system" | "user" | "assistant"; content: string }>
+): Promise<IntentParseResult> {
+  // Calculate dynamic timeout
+  const timeoutMs = calculateIntentParseTimeout(conversationHistory);
+  
+  // First attempt
+  let result = await parseIntentAttempt(userQuery, conversationHistory, timeoutMs);
+  
+  // Retry only on timeout errors
+  if (!result.success && result.error === "Request timeout") {
+    // Small jitter backoff (300-800ms)
+    const backoffMs = INTENT_PARSE_RETRY_BACKOFF_MIN_MS + 
+      Math.floor(Math.random() * (INTENT_PARSE_RETRY_BACKOFF_MAX_MS - INTENT_PARSE_RETRY_BACKOFF_MIN_MS));
+    
+    console.log(`[Intent Parsing] Retrying after timeout, backoff=${backoffMs}ms`);
+    await new Promise(resolve => setTimeout(resolve, backoffMs));
+    
+    // Second attempt
+    result = await parseIntentAttempt(userQuery, conversationHistory, timeoutMs);
+    
+    if (!result.success) {
+      // Both attempts failed - mark clearly in logs
+      console.warn(`[Intent Parsing] fallback=pattern timeout=true attempts=2`);
+    }
+  }
+  
+  return result;
 }
 

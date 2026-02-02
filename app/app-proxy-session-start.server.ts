@@ -62,6 +62,7 @@ function pickString(obj: any, keys: string[]): string | null {
  */
 /**
  * Normalize a group key by removing sale/clearance tokens and generic terms
+ * (Legacy function - kept for backward compatibility with assignGroupKey)
  */
 function normalizeGroupKey(key: string): string {
   if (!key || typeof key !== "string") return "unknown";
@@ -82,6 +83,69 @@ function normalizeGroupKey(key: string): string {
   }
   
   return normalized;
+}
+
+/**
+ * Canonicalize a group key for merging duplicates (industry-agnostic)
+ * Handles singular/plural, punctuation, capitalization, whitespace variants
+ */
+function canonicalizeGroupKey(rawKey: string): string {
+  if (!rawKey || typeof rawKey !== "string") return "unknown";
+  
+  // Step 1: lowercase, trim
+  let canonical = rawKey.trim().toLowerCase();
+  
+  // Step 2: replace punctuation/separators with space, then collapse whitespace
+  canonical = canonical.replace(/[-_/.,'"]/g, " ").replace(/\s+/g, " ").trim();
+  
+  if (canonical.length === 0) return "unknown";
+  
+  // Step 3: Split into tokens
+  const tokens = canonical.split(/\s+/).filter(t => t.length > 0);
+  
+  // Step 4: Remove leading/trailing stop tokens (the, and, of) if standalone
+  const stopTokens = new Set(["the", "and", "of"]);
+  while (tokens.length > 0 && stopTokens.has(tokens[0])) {
+    tokens.shift();
+  }
+  while (tokens.length > 0 && stopTokens.has(tokens[tokens.length - 1])) {
+    tokens.pop();
+  }
+  
+  if (tokens.length === 0) return "unknown";
+  
+  // Step 5: Singularize tokens (conservative English)
+  const singularized = tokens.map(token => {
+    // Do not singularize short tokens or tokens with digits
+    if (token.length <= 3 || /\d/.test(token)) {
+      return token;
+    }
+    
+    // Conservative singularization rules
+    if (token.endsWith("ies") && token.length > 4) {
+      return token.slice(0, -3) + "y";
+    } else if (token.endsWith("sses") || token.endsWith("shes") || token.endsWith("ches") || token.endsWith("xes") || token.endsWith("zes")) {
+      return token.slice(0, -2);
+    } else if (token.endsWith("s") && !token.endsWith("ss") && token.length > 1) {
+      return token.slice(0, -1);
+    }
+    
+    return token;
+  });
+  
+  // Step 6: Remove duplicate tokens (keep order)
+  const uniqueTokens: string[] = [];
+  const seen = new Set<string>();
+  for (const token of singularized) {
+    if (!seen.has(token)) {
+      uniqueTokens.push(token);
+      seen.add(token);
+    }
+  }
+  
+  if (uniqueTokens.length === 0) return "unknown";
+  
+  return uniqueTokens.join(" ");
 }
 
 /**
@@ -4701,9 +4765,12 @@ async function processSessionInBackground({
         // Derive family keys for all ranked candidates
         const candidatesWithFamilies = rankedCandidates.map(r => {
           const familyInfo = deriveFamilyKey(r.candidate);
+          const rawKey = familyInfo.key;
+          const canonicalKey = canonicalizeGroupKey(rawKey);
           return {
             ...r,
-            familyKey: familyInfo.key,
+            familyKey: canonicalKey, // Use canonical key for grouping
+            rawFamilyKey: rawKey, // Keep raw key for reference
             familySource: familyInfo.source
           };
         });
@@ -4715,26 +4782,208 @@ async function processSessionInBackground({
         });
         console.log(`[CollectionIntent] familyKey_source sample=${JSON.stringify(sampleFamilySources)}`);
         
-        // Build groupsByFamilyKey: count + top BM25 score per family
-        const familyStats = new Map<string, { count: number; topBM25: number }>();
+        // ============================================
+        // COMPUTE INTENT STRENGTH
+        // ============================================
+        // Get preferences count (from LLM intent if available)
+        // Note: preferences are merged into softTerms earlier, but we can still count them if LLM provided them
+        let preferencesCount = 0;
+        if (llmIntentUsed && llmIntentResult?.intent?.preferences) {
+          preferencesCount = Array.isArray(llmIntentResult.intent.preferences) ? llmIntentResult.intent.preferences.length : 0;
+        }
+        
+        const intentStrength = Math.min(1.0, Math.max(0.0, (hardTerms.length * 2 + softTerms.length + preferencesCount) / 6));
+        console.log(`[CollectionIntent] intent_strength=${intentStrength.toFixed(2)} hardTerms=${hardTerms.length} softTerms=${softTerms.length} preferences=${preferencesCount}`);
+        
+        // ============================================
+        // COMPUTE COMMITMENT SCORE PER FAMILY
+        // ============================================
+        // Group candidates by family for commitment calculation
+        const familyCandidatesMap = new Map<string, typeof candidatesWithFamilies>();
         candidatesWithFamilies.forEach(c => {
-          const existing = familyStats.get(c.familyKey);
+          if (!familyCandidatesMap.has(c.familyKey)) {
+            familyCandidatesMap.set(c.familyKey, []);
+          }
+          familyCandidatesMap.get(c.familyKey)!.push(c);
+        });
+        
+        // Compute commitment score per family
+        const familyCommitmentScores = new Map<string, number>();
+        const allPrices: number[] = [];
+        const allTitleLengths: number[] = [];
+        const allDescLengths: number[] = [];
+        const allVariantCounts: number[] = [];
+        
+        // First pass: collect global stats for normalization
+        candidatesWithFamilies.forEach(c => {
+          const price = c.candidate.price ? parseFloat(String(c.candidate.price)) : 0;
+          if (Number.isFinite(price) && price > 0) allPrices.push(price);
+          
+          const titleLen = c.candidate.title ? String(c.candidate.title).length : 0;
+          if (titleLen > 0) allTitleLengths.push(titleLen);
+          
+          const descLen = c.candidate.description ? String(c.candidate.description).length : 0;
+          if (descLen > 0) allDescLengths.push(descLen);
+          
+          // Count variants/options
+          const optionValues = c.candidate.optionValues || {};
+          const variantCount = Object.keys(optionValues).length;
+          if (variantCount > 0) allVariantCounts.push(variantCount);
+        });
+        
+        const medianPrice = allPrices.length > 0 ? [...allPrices].sort((a, b) => a - b)[Math.floor(allPrices.length / 2)] : 0;
+        const avgTitleLength = allTitleLengths.length > 0 ? allTitleLengths.reduce((a, b) => a + b, 0) / allTitleLengths.length : 0;
+        const avgDescLength = allDescLengths.length > 0 ? allDescLengths.reduce((a, b) => a + b, 0) / allDescLengths.length : 0;
+        const avgVariantCount = allVariantCounts.length > 0 ? allVariantCounts.reduce((a, b) => a + b, 0) / allVariantCounts.length : 0;
+        
+        // Second pass: compute commitment score per family
+        familyCandidatesMap.forEach((candidates, familyKey) => {
+          const familyPrices: number[] = [];
+          const familyTitleLengths: number[] = [];
+          const familyDescLengths: number[] = [];
+          const familyVariantCounts: number[] = [];
+          let hasSetBundleKit = false;
+          
+          candidates.forEach(c => {
+            const price = c.candidate.price ? parseFloat(String(c.candidate.price)) : 0;
+            if (Number.isFinite(price) && price > 0) familyPrices.push(price);
+            
+            const titleLen = c.candidate.title ? String(c.candidate.title).length : 0;
+            if (titleLen > 0) familyTitleLengths.push(titleLen);
+            
+            const descLen = c.candidate.description ? String(c.candidate.description).length : 0;
+            if (descLen > 0) familyDescLengths.push(descLen);
+            
+            const optionValues = c.candidate.optionValues || {};
+            const variantCount = Object.keys(optionValues).length;
+            if (variantCount > 0) familyVariantCounts.push(variantCount);
+            
+            // Check for set/bundle/kit/complete signals (generic, industry-agnostic)
+            const searchText = extractSearchText(c.candidate).toLowerCase();
+            if (/\b(set|bundle|kit|complete|pack|collection|ensemble)\b/.test(searchText)) {
+              hasSetBundleKit = true;
+            }
+          });
+          
+          const familyMedianPrice = familyPrices.length > 0 
+            ? [...familyPrices].sort((a, b) => a - b)[Math.floor(familyPrices.length / 2)] 
+            : 0;
+          const familyAvgTitleLength = familyTitleLengths.length > 0 
+            ? familyTitleLengths.reduce((a, b) => a + b, 0) / familyTitleLengths.length 
+            : 0;
+          const familyAvgDescLength = familyDescLengths.length > 0 
+            ? familyDescLengths.reduce((a, b) => a + b, 0) / familyDescLengths.length 
+            : 0;
+          const familyAvgVariantCount = familyVariantCounts.length > 0 
+            ? familyVariantCounts.reduce((a, b) => a + b, 0) / familyVariantCounts.length 
+            : 0;
+          
+          // Compute normalized commitment components (0..1 each)
+          const priceComponent = medianPrice > 0 ? Math.min(1.0, familyMedianPrice / (medianPrice * 2)) : 0.5;
+          const complexityComponent = avgTitleLength > 0 && avgDescLength > 0
+            ? Math.min(1.0, ((familyAvgTitleLength / avgTitleLength) + (familyAvgDescLength / avgDescLength)) / 2)
+            : 0.5;
+          const variantComponent = avgVariantCount > 0
+            ? Math.min(1.0, familyAvgVariantCount / (avgVariantCount * 2))
+            : 0.5;
+          const setBundleComponent = hasSetBundleKit ? 0.8 : 0.3;
+          
+          // Weighted average (normalize to 0..1)
+          const commitmentScore = (priceComponent * 0.4 + complexityComponent * 0.2 + variantComponent * 0.2 + setBundleComponent * 0.2);
+          familyCommitmentScores.set(familyKey, commitmentScore);
+        });
+        
+        // Log commitment scores
+        const perFamilyCommitment: Record<string, number> = {};
+        familyCommitmentScores.forEach((score, key) => {
+          perFamilyCommitment[key] = parseFloat(score.toFixed(2));
+        });
+        console.log(`[CollectionIntent] per_family_commitment=${JSON.stringify(perFamilyCommitment)}`);
+        
+        // ============================================
+        // CANONICALIZE AND MERGE FAMILY GROUPS
+        // ============================================
+        // First, build raw family stats (before canonicalization)
+        // Note: candidatesWithFamilies already has canonicalKey in familyKey, but we need to use rawFamilyKey for proper merging
+        const rawFamilyStats = new Map<string, { count: number; topBM25: number; commitmentScore: number; rawKey: string }>();
+        candidatesWithFamilies.forEach(c => {
+          // Use rawFamilyKey (original) for building raw stats, then canonicalize for merging
+          const rawKey = c.rawFamilyKey || c.familyKey; // Fallback to familyKey if rawFamilyKey missing
+          const existing = rawFamilyStats.get(rawKey);
+          // Get commitment score using the canonical key (familyKey)
+          const commitmentScore = familyCommitmentScores.get(c.familyKey) || 0.5;
           if (!existing || c.score > existing.topBM25) {
-            familyStats.set(c.familyKey, {
+            rawFamilyStats.set(rawKey, {
               count: (existing?.count || 0) + 1,
-              topBM25: c.score
+              topBM25: c.score,
+              commitmentScore,
+              rawKey
             });
           } else {
-            familyStats.set(c.familyKey, {
+            rawFamilyStats.set(rawKey, {
               ...existing,
-              count: existing.count + 1
+              count: existing.count + 1,
+              commitmentScore,
+              rawKey
             });
           }
         });
         
+        // Log sample normalization for debugging
+        const normalizationSample: Array<{ raw: string; canonical: string }> = [];
+        Array.from(rawFamilyStats.keys()).slice(0, 10).forEach(rawKey => {
+          const canonical = canonicalizeGroupKey(rawKey);
+          normalizationSample.push({ raw: rawKey, canonical });
+        });
+        console.log(`[CollectionIntent] group_key_normalization sample=${JSON.stringify(normalizationSample)}`);
+        
+        // Merge groups by canonicalKey
+        const canonicalFamilyStats = new Map<string, { 
+          count: number; 
+          topBM25: number; 
+          commitmentScore: number; 
+          mergedFrom: string[];
+        }>();
+        
+        rawFamilyStats.forEach((stats, rawKey) => {
+          const canonicalKey = canonicalizeGroupKey(rawKey);
+          const existing = canonicalFamilyStats.get(canonicalKey);
+          
+          if (!existing) {
+            canonicalFamilyStats.set(canonicalKey, {
+              count: stats.count,
+              topBM25: stats.topBM25,
+              commitmentScore: stats.commitmentScore,
+              mergedFrom: [rawKey]
+            });
+          } else {
+            // Merge: sum counts, max BM25, max commitment
+            canonicalFamilyStats.set(canonicalKey, {
+              count: existing.count + stats.count,
+              topBM25: Math.max(existing.topBM25, stats.topBM25),
+              commitmentScore: Math.max(existing.commitmentScore, stats.commitmentScore),
+              mergedFrom: [...existing.mergedFrom, rawKey]
+            });
+          }
+        });
+        
+        // Log merged groups (show examples of merges)
+        const mergedExamples: Array<{ canonical: string; mergedFrom: string[] }> = [];
+        canonicalFamilyStats.forEach((stats, canonicalKey) => {
+          if (stats.mergedFrom.length > 1) {
+            mergedExamples.push({ canonical: canonicalKey, mergedFrom: stats.mergedFrom });
+          }
+        });
+        const removedCount = rawFamilyStats.size - canonicalFamilyStats.size;
+        console.log(`[CollectionIntent] merged_groups removed=${removedCount} examples=${JSON.stringify(mergedExamples.slice(0, 5))}`);
+        
         // Score each family: maxBM25 (or avgBM25 + count) - using maxBM25 for simplicity
-        const familyGroups = Array.from(familyStats.entries())
-          .map(([key, stats]) => ({ key, ...stats }))
+        const familyGroups = Array.from(canonicalFamilyStats.entries())
+          .map(([canonicalKey, stats]) => ({ 
+            key: canonicalKey, // Use canonical key
+            rawKey: stats.mergedFrom[0], // Keep first raw key for reference
+            ...stats 
+          }))
           .sort((a, b) => {
             // First by top BM25 score (descending)
             if (Math.abs(b.topBM25 - a.topBM25) > 0.01) {
@@ -4744,31 +4993,86 @@ async function processSessionInBackground({
             return b.count - a.count;
           });
         
-        console.log(`[CollectionIntent] family_groups=${JSON.stringify(familyGroups.slice(0, 10).map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25.toFixed(2) })))}`);
+        console.log(`[CollectionIntent] family_groups=${JSON.stringify(familyGroups.slice(0, 10).map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25.toFixed(2), commitment: f.commitmentScore.toFixed(2), mergedFrom: f.mergedFrom.length > 1 ? f.mergedFrom : undefined })))}`);
         
-        // Choose up to 4 families with highest score, enforce at least 2 distinct families
-        let chosenFamilies: Array<{ key: string; count: number; topBM25: number }> = [];
-        const candidatePool = familyGroups;
-        const totalCount = candidatesWithFamilies.length;
+        // ============================================
+        // FILTER FAMILIES BASED ON INTENT STRENGTH
+        // ============================================
+        // Always include the top 1 family by BM25 relevance
+        const topFamily = familyGroups.length > 0 ? familyGroups[0] : null;
+        const topFamilyBM25 = topFamily ? topFamily.topBM25 : 0;
         
-        for (const family of candidatePool) {
-          if (chosenFamilies.length >= 4) break;
+        // Filter families based on intent strength and commitment
+        let filteredFamilies: Array<{ key: string; count: number; topBM25: number; commitmentScore: number }> = [];
+        const excludedFamilies: Array<{ key: string; reason: string }> = [];
+        
+        if (topFamily) {
+          filteredFamilies.push(topFamily); // Always include top family
+        }
+        
+        // For remaining families, apply filtering when intent strength is low
+        for (let i = 1; i < familyGroups.length && filteredFamilies.length < 4; i++) {
+          const family = familyGroups[i];
           
-          // Check if this family is similar to any already chosen (simple substring check)
-          const isSimilar = chosenFamilies.some(chosen => 
+          // Skip if similar to already chosen
+          const isSimilar = filteredFamilies.some(chosen => 
             chosen.key.includes(family.key) || family.key.includes(chosen.key)
           );
+          if (isSimilar) continue;
           
-          if (!isSimilar) {
-            chosenFamilies.push(family);
+          // Skip "unknown" unless we have <2 families or it's close to top BM25
+          if (family.key === "unknown") {
+            if (filteredFamilies.length >= 2 && family.topBM25 < topFamilyBM25 * 0.85) {
+              excludedFamilies.push({ key: family.key, reason: "unknown_low_relevance" });
+              continue;
+            }
+          }
+          
+          // Apply commitment filtering when intent strength is low
+          if (intentStrength < 0.35) {
+            const commitmentScore = family.commitmentScore;
+            const bm25Ratio = topFamilyBM25 > 0 ? family.topBM25 / topFamilyBM25 : 0;
+            
+            // Exclude high-commitment families unless BM25 is close to top
+            if (commitmentScore > 0.65 && bm25Ratio < 0.85) {
+              excludedFamilies.push({ 
+                key: family.key, 
+                reason: `high_commitment_low_intent commitment=${commitmentScore.toFixed(2)} bm25Ratio=${bm25Ratio.toFixed(2)}` 
+              });
+              continue;
+            }
+          }
+          
+          filteredFamilies.push(family);
+        }
+        
+        // If we still have <2 families, include "unknown" as last resort
+        if (filteredFamilies.length < 2) {
+          const unknownFamily = familyGroups.find(f => f.key === "unknown");
+          if (unknownFamily && !filteredFamilies.some(f => f.key === "unknown")) {
+            filteredFamilies.push(unknownFamily);
+          }
+          
+          // Also add any remaining families if still <2
+          if (filteredFamilies.length < 2) {
+            const remaining = familyGroups
+              .filter(f => !filteredFamilies.some(chosen => chosen.key === f.key))
+              .slice(0, 2 - filteredFamilies.length);
+            filteredFamilies.push(...remaining);
           }
         }
         
-        // If we don't have enough distinct families, include all families (fallback)
-        if (chosenFamilies.length < 2) {
-          const allFamilies = candidatePool.slice(0, 2 - chosenFamilies.length);
-          chosenFamilies.push(...allFamilies);
-        }
+        console.log(`[CollectionIntent] filtered_families=${JSON.stringify(filteredFamilies.map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25.toFixed(2), commitment: f.commitmentScore.toFixed(2) })))} excluded=${JSON.stringify(excludedFamilies)}`);
+        
+        // Use filtered families as chosen families
+        let chosenFamilies: Array<{ key: string; count: number; topBM25: number }> = filteredFamilies.map(f => ({
+          key: f.key,
+          count: f.count,
+          topBM25: f.topBM25
+        }));
+        
+        const candidatePool = familyGroups;
+        const totalCount = candidatesWithFamilies.length;
         
         // ============================================
         // DOMINANT FAMILY DETECTION (fixed calculation)
@@ -5789,30 +6093,34 @@ async function processSessionInBackground({
         }
         
         // ============================================
-        // COVERAGE GUARDRAIL (for collection intent - uses family keys)
+        // COVERAGE GUARDRAIL (for collection intent - uses canonical family keys)
         // ============================================
         if (collectionIntent && !bundleIntent.isBundle && finalHandles.length > 0) {
-          // Reconstruct chosen families using the same logic as window selection
+          // Reconstruct chosen families using the same logic as window selection (with canonicalization)
           const candidatesWithFamilies = rankedCandidates.map(r => {
             const familyInfo = deriveFamilyKey(r.candidate);
+            const rawKey = familyInfo.key;
+            const canonicalKey = canonicalizeGroupKey(rawKey);
             return {
               candidate: r.candidate,
               score: r.score,
-              familyKey: familyInfo.key
+              familyKey: canonicalKey // Use canonical key
             };
           });
           
-          // Build familyStats (same as window selection)
-          const familyStats = new Map<string, { count: number; topBM25: number }>();
+          // Build family stats using canonical keys (already canonicalized in candidatesWithFamilies)
+          // Since candidatesWithFamilies already has canonical keys, we can directly build stats
+          const canonicalFamilyStats = new Map<string, { count: number; topBM25: number }>();
           candidatesWithFamilies.forEach(c => {
-            const existing = familyStats.get(c.familyKey);
+            const canonicalKey = c.familyKey; // Already canonical
+            const existing = canonicalFamilyStats.get(canonicalKey);
             if (!existing || c.score > existing.topBM25) {
-              familyStats.set(c.familyKey, {
+              canonicalFamilyStats.set(canonicalKey, {
                 count: (existing?.count || 0) + 1,
                 topBM25: c.score
               });
             } else {
-              familyStats.set(c.familyKey, {
+              canonicalFamilyStats.set(canonicalKey, {
                 ...existing,
                 count: existing.count + 1
               });
@@ -5820,8 +6128,8 @@ async function processSessionInBackground({
           });
           
           // Rank families by top BM25, then count (same as window selection)
-          const rankedFamilies = Array.from(familyStats.entries())
-            .map(([key, stats]) => ({ key, ...stats }))
+          const rankedFamilies = Array.from(canonicalFamilyStats.entries())
+            .map(([key, stats]) => ({ key, count: stats.count, topBM25: stats.topBM25 }))
             .sort((a, b) => {
               if (Math.abs(b.topBM25 - a.topBM25) > 0.01) {
                 return b.topBM25 - a.topBM25;
@@ -5839,24 +6147,25 @@ async function processSessionInBackground({
               chosen.key.includes(family.key) || family.key.includes(chosen.key)
             );
             if (!isSimilar) {
-              chosenFamilies.push(family);
+              chosenFamilies.push({ key: family.key, count: family.count, topBM25: family.topBM25 });
             }
           }
           
           if (chosenFamilies.length < 2) {
             const allFamilies = rankedFamilies.slice(0, 2 - chosenFamilies.length);
-            chosenFamilies.push(...allFamilies);
+            chosenFamilies.push(...allFamilies.map(f => ({ key: f.key, count: f.count, topBM25: f.topBM25 })));
           }
           
           const chosenFamilyKeys = chosenFamilies.map(f => f.key);
           
-          // Check which families are represented in finalHandles
+          // Check which families are represented in finalHandles (use canonical keys)
           const coverageBefore: Record<string, number> = {};
           finalHandles.forEach(handle => {
             const candidate = sortedCandidates.find(c => c.handle === handle);
             if (candidate) {
               const familyInfo = deriveFamilyKey(candidate);
-              coverageBefore[familyInfo.key] = (coverageBefore[familyInfo.key] || 0) + 1;
+              const canonicalKey = canonicalizeGroupKey(familyInfo.key);
+              coverageBefore[canonicalKey] = (coverageBefore[canonicalKey] || 0) + 1;
             }
           });
           
