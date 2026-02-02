@@ -3445,33 +3445,219 @@ async function processSessionInBackground({
       const fromTextForIntent = parseConstraintsFromText(userIntent);
       const variantConstraintsForIntent = mergeConstraints(fromAnswersForIntent, fromTextForIntent);
       
-        // Merge LLM facets with variant constraints (variant constraints take precedence - explicit user selection wins)
-        hardFacets = {
-          size: variantConstraintsForIntent.size || intent.hardFacets?.size || null,
-          color: variantConstraintsForIntent.color || intent.hardFacets?.color || null,
-          material: variantConstraintsForIntent.material || intent.hardFacets?.material || null
-        };
-        
         // Convert LLM bundle structure to existing format
+        // CRITICAL: Extract canonical_type (head noun) and facets per-item
         const isValidBundle = intent.isBundle === true && Array.isArray(intent.bundleItems) && intent.bundleItems.length >= 2;
-        bundleIntent = {
-          isBundle: isValidBundle,
-          items: isValidBundle ? (intent.bundleItems || [])
-            .filter(item => item && Array.isArray(item.hardTerms) && item.hardTerms.length > 0)
-            .map(item => ({
-              hardTerms: item.hardTerms.filter((t: string) => typeof t === "string" && t.trim().length > 0),
+        
+        // Helper to extract canonical_type and facets from hardTerms (industry-agnostic)
+        function extractCanonicalTypeAndFacets(hardTerms: string[], existingFacets?: { size?: string | null; color?: string | null; material?: string | null }): {
+          canonicalType: string;
+          facets: { size: string | null; color: string | null; material: string | null };
+        } {
+          // Common color terms (industry-agnostic)
+          const colorTerms = new Set([
+            "red", "blue", "green", "yellow", "orange", "purple", "pink", "brown", "black", "white", "gray", "grey",
+            "navy", "beige", "tan", "maroon", "burgundy", "crimson", "scarlet", "azure", "cyan", "teal", "lime",
+            "olive", "khaki", "ivory", "cream", "silver", "gold", "bronze", "copper"
+          ]);
+          
+          // Common size terms (industry-agnostic)
+          const sizeTerms = new Set([
+            "xs", "s", "m", "l", "xl", "xxl", "xxxl", "small", "medium", "large", "extra", "one", "size"
+          ]);
+          
+          // Common material terms (industry-agnostic)
+          const materialTerms = new Set([
+            "cotton", "wool", "silk", "linen", "polyester", "nylon", "leather", "suede", "denim", "satin",
+            "cashmere", "bamboo", "modal", "rayon", "spandex", "elastane", "acrylic", "viscose"
+          ]);
+          
+          const facets: { size: string | null; color: string | null; material: string | null } = {
+            size: existingFacets?.size || null,
+            color: existingFacets?.color || null,
+            material: existingFacets?.material || null
+          };
+          
+          // Extract facets from hardTerms
+          const remainingTerms: string[] = [];
+          for (const term of hardTerms) {
+            const normalized = term.toLowerCase().trim();
+            if (colorTerms.has(normalized) && !facets.color) {
+              facets.color = term; // Keep original case
+            } else if (sizeTerms.has(normalized) && !facets.size) {
+              facets.size = term;
+            } else if (materialTerms.has(normalized) && !facets.material) {
+              facets.material = term;
+            } else {
+              remainingTerms.push(term);
+            }
+          }
+          
+          // Canonical type is the longest remaining term (likely the head noun)
+          // If no terms remain, use the first hardTerm as fallback
+          let canonicalType = "unknown";
+          if (remainingTerms.length > 0) {
+            // Prefer longer terms (more specific nouns)
+            canonicalType = remainingTerms.reduce((longest, current) => 
+              current.length > longest.length ? current : longest, remainingTerms[0]
+            );
+            // Normalize: lowercase, singularize if needed
+            canonicalType = normalizeItemLabel(canonicalType);
+          } else if (hardTerms.length > 0) {
+            // Fallback: use first term if all were facets
+            canonicalType = normalizeItemLabel(hardTerms[0]);
+          }
+          
+          return { canonicalType, facets };
+        }
+        
+        // Normalize bundle items: extract canonical_type and per-item facets
+        const normalizedBundleItems: Array<{
+          hardTerms: string[];
+          canonicalType: string;
+          quantity: number;
+          constraints?: any;
+          facets: { size: string | null; color: string | null; material: string | null };
+        }> = [];
+        
+        if (isValidBundle) {
+          for (const item of intent.bundleItems || []) {
+            if (!item || !Array.isArray(item.hardTerms) || item.hardTerms.length === 0) continue;
+            
+            const filteredHardTerms = item.hardTerms.filter((t: string) => typeof t === "string" && t.trim().length > 0);
+            if (filteredHardTerms.length === 0) continue;
+            
+            // Extract canonical_type and facets
+            const existingFacets = item.constraints?.optionConstraints || {};
+            const { canonicalType, facets } = extractCanonicalTypeAndFacets(filteredHardTerms, {
+              size: existingFacets.size || null,
+              color: existingFacets.color || null,
+              material: existingFacets.material || null
+            });
+            
+            // Merge extracted facets with existing constraints
+            const mergedFacets = {
+              size: facets.size || existingFacets.size || null,
+              color: facets.color || existingFacets.color || null,
+              material: facets.material || existingFacets.material || null
+            };
+            
+            // Build constraints with per-item facets
+            const constraints = item.constraints && typeof item.constraints === "object" ? {
+              ...item.constraints,
+              optionConstraints: {
+                size: mergedFacets.size,
+                color: mergedFacets.color,
+                material: mergedFacets.material
+              }
+            } : {
+              optionConstraints: mergedFacets,
+              priceCeiling: null,
+              includeTerms: [],
+              excludeTerms: []
+            };
+            
+            normalizedBundleItems.push({
+              hardTerms: [canonicalType], // Use canonical_type as the main term
+              canonicalType,
               quantity: typeof item.quantity === "number" && item.quantity > 0 ? item.quantity : 1,
-              constraints: item.constraints && typeof item.constraints === "object" ? item.constraints : undefined
-            })) : [],
-          totalBudget: typeof intent.totalBudget === "number" && intent.totalBudget > 0 ? intent.totalBudget : null,
-          totalBudgetCurrency: typeof intent.totalBudgetCurrency === "string" ? intent.totalBudgetCurrency : null
-        };
+              constraints,
+              facets: mergedFacets
+            });
+          }
+          
+          // Deduplicate: prevent duplicate bundle items with same canonical_type unless quantity>1
+          const seenTypes = new Map<string, number>();
+          const deduplicatedItems: typeof normalizedBundleItems = [];
+          
+          for (const item of normalizedBundleItems) {
+            const existingIndex = seenTypes.get(item.canonicalType);
+            if (existingIndex !== undefined) {
+              // Duplicate canonical_type found - merge quantities if both are quantity=1
+              const existing = deduplicatedItems[existingIndex];
+              if (existing.quantity === 1 && item.quantity === 1) {
+                // Merge: keep first, but this shouldn't happen if LLM is correct
+                console.warn(`[Bundle Normalization] Duplicate canonical_type "${item.canonicalType}" detected - keeping first occurrence`);
+              } else {
+                // Different quantities - keep both (user explicitly requested multiples)
+                deduplicatedItems.push(item);
+              }
+            } else {
+              seenTypes.set(item.canonicalType, deduplicatedItems.length);
+              deduplicatedItems.push(item);
+            }
+          }
+          
+          // Log normalized bundle items
+          console.log(`[Bundle Normalization] bundleItems canonical_type + per-item facets:`, 
+            deduplicatedItems.map(item => ({
+              canonicalType: item.canonicalType,
+              quantity: item.quantity,
+              facets: item.facets,
+              hardTerms: item.hardTerms
+            }))
+          );
+          
+          bundleIntent = {
+            isBundle: deduplicatedItems.length >= 2,
+            items: deduplicatedItems.map(item => ({
+              hardTerms: item.hardTerms,
+              quantity: item.quantity,
+              constraints: item.constraints
+            })),
+            totalBudget: typeof intent.totalBudget === "number" && intent.totalBudget > 0 ? intent.totalBudget : null,
+            totalBudgetCurrency: typeof intent.totalBudgetCurrency === "string" ? intent.totalBudgetCurrency : null
+          };
+        } else {
+          bundleIntent = {
+            isBundle: false,
+            items: [],
+            totalBudget: typeof intent.totalBudget === "number" && intent.totalBudget > 0 ? intent.totalBudget : null,
+            totalBudgetCurrency: typeof intent.totalBudgetCurrency === "string" ? intent.totalBudgetCurrency : null
+          };
+        }
         
         // If bundle validation failed, ensure isBundle is false
         if (bundleIntent.isBundle && bundleIntent.items.length < 2) {
           bundleIntent.isBundle = false;
           bundleIntent.items = [];
           console.log("[Intent Parsing] ⚠️  Bundle validation failed: less than 2 valid items, treating as single item");
+        }
+        
+        // Merge LLM facets with variant constraints (AFTER bundle normalization)
+        // For bundle mode: only set global facets if user explicitly indicates "all/everything/both items" share a facet
+        // Check for global facet indicators in userIntent
+        const globalFacetPatterns = [
+          /\b(?:all|every|everything|both|each)\s+(?:items?|pieces?|things?|products?)\s+(?:are|is|in|should\s+be)\s+(\w+)/i,
+          /\b(?:all|every|everything|both|each)\s+in\s+(\w+)/i,
+          /\b(\w+)\s+(?:for|on)\s+(?:all|every|everything|both|each)/i
+        ];
+        
+        let hasGlobalFacetIndicator = false;
+        for (const pattern of globalFacetPatterns) {
+          if (pattern.test(userIntent)) {
+            hasGlobalFacetIndicator = true;
+            break;
+          }
+        }
+        
+        // Merge LLM facets with variant constraints (variant constraints take precedence - explicit user selection wins)
+        // For bundle mode: only use global facets if explicitly indicated, otherwise null
+        if (bundleIntent.isBundle && !hasGlobalFacetIndicator) {
+          // Bundle mode without global indicator: facets are per-item, not global
+          hardFacets = {
+            size: null,
+            color: null,
+            material: null
+          };
+          console.log(`[Bundle Normalization] global facets in bundle mode should be null unless explicitly global - hasGlobalIndicator=${hasGlobalFacetIndicator}`);
+        } else {
+          // Single-item mode OR bundle with global indicator: use global facets
+          hardFacets = {
+            size: variantConstraintsForIntent.size || intent.hardFacets?.size || null,
+            color: variantConstraintsForIntent.color || intent.hardFacets?.color || null,
+            material: variantConstraintsForIntent.material || intent.hardFacets?.material || null
+          };
         }
         
         // Merge preferences into softTerms if not already present
@@ -3561,12 +3747,21 @@ async function processSessionInBackground({
       
       // Log requested groups (normalized) for bundle mode
       if (bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        // Use canonical_type from normalized items (stored in hardTerms[0] after normalization)
         const requestedGroupsNormalized = bundleIntent.items.map((item, idx) => ({
           index: idx,
-          label: normalizeItemLabel(item.hardTerms[0] || "unknown"),
+          label: normalizeItemLabel(item.hardTerms[0] || "unknown"), // This is now canonical_type
           quantity: item.quantity || 1,
         }));
         console.log("[Bundle] requestedGroupsNormalized", requestedGroupsNormalized);
+        
+        // Log requestedTypes derived from canonical_type (not colors)
+        const requestedTypes = bundleIntent.items.map((item, idx) => ({
+          index: idx,
+          type: normalizeItemLabel(item.hardTerms[0] || "unknown"), // canonical_type
+          quantity: item.quantity || 1,
+        }));
+        console.log("[Bundle] requestedTypes derived from canonical_type (not colors)", requestedTypes);
       }
       
       // Currency conversion: Convert user budget to shop currency
@@ -7013,7 +7208,127 @@ async function processSessionInBackground({
         console.log("[App Proxy] After diversity check:", diverseHandles.length, "handles (was", handlesToDiversify.length, ")");
       }
       
-      // Update finalHandles with diverse result
+      // ============================================
+      // POST-DIVERSITY REFILL (for bundle mode)
+      // ============================================
+      // If diversity reduced handles below requestedCount, refill back to requestedCount
+      // by selecting additional valid handles from remaining candidates while respecting per-item slotPlan and constraints
+      if (isBundleMode && diverseHandles.length < finalResultCount && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        const beforeRefill = diverseHandles.length;
+        const usedHandlesSet = new Set(diverseHandles);
+        const refillNeeded = finalResultCount - diverseHandles.length;
+        
+        // Get slotPlan for bundle items
+        const slotPlan = allocateSlotsAcrossTypes(bundleIntent.items, finalResultCount);
+        
+        // Count current handles per item type
+        const handlesPerItem = new Map<number, string[]>();
+        diverseHandles.forEach(handle => {
+          const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+          if (candidate) {
+            // Find which bundle item this handle matches
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const item = bundleIntent.items[itemIdx];
+              const itemHardTerms = item.hardTerms || [];
+              const slotDescriptor = itemHardTerms.join(" ");
+              const slotScore = scoreProductForSlot(candidate, slotDescriptor);
+              
+              if (slotScore >= 0.1) {
+                // This handle matches this item type
+                if (!handlesPerItem.has(itemIdx)) {
+                  handlesPerItem.set(itemIdx, []);
+                }
+                handlesPerItem.get(itemIdx)!.push(handle);
+                break; // Only count once per handle
+              }
+            }
+          }
+        });
+        
+        // Refill by item type, respecting slotPlan
+        const refillHandles: string[] = [];
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length && refillHandles.length < refillNeeded; itemIdx++) {
+          const item = bundleIntent.items[itemIdx];
+          const currentCount = handlesPerItem.get(itemIdx)?.length || 0;
+          const targetSlots = slotPlan.get(itemIdx) || 0;
+          const neededForThisItem = Math.max(0, targetSlots - currentCount);
+          
+          if (neededForThisItem > 0) {
+            // Get item-specific constraints for gating
+            const itemConstraints = item.constraints;
+            const itemOptionConstraints = itemConstraints?.optionConstraints;
+            const itemHardTerms = item.hardTerms || [];
+            
+            // Find candidates that match this item type and constraints
+            const itemCandidates = allCandidatesEnriched
+              .filter(c => {
+                if (usedHandlesSet.has(c.handle) || refillHandles.includes(c.handle)) return false;
+                
+                // Apply item-specific facet constraints
+                if (itemOptionConstraints?.color && c.colors.length > 0) {
+                  const colorMatch = c.colors.some((col: string) => 
+                    normalizeText(col) === normalizeText(itemOptionConstraints.color!) ||
+                    normalizeText(col).includes(normalizeText(itemOptionConstraints.color!)) ||
+                    normalizeText(itemOptionConstraints.color!).includes(normalizeText(col))
+                  );
+                  if (!colorMatch) return false;
+                }
+                
+                if (itemOptionConstraints?.size && c.sizes.length > 0) {
+                  const sizeMatch = c.sizes.some((s: string) => 
+                    normalizeText(s) === normalizeText(itemOptionConstraints.size!) ||
+                    normalizeText(s).includes(normalizeText(itemOptionConstraints.size!)) ||
+                    normalizeText(itemOptionConstraints.size!).includes(normalizeText(s))
+                  );
+                  if (!sizeMatch) return false;
+                }
+                
+                if (itemOptionConstraints?.material && c.materials.length > 0) {
+                  const materialMatch = c.materials.some((m: string) => 
+                    normalizeText(m) === normalizeText(itemOptionConstraints.material!) ||
+                    normalizeText(m).includes(normalizeText(itemOptionConstraints.material!)) ||
+                    normalizeText(itemOptionConstraints.material!).includes(normalizeText(m))
+                  );
+                  if (!materialMatch) return false;
+                }
+                
+                // Apply token-based slot matching
+                const slotDescriptor = itemHardTerms.join(" ");
+                const slotScore = scoreProductForSlot(c, slotDescriptor);
+                if (slotScore < 0.1) return false;
+                
+                // Check availability
+                if (experience.inStockOnly && !c.available) return false;
+                
+                return true;
+              })
+              .sort((a, b) => {
+                // Sort by slot score (descending), then price (ascending)
+                const scoreA = scoreProductForSlot(a, itemHardTerms.join(" "));
+                const scoreB = scoreProductForSlot(b, itemHardTerms.join(" "));
+                if (Math.abs(scoreA - scoreB) > 0.01) {
+                  return scoreB - scoreA;
+                }
+                const priceA = a.price ? parseFloat(String(a.price)) : Infinity;
+                const priceB = b.price ? parseFloat(String(b.price)) : Infinity;
+                return priceA - priceB;
+              })
+              .slice(0, neededForThisItem);
+            
+            refillHandles.push(...itemCandidates.map(c => c.handle));
+          }
+        }
+        
+        // Add refilled handles to diverseHandles
+        if (refillHandles.length > 0) {
+          diverseHandles = [...diverseHandles, ...refillHandles].slice(0, finalResultCount);
+          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${refillHandles.length} source=remaining_candidates`);
+        } else {
+          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${beforeRefill} added=0 reason=no_valid_candidates`);
+        }
+      }
+      
+      // Update finalHandles with diverse result (potentially refilled)
       finalHandles = diverseHandles;
       finalHandlesGuaranteed = diverseHandles;
 
