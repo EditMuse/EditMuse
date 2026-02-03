@@ -546,11 +546,40 @@ export async function fetchShopifyProductsGraphQL({
                         name
                         values
                       }
-                      variants(first: 1) {
+                      variants(first: 50) {
                         edges {
                           node {
+                            title
+                            availableForSale
+                            selectedOptions {
+                              name
+                              value
+                            }
                             inventoryPolicy
                           }
+                        }
+                      }
+                      collections(first: 10) {
+                        edges {
+                          node {
+                            title
+                            handle
+                          }
+                        }
+                      }
+                      metafields(first: 20) {
+                        edges {
+                          node {
+                            namespace
+                            key
+                            value
+                            type
+                          }
+                        }
+                      }
+                      productCategory {
+                        productTaxonomyNode {
+                          fullName
                         }
                       }
                     }
@@ -661,11 +690,40 @@ export async function fetchShopifyProductsGraphQL({
                   name
                   values
                 }
-                variants(first: 1) {
+                variants(first: 50) {
                   edges {
                     node {
+                      title
+                      availableForSale
+                      selectedOptions {
+                        name
+                        value
+                      }
                       inventoryPolicy
                     }
+                  }
+                }
+                collections(first: 10) {
+                  edges {
+                    node {
+                      title
+                      handle
+                    }
+                  }
+                }
+                metafields(first: 20) {
+                  edges {
+                    node {
+                      namespace
+                      key
+                      value
+                      type
+                    }
+                  }
+                }
+                productCategory {
+                  productTaxonomyNode {
+                    fullName
                   }
                 }
               }
@@ -769,24 +827,107 @@ export async function fetchShopifyProductsGraphQL({
       }
     }
     
+    // Extract variant data (title, selectedOptions, availableForSale)
+    const variants: Array<{
+      title: string | null;
+      availableForSale: boolean;
+      selectedOptions: Array<{ name: string; value: string }>;
+    }> = [];
+    if (Array.isArray(node.variants?.edges)) {
+      for (const edge of node.variants.edges) {
+        const variant = edge?.node;
+        if (variant) {
+          variants.push({
+            title: variant.title || null,
+            availableForSale: variant.availableForSale || false,
+            selectedOptions: Array.isArray(variant.selectedOptions) 
+              ? variant.selectedOptions.filter((opt: any) => opt?.name && opt?.value)
+              : [],
+          });
+          
+          // Also extract option values from variant selectedOptions
+          if (Array.isArray(variant.selectedOptions)) {
+            for (const opt of variant.selectedOptions) {
+              if (opt?.name && opt?.value) {
+                const key = opt.name.toLowerCase();
+                if (!optionValues[key]) optionValues[key] = [];
+                if (!optionValues[key].includes(opt.value)) {
+                  optionValues[key].push(opt.value);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // Extract collections (title and handle)
+    const collections: Array<{ title: string; handle: string }> = [];
+    if (Array.isArray(node.collections?.edges)) {
+      for (const edge of node.collections.edges) {
+        const coll = edge?.node;
+        if (coll?.title && coll?.handle) {
+          collections.push({
+            title: coll.title,
+            handle: coll.handle,
+          });
+        }
+      }
+    }
+    
+    // Extract metafields (namespace, key, value, type)
+    const metafields: Array<{ namespace: string; key: string; value: string | null; type: string }> = [];
+    if (Array.isArray(node.metafields?.edges)) {
+      for (const edge of node.metafields.edges) {
+        const mf = edge?.node;
+        if (mf?.namespace && mf?.key) {
+          metafields.push({
+            namespace: mf.namespace,
+            key: mf.key,
+            value: mf.value || null,
+            type: mf.type || "single_line_text_field",
+          });
+        }
+      }
+    }
+    
+    // Extract productCategory fullName (guarded - may not be available)
+    const categoryFullName: string | null = node.productCategory?.productTaxonomyNode?.fullName || null;
+    
     // Build convenience arrays for sizes/colors/materials
+    // Also parse from tags (e.g., cf-color-*)
     const sizes: string[] = optionValues["size"] || [];
     const colors: string[] = (optionValues["color"] || []).concat(optionValues["colour"] || []);
     const materials: string[] = optionValues["material"] || [];
     
-    // Improved availability heuristic
+    // Parse color tags (cf-color-*)
+    if (Array.isArray(node.tags)) {
+      for (const tag of node.tags) {
+        if (typeof tag === "string" && tag.startsWith("cf-color-")) {
+          const color = tag.replace("cf-color-", "").trim();
+          if (color && !colors.includes(color.toLowerCase())) {
+            colors.push(color.toLowerCase());
+          }
+        }
+      }
+    }
+    
+    // Improved availability heuristic using variants
     let available = false;
     const totalInventory = node.totalInventory ?? 0;
     if (totalInventory > 0) {
       available = true;
+    } else if (variants.length > 0) {
+      // Check if any variant is availableForSale or has inventoryPolicy = "CONTINUE"
+      available = variants.some(v => v.availableForSale) || 
+                  variants.some(v => {
+                    // Check inventoryPolicy from original node data if available
+                    const variantNode = node.variants?.edges?.find((e: any) => e?.node?.title === v.title)?.node;
+                    return variantNode?.inventoryPolicy === "CONTINUE";
+                  });
     } else {
-      // Check if first variant has inventoryPolicy = "CONTINUE"
-      const firstVariant = node.variants?.edges?.[0]?.node;
-      if (firstVariant?.inventoryPolicy === "CONTINUE") {
-        available = true;
-      } else {
-        available = false;
-      }
+      // No variants - default to false
+      available = false;
     }
     
     return {
@@ -804,7 +945,12 @@ export async function fetchShopifyProductsGraphQL({
       description: null, // Not fetched in initial query - fetched separately for AI candidates
       status: node.status || null,
       // Add option intelligence
-      optionValues: optionValues,
+      options: options, // Full options array with name and values
+      optionValues: optionValues, // Map of option name -> values array
+      variants: variants, // Variants array with title, selectedOptions, availableForSale
+      collections: collections, // Collections array with title and handle
+      metafields: metafields, // Metafields array with namespace, key, value, type
+      categoryFullName: categoryFullName, // Product category full name if available
       sizes: sizes,
       colors: colors,
       materials: materials,

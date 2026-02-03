@@ -4984,7 +4984,7 @@ async function processSessionInBackground({
         }
       }
       
-      // Gate 2: Hard terms (must match at least one hard term if hard terms exist)
+      // Gate 2: Hard terms (STRICT: must match ALL hard terms when count >= 2, OR at least one when count == 1)
       // Use word-boundary matching on normalized text (title/productType/tags/descPlain), not substring
       let trustFallback = false;
       const strictGate: EnrichedCandidate[] = [];
@@ -4993,24 +4993,36 @@ async function processSessionInBackground({
       if (hardTerms.length > 0) {
         // Build normalized haystack using extractSearchText (includes ALL fields: title, handle, productType, tags, vendor, options, description)
         // Use unifiedNormalize for consistency
+        const requireAllHardTerms = hardTerms.length >= 2; // AND logic when 2+ terms
+        
         for (const candidate of gatedCandidates) {
           // Use extractSearchText which includes all relevant fields, then normalize
           const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
           
-          // Check hard terms with word-boundary matching (not substring/token matching)
-          // Multi-word terms are matched as phrases, single-word terms use word boundaries
-          const hasHardTermMatch = hardTerms.some(phrase => {
-            const normalizedPhrase = unifiedNormalize(phrase);
-            return matchesHardTermWithBoundary(haystack, normalizedPhrase);
-          });
+          // STRICT GATING: Require ALL hard terms when count >= 2 (AND logic)
+          let matchesHardTerms: boolean;
+          if (requireAllHardTerms) {
+            // AND logic: ALL hard terms must match
+            matchesHardTerms = hardTerms.every(phrase => {
+              const normalizedPhrase = unifiedNormalize(phrase);
+              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
+            });
+          } else {
+            // OR logic: at least one hard term must match (when only 1 term)
+            matchesHardTerms = hardTerms.some(phrase => {
+              const normalizedPhrase = unifiedNormalize(phrase);
+              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
+            });
+          }
           
-          // Also check boost terms (if user intent suggests them)
+          // Also check boost terms (if user intent suggests them) - boost terms are optional, not required
           const hasBoostTerm = Array.from(boostTerms).some(term => {
             const normalizedTerm = unifiedNormalize(term);
             return matchesHardTermWithBoundary(haystack, normalizedTerm);
           });
           
-          if (hasHardTermMatch || hasBoostTerm) {
+          // Include candidate if it matches hard terms (AND/OR based on count) OR has boost term
+          if (matchesHardTerms || hasBoostTerm) {
             strictGate.push(candidate);
           }
         }
@@ -5112,8 +5124,8 @@ async function processSessionInBackground({
               console.log(`[Gating] BM25 with token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
             } else {
               // All stages failed - return NO_MATCH
-              console.log(`[Gating] no_match=true - all gating stages failed (strictGateCount=0, synonym retry=0, BM25 filter=0)`);
-              // Will be handled below to return NO_MATCH result
+              console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
+              // Will be handled below to return NO_MATCH result (gatedCandidates.length will be 0)
             }
           }
         } else {

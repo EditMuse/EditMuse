@@ -83,6 +83,7 @@ model Experience {
   inStockOnly         Boolean            @default(false)
   isDefault           Boolean            @default(false)
   questionsJson       String             @default("[]") // JSON array of question objects
+  searchSynonymsJson  String?            // JSON object mapping term -> synonyms array (e.g., {"overcoat": ["coat","outerwear","jacket"]})
   createdAt           DateTime           @default(now())
   updatedAt           DateTime           @updatedAt
   conciergeSessions   ConciergeSession[]
