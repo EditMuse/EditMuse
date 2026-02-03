@@ -3057,6 +3057,27 @@ async function processSessionInBackground({
     console.log(`[Conversation] Extracted ${answers.length} user messages from conversation`);
   }
 
+  // BUG FIX #1: Early return for empty chat requests (no query, no answers, no messages)
+  // If conversation messages are empty AND answersJson is empty -> save NO_QUERY result
+  if (conversationMessages.length === 0 && answers.length === 0) {
+    console.log(`[App Proxy] NO_QUERY detected - conversation messages empty and answersJson empty - returning early`);
+    
+    await saveConciergeResult({
+      sessionToken,
+      productHandles: [],
+      productIds: null,
+      reasoning: "No query provided. Please enter a search term or question.",
+    });
+    
+    await prisma.conciergeSession.update({
+      where: { publicToken: sessionToken },
+      data: { status: ConciergeSessionStatus.COMPLETE },
+    });
+    
+    console.log("[App Proxy] NO_QUERY result saved - session marked COMPLETE with 0 products (no Shopify fetch, no AI ranking, no billing)");
+    return; // Exit early - DO NOT fetch products, DO NOT call AI ranking, DO NOT bill
+  }
+
   // Parse answers to extract price/budget range if present
   let priceMin: number | null = null;
   let priceMax: number | null = null;
@@ -3572,15 +3593,22 @@ async function processSessionInBackground({
         // SYNONYM EXPANSION: Expand hardTerms using Experience config (industry-agnostic)
         // Parse searchSynonymsJson from experience config
         let searchSynonyms: Record<string, string[]> = {};
+        const hasSearchSynonymsJson = experience.searchSynonymsJson !== null && experience.searchSynonymsJson !== undefined;
+        let synonymsKeysCount = 0;
+        
         try {
           if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "string") {
             searchSynonyms = JSON.parse(experience.searchSynonymsJson);
+            synonymsKeysCount = Object.keys(searchSynonyms).length;
           } else if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "object") {
             searchSynonyms = experience.searchSynonymsJson;
+            synonymsKeysCount = Object.keys(searchSynonyms).length;
           }
         } catch (e) {
           console.warn("[Synonyms] Failed to parse searchSynonymsJson:", e);
         }
+        
+        console.log(`[Synonyms] loading exists=${hasSearchSynonymsJson} keys_count=${synonymsKeysCount}`);
         
         // Expand hardTerms with synonyms (one-hop expansion)
         const originalHardTerms = [...hardTerms];
@@ -3609,8 +3637,9 @@ async function processSessionInBackground({
         
         const expandedHardTermsArray = Array.from(expandedHardTerms);
         const synonymsApplied = expandedHardTermsArray.length > hardTerms.length;
+        const expansionChangedTerms = synonymsApplied ? "true" : "false";
         
-        console.log(`[Synonyms] applied=${synonymsApplied} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
+        console.log(`[Synonyms] applied=${synonymsApplied} expansion_changed_terms=${expansionChangedTerms} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
         
         // Use expanded terms for gating (but keep original for logging/reasoning)
         hardTerms = expandedHardTermsArray;
@@ -3880,15 +3909,22 @@ async function processSessionInBackground({
         // SYNONYM EXPANSION: Expand hardTerms using Experience config (industry-agnostic)
         // Parse searchSynonymsJson from experience config
         let searchSynonyms: Record<string, string[]> = {};
+        const hasSearchSynonymsJson = experience.searchSynonymsJson !== null && experience.searchSynonymsJson !== undefined;
+        let synonymsKeysCount = 0;
+        
         try {
           if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "string") {
             searchSynonyms = JSON.parse(experience.searchSynonymsJson);
+            synonymsKeysCount = Object.keys(searchSynonyms).length;
           } else if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "object") {
             searchSynonyms = experience.searchSynonymsJson;
+            synonymsKeysCount = Object.keys(searchSynonyms).length;
           }
         } catch (e) {
           console.warn("[Synonyms] Failed to parse searchSynonymsJson:", e);
         }
+        
+        console.log(`[Synonyms] loading exists=${hasSearchSynonymsJson} keys_count=${synonymsKeysCount}`);
         
         // Expand hardTerms with synonyms (one-hop expansion)
         const originalHardTerms = [...hardTerms];
@@ -3917,8 +3953,9 @@ async function processSessionInBackground({
         
         const expandedHardTermsArray = Array.from(expandedHardTerms);
         const synonymsApplied = expandedHardTermsArray.length > hardTerms.length;
+        const expansionChangedTerms = synonymsApplied ? "true" : "false";
         
-        console.log(`[Synonyms] applied=${synonymsApplied} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
+        console.log(`[Synonyms] applied=${synonymsApplied} expansion_changed_terms=${expansionChangedTerms} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
         
         // Use expanded terms for gating (but keep original for logging/reasoning)
         hardTerms = expandedHardTermsArray;
@@ -4987,6 +5024,7 @@ async function processSessionInBackground({
       // Gate 2: Hard terms (STRICT: must match ALL hard terms when count >= 2, OR at least one when count == 1)
       // Use word-boundary matching on normalized text (title/productType/tags/descPlain), not substring
       let trustFallback = false;
+      let noMatchDetected = false; // BUG FIX #2: Track no_match flag to short-circuit pipeline
       const strictGate: EnrichedCandidate[] = [];
       let strictGateCount = 0; // Declare outside if block for use in type anchor gating
       
@@ -5125,7 +5163,9 @@ async function processSessionInBackground({
             } else {
               // All stages failed - return NO_MATCH
               console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
-              // Will be handled below to return NO_MATCH result (gatedCandidates.length will be 0)
+              noMatchDetected = true; // Set flag to short-circuit pipeline
+              gatedCandidates = []; // Ensure gatedCandidates is empty
+              // Will be handled below to return NO_MATCH result
             }
           }
         } else {
@@ -5251,9 +5291,10 @@ async function processSessionInBackground({
       const strictGateCandidates = strictGate.length > 0 ? [...strictGate] : undefined;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
       
-      // NO_MATCH CHECK: If all gating stages failed and we have no candidates, return NO_MATCH result
-      if (gatedCandidates.length === 0 && hardTerms.length > 0) {
-        console.log(`[Gating] no_match=true - returning NO_MATCH result (all gating stages failed)`);
+      // BUG FIX #2: NO_MATCH CHECK - If all gating stages failed and we have no candidates, return NO_MATCH result
+      // This must short-circuit BEFORE BM25 ranking and AI ranking
+      if ((gatedCandidates.length === 0 && hardTerms.length > 0) || noMatchDetected) {
+        console.log(`[Gating] no_match=true - returning NO_MATCH result (all gating stages failed) - SHORT-CIRCUITING pipeline`);
         
         // Generate suggested synonyms from searchSynonymsJson
         let suggestedSynonyms: string[] = [];
@@ -5295,11 +5336,11 @@ async function processSessionInBackground({
           data: { status: ConciergeSessionStatus.COMPLETE },
         });
         
-        console.log("[App Proxy] NO_MATCH result saved - session marked COMPLETE with 0 products");
-        return; // Exit early - no further processing needed
+        console.log("[App Proxy] NO_MATCH result saved - session marked COMPLETE with 0 products (SKIPPED: BM25 ranking, AI ranking, billing)");
+        return; // Exit early - DO NOT continue to BM25 ranking, DO NOT call AI ranking, DO NOT bill
       }
       
-      // BUNDLE/HARD-TERM PATH: Continue processing
+      // BUNDLE/HARD-TERM PATH: Continue processing (only if we have candidates)
       // Reduce AI window when no hardTerms (max 30 candidates for speed)
       if (hardTerms.length === 0 && aiWindow > noHardTermsWindow) {
         aiWindow = noHardTermsWindow;
@@ -7105,94 +7146,173 @@ async function processSessionInBackground({
         console.log(`[Bundle] handles_before_validation count=${finalHandles.length} preview=[${finalHandles.slice(0, 5).join(", ")}${finalHandles.length > 5 ? "..." : ""}]`);
       }
       
-      // Validate final handles (use enriched candidates)
+      // BUG FIX #1: Separate validations with explicit names for bundle flow
+      // (a) Handle existence validation (Shopify fetch by handle returns product)
+      // (b) Constraint validation (availability/facets)
+      // (c) Bundle-type validation (each requested type has >=1)
       let validatedHandles: string[];
+      const candidateMap = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+      
       if (isBundleMode && !trustFallback) {
-        // Bundle validation: ensure each handle belongs to correct item's pool
-        // CRITICAL FIX: Use proper matching logic instead of metadata (industry-agnostic)
-        // Build item pools using proper matching (same as bundle selection)
-        const itemPools = new Map<number, Set<string>>();
-        const candidateMap = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        // BUNDLE VALIDATION: Three separate validation stages
         
-        // Build pools using proper matching logic (not metadata)
-        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-          const bundleItem = bundleIntent.items[itemIdx];
-          const itemHardTerms = bundleItem.hardTerms;
-          const pool = new Set<string>();
-          
-          // Check all candidates to see if they match this item's hard terms
-          // Apply type anchor gating: must contain at least one non-facet term
-          const itemConstraints = bundleItem.constraints;
-          const itemOptionConstraints = itemConstraints?.optionConstraints;
-          const itemTerms = [
-            ...itemHardTerms,
-            ...(itemConstraints?.includeTerms || [])
-          ];
-          const itemFacets = {
-            size: itemOptionConstraints?.size ?? null,
-            color: itemOptionConstraints?.color ?? null,
-            material: itemOptionConstraints?.material ?? null,
-          };
-          const nonFacetItemTerms = getNonFacetHardTerms(itemTerms, itemFacets);
-          
-          for (const c of allCandidatesEnriched) {
-            const haystack = [
-              c.title || "",
-              c.productType || "",
-              (c.tags || []).join(" "),
-              c.vendor || "",
-              c.searchText || "",
-            ].join(" ");
-            
-            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-            if (!hasItemMatch) continue;
-            
-            // Type anchor: if non-facet terms exist, product must contain at least one
-            if (nonFacetItemTerms.length > 0) {
-              const searchText = extractSearchText(c);
-              const hasAnchorMatch = nonFacetItemTerms.some(term => {
-                const termLower = term.toLowerCase().trim();
-                return searchText.includes(termLower);
-              });
-              if (!hasAnchorMatch) continue;
-            }
-            
-            pool.add(c.handle);
-          }
-          
-          itemPools.set(itemIdx, pool);
-        }
-        
-        validatedHandles = finalHandles.filter(handle => {
-          // Check if handle belongs to any item pool using proper matching
-          const candidate = candidateMap.get(handle);
-          if (!candidate) return false; // Handle not found in candidates
-          
-          // Check if handle matches any item's hard terms
-          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-            const bundleItem = bundleIntent.items[itemIdx];
-            const itemHardTerms = bundleItem.hardTerms;
-            
-            const haystack = [
-              candidate.title || "",
-              candidate.productType || "",
-              (candidate.tags || []).join(" "),
-              candidate.vendor || "",
-              candidate.searchText || "",
-            ].join(" ");
-            
-            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-            if (hasItemMatch) {
-              return true; // Handle matches at least one item type
-            }
-          }
-          return false;
+        // (a) Handle existence validation: Check if handle exists in enriched candidates
+        const handleExistenceValid = finalHandles.filter(handle => {
+          return candidateMap.has(handle);
         });
-        console.log("[Bundle] validated", validatedHandles.length, "handles (all from item pools, using proper matching)");
+        console.log(`[Bundle Validation] (a) handle_existence: ${handleExistenceValid.length} out of ${finalHandles.length} handles exist in candidates`);
+        
+        if (handleExistenceValid.length === 0) {
+          console.warn(`[Bundle Validation] (a) handle_existence FAILED: 0 handles exist - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
+          validatedHandles = [];
+        } else {
+          // (b) Constraint validation: Check availability and facets per item
+          const constraintValid: string[] = [];
+          for (const handle of handleExistenceValid) {
+            const candidate = candidateMap.get(handle);
+            if (!candidate) continue;
+            
+            // Find which bundle item this handle matches
+            let matchedItemIdx: number | null = null;
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const bundleItem = bundleIntent.items[itemIdx];
+              const itemHardTerms = bundleItem.hardTerms;
+              const haystack = [
+                candidate.title || "",
+                candidate.productType || "",
+                (candidate.tags || []).join(" "),
+                candidate.vendor || "",
+                candidate.searchText || "",
+              ].join(" ");
+              
+              const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+              if (hasItemMatch) {
+                matchedItemIdx = itemIdx;
+                break;
+              }
+            }
+            
+            if (matchedItemIdx === null) continue; // Doesn't match any item type
+            
+            // Check constraints for this item
+            const bundleItem = bundleIntent.items[matchedItemIdx];
+            const itemConstraints = bundleItem.constraints;
+            const itemOptionConstraints = itemConstraints?.optionConstraints;
+            const itemFacets = {
+              size: itemOptionConstraints?.size ?? null,
+              color: itemOptionConstraints?.color ?? null,
+              material: itemOptionConstraints?.material ?? null,
+            };
+            
+            // Check availability (if inStockOnly is enabled)
+            if (experience.inStockOnly && !candidate.available) {
+              continue; // Skip unavailable items
+            }
+            
+            // Check facets (size/color/material) if specified
+            let passesFacets = true;
+            if (itemFacets.size && candidate.sizes.length > 0) {
+              const sizeMatch = candidate.sizes.some((s: string) => 
+                normalizeText(s) === normalizeText(itemFacets.size) ||
+                normalizeText(s).includes(normalizeText(itemFacets.size)) ||
+                normalizeText(itemFacets.size).includes(normalizeText(s))
+              );
+              if (!sizeMatch) passesFacets = false;
+            }
+            if (itemFacets.color && candidate.colors.length > 0 && passesFacets) {
+              const colorMatch = candidate.colors.some((col: string) => 
+                normalizeText(col) === normalizeText(itemFacets.color) ||
+                normalizeText(col).includes(normalizeText(itemFacets.color)) ||
+                normalizeText(itemFacets.color).includes(normalizeText(col))
+              );
+              if (!colorMatch) passesFacets = false;
+            }
+            if (itemFacets.material && candidate.materials.length > 0 && passesFacets) {
+              const materialMatch = candidate.materials.some((m: string) => 
+                normalizeText(m) === normalizeText(itemFacets.material) ||
+                normalizeText(m).includes(normalizeText(itemFacets.material)) ||
+                normalizeText(itemFacets.material).includes(normalizeText(m))
+              );
+              if (!materialMatch) passesFacets = false;
+            }
+            
+            if (passesFacets) {
+              constraintValid.push(handle);
+            }
+          }
+          console.log(`[Bundle Validation] (b) constraint_validation: ${constraintValid.length} out of ${handleExistenceValid.length} handles pass constraints`);
+          
+          if (constraintValid.length === 0) {
+            console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
+            validatedHandles = [];
+          } else {
+            // (c) Bundle-type validation: Ensure each requested type has >=1 handle
+            const handlesByItemType = new Map<number, string[]>();
+            for (const handle of constraintValid) {
+              const candidate = candidateMap.get(handle);
+              if (!candidate) continue;
+              
+              // Find which bundle item this handle matches
+              for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+                const bundleItem = bundleIntent.items[itemIdx];
+                const itemHardTerms = bundleItem.hardTerms;
+                const haystack = [
+                  candidate.title || "",
+                  candidate.productType || "",
+                  (candidate.tags || []).join(" "),
+                  candidate.vendor || "",
+                  candidate.searchText || "",
+                ].join(" ");
+                
+                const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (hasItemMatch) {
+                  if (!handlesByItemType.has(itemIdx)) {
+                    handlesByItemType.set(itemIdx, []);
+                  }
+                  handlesByItemType.get(itemIdx)!.push(handle);
+                  break; // Handle can only match one item type
+                }
+              }
+            }
+            
+            // Check if each requested type has at least 1 handle
+            const missingTypes: number[] = [];
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const handlesForType = handlesByItemType.get(itemIdx) || [];
+              if (handlesForType.length === 0) {
+                missingTypes.push(itemIdx);
+              }
+            }
+            
+            if (missingTypes.length === bundleIntent.items.length) {
+              // All types missing - treat as NO_MATCH
+              console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
+              validatedHandles = [];
+            } else if (missingTypes.length > 0) {
+              // Partial bundle - keep handles that match existing types
+              console.log(`[Bundle Validation] (c) bundle_type_validation: partial bundle - ${missingTypes.length} types missing, keeping ${constraintValid.length} handles`);
+              validatedHandles = constraintValid; // Keep all constraint-valid handles (partial bundle is OK)
+            } else {
+              // All types present
+              console.log(`[Bundle Validation] (c) bundle_type_validation: all ${bundleIntent.items.length} types present`);
+              validatedHandles = constraintValid;
+            }
+            
+            // Log per-item counts for bundle-type validation
+            const perItemCounts = Array.from(handlesByItemType.entries()).map(([idx, handles]) => {
+              const itemName = bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
+              return `${itemName}=${handles.length}`;
+            }).join(" ");
+            console.log(`[Bundle Validation] (c) per_item_counts: ${perItemCounts}`);
+          }
+        }
       } else {
+        // Single-item validation (non-bundle or trustFallback)
         validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
       }
-      console.log("[App Proxy] [Layer 3] Validated handles:", validatedHandles.length, "out of", finalHandles.length);
+      
+      // BUG FIX #2: Log actual validated array (no later mutation)
+      console.log("[App Proxy] [Layer 3] Validated handles (FINAL):", validatedHandles.length, "out of", finalHandles.length, "preview=", validatedHandles.slice(0, 5).join(", "));
       
       // Bundle budget validation - ONLY when totalBudget is a number
       if (isBundleMode && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") {
@@ -7243,11 +7363,53 @@ async function processSessionInBackground({
       // Ensure validatedHandles is always an array to prevent errors
       // CRITICAL FIX: If validation filtered out all handles, use original finalHandles as fallback
       // This prevents 0 handles when validation is too strict (e.g., bundle item has 0 candidates)
+      // BUG FIX #3: If validation returns 0 valid handles, treat as NO_MATCH OR rerun safe fallback
+      // Never accept invalid handles - this prevents random products from being returned
       if (validatedHandles.length === 0 && finalHandles.length > 0) {
-        console.log("[App Proxy] [Layer 3] Validation filtered out all handles, using original finalHandles as fallback");
-        finalHandlesGuaranteed = uniq(finalHandles);
+        console.warn(`[Layer 3] Validation filtered out all handles (${finalHandles.length} invalid) - treating as NO_MATCH or safe fallback`);
+        
+        // Try safe fallback: rerun validation with anchor token matching only (if we have hardTerms)
+        // This is a last resort that still enforces some relevance
+        if (hardTerms.length > 0) {
+          const hardTermTokens = new Set<string>();
+          hardTerms.forEach(term => {
+            const normalized = unifiedNormalize(term);
+            const tokens = tokenize(normalized);
+            tokens.forEach(t => hardTermTokens.add(t));
+          });
+          
+          // Build candidate map for lookup
+          const candidateMapForCheck = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+          
+          // Filter finalHandles to only those that match at least one anchor token
+          const safeFallbackHandles: string[] = [];
+          for (const handle of finalHandles) {
+            const candidate = candidateMapForCheck.get(handle);
+            if (candidate) {
+              const haystack = unifiedNormalize(extractSearchText(candidate, indexMetafields));
+              const candidateTokens = new Set(tokenize(haystack));
+              const hasAnchorMatch = Array.from(hardTermTokens).some(token => candidateTokens.has(token));
+              if (hasAnchorMatch) {
+                safeFallbackHandles.push(handle);
+              }
+            }
+          }
+          
+          if (safeFallbackHandles.length > 0) {
+            console.log(`[Layer 3] Safe fallback found ${safeFallbackHandles.length} handles with anchor token matches`);
+            finalHandlesGuaranteed = uniq(safeFallbackHandles);
+          } else {
+            // Even safe fallback failed - treat as NO_MATCH
+            console.log(`[Layer 3] Safe fallback also returned 0 handles - treating as NO_MATCH (0 products)`);
+            finalHandlesGuaranteed = [];
+          }
+        } else {
+          // No hardTerms to anchor on - treat as NO_MATCH
+          console.log(`[Layer 3] No hardTerms available for safe fallback - treating as NO_MATCH (0 products)`);
+          finalHandlesGuaranteed = [];
+        }
       } else {
-      finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+        finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
       }
 
       // Bundle-safe top-up: only from bundle item pools
@@ -7544,26 +7706,25 @@ async function processSessionInBackground({
       if (finalSource !== "ai") {
       finalHandles = finalHandlesGuaranteed;
       } else {
-        // AI source: ensure finalHandlesGuaranteed uses AI handles if validation didn't filter them all
-        if (finalHandlesGuaranteed.length === 0 && finalHandles.length > 0) {
-          console.log("[Bundle] Validation filtered all handles, but AI source - using AI handles as fallback");
-          finalHandlesGuaranteed = finalHandles;
-        } else if (finalHandlesGuaranteed.length > 0) {
+        // BUG FIX #1: Never bypass validation even if source=ai
+        // If validation returns 0, treat as NO_MATCH (already handled in validation logic above)
+        // Use validated handles (validation already handled NO_MATCH case above)
+        if (finalHandlesGuaranteed.length > 0) {
           // Use validated handles if available (validation may have filtered some)
           finalHandles = finalHandlesGuaranteed;
+        } else {
+          // Validation returned 0 - this is NO_MATCH (already handled above)
+          // DO NOT use AI handles as fallback - validation failure means no valid matches
+          console.warn("[Bundle] Validation filtered all handles - DO NOT bypass even if source=ai (NO_MATCH)");
+          finalHandles = []; // Keep empty - will be handled as NO_MATCH later
         }
-        // If finalHandles already has AI handles and finalHandlesGuaranteed is empty, keep finalHandles
       }
       
-      // Hard guard: prevent empty handles when AI succeeded
-      if (finalSource === "ai" && finalHandles.length === 0) {
-        console.warn("[Bundle] ERROR: AI source but finalHandles empty after top-up/validation - using AI handles directly");
-        // Restore from bundleFinalHandles if available
-        if (bundleFinalHandles.length > 0) {
-          finalHandles = bundleFinalHandles;
-          finalHandlesGuaranteed = bundleFinalHandles;
-          console.log(`[Bundle] Restored ${finalHandles.length} handles from bundleFinalHandles`);
-        }
+      // Hard guard: If validation failed, DO NOT restore invalid handles even if AI succeeded
+      if (finalSource === "ai" && finalHandles.length === 0 && finalHandlesGuaranteed.length === 0) {
+        // Both AI and validation returned 0 - this is a true NO_MATCH
+        // DO NOT restore from bundleFinalHandles - validation failure is authoritative
+        console.warn("[Bundle] ERROR: AI source but validation returned 0 handles - treating as NO_MATCH (DO NOT restore invalid handles)");
       }
 
       // Prioritize AI reasoning over technical matching details
@@ -8543,6 +8704,77 @@ async function processSessionInBackground({
       const requestedCountFinal = finalResultCount;
       const isBundleModeForReasoning = bundleIntent?.isBundle === true;
       
+      // BUG FIX #3: Group bundle results by item type (for structured return)
+      // Declare early so it's available when saving
+      let bundleGroupedResult: {
+        items: Array<{ type: string; primary: string; alternatives: string[] }>;
+        flatHandles: string[];
+      } | null = null;
+      
+      if (isBundleModeForReasoning && bundleIntent.items.length >= 2 && deliveredHandlesFinal.length > 0) {
+        // Group handles by item type
+        const handlesByItemType = new Map<number, string[]>();
+        const candidateMapForGrouping = new Map(allCandidatesEnriched.map(c => [c.handle, c]));
+        
+        for (const handle of deliveredHandlesFinal) {
+          const candidate = candidateMapForGrouping.get(handle);
+          if (!candidate) continue;
+          
+          // Find which bundle item this handle matches
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const bundleItem = bundleIntent.items[itemIdx];
+            const itemHardTerms = bundleItem.hardTerms;
+            const haystack = [
+              candidate.title || "",
+              candidate.productType || "",
+              (candidate.tags || []).join(" "),
+              candidate.vendor || "",
+              candidate.searchText || "",
+            ].join(" ");
+            
+            const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (hasItemMatch) {
+              if (!handlesByItemType.has(itemIdx)) {
+                handlesByItemType.set(itemIdx, []);
+              }
+              handlesByItemType.get(itemIdx)!.push(handle);
+              break; // Handle can only match one item type
+            }
+          }
+        }
+        
+        // Build grouped structure: primary (first) + alternatives (rest)
+        // Stable ordering: sort by itemIdx, then by handle order in deliveredHandlesFinal
+        const groupedItems: Array<{ type: string; primary: string; alternatives: string[] }> = [];
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+          const bundleItem = bundleIntent.items[itemIdx];
+          const itemType = bundleItem.hardTerms[0] || `item${itemIdx}`;
+          const handlesForType = handlesByItemType.get(itemIdx) || [];
+          
+          if (handlesForType.length > 0) {
+            // Sort handles to maintain stable ordering (by position in deliveredHandlesFinal)
+            const sortedHandles = handlesForType.sort((a, b) => {
+              const idxA = deliveredHandlesFinal.indexOf(a);
+              const idxB = deliveredHandlesFinal.indexOf(b);
+              return idxA - idxB;
+            });
+            
+            groupedItems.push({
+              type: itemType,
+              primary: sortedHandles[0], // First handle is primary
+              alternatives: sortedHandles.slice(1), // Rest are alternatives
+            });
+          }
+        }
+        
+        bundleGroupedResult = {
+          items: groupedItems,
+          flatHandles: deliveredHandlesFinal, // Keep flat list for backward compatibility
+        };
+        
+        console.log(`[Bundle Grouping] grouped ${groupedItems.length} item types:`, groupedItems.map(item => `${item.type}=${1 + item.alternatives.length}`).join(", "));
+      }
+      
       // Log final delivery metrics (authoritative values)
       console.log("[App Proxy] Final handles after top-up:", deliveredCountFinal, "requested:", requestedCountFinal);
       
@@ -8599,21 +8831,79 @@ async function processSessionInBackground({
       
       // Save results and mark session as COMPLETE (ONLY AFTER finalHandles is computed)
       // Note: If missingTypes.length > 0, this is a PARTIAL_BUNDLE (still marked COMPLETE)
+      // BUG FIX #3: Store grouped bundle info if available (as JSON in reasoning or separate field)
       const saveStart = performance.now();
+      
+      // For bundles, include grouped structure in reasoning (as JSON string for now)
+      // TODO: Add separate field to ConciergeResult schema for bundleGroupedData
+      let reasoningToSave = deliveredCountFinal > 0 ? finalReasoningToSave : finalReasoning;
+      if (bundleGroupedResult && deliveredCountFinal > 0) {
+        // Append grouped structure as JSON (can be parsed by frontend if needed)
+        const groupedJson = JSON.stringify(bundleGroupedResult);
+        reasoningToSave += ` [BUNDLE_GROUPED:${groupedJson}]`;
+      }
+      
       await saveConciergeResult({
         sessionToken,
-        productHandles: deliveredHandlesFinal, // Use authoritative final handles
+        productHandles: deliveredHandlesFinal, // Use authoritative final handles (flat list for backward compatibility)
         productIds: null,
-        reasoning: deliveredCountFinal > 0 
-          ? finalReasoningToSave
-          : finalReasoning,
+        reasoning: reasoningToSave,
       });
       saveMs = Math.round(performance.now() - saveStart);
 
       console.log("[App Proxy] Results saved, session marked COMPLETE. deliveredCount=", deliveredCount);
 
-      // Log 3-layer pipeline metrics
-      console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
+      // BUG FIX #4: Log metrics - per-item stats for bundle mode, single-item stats otherwise
+      if (isBundleModeForReasoning && bundleIntent.items.length >= 2) {
+        // Bundle metrics: per-item stats
+        const perItemStats: Array<{ itemType: string; strictGateCount: number; gatedPoolCount: number }> = [];
+        
+        // Build item pools for metrics (reuse logic from validation)
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+          const bundleItem = bundleIntent.items[itemIdx];
+          const itemHardTerms = bundleItem.hardTerms;
+          const itemType = itemHardTerms[0] || `item${itemIdx}`;
+          
+          // Count strict gate candidates for this item (if strictGate exists)
+          let itemStrictGateCount = 0;
+          if (strictGate && strictGate.length > 0) {
+            itemStrictGateCount = strictGate.filter(c => {
+              const haystack = [
+                c.title || "",
+                c.productType || "",
+                (c.tags || []).join(" "),
+                c.vendor || "",
+                c.searchText || "",
+              ].join(" ");
+              return itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            }).length;
+          }
+          
+          // Count gated pool candidates for this item
+          const itemGatedPoolCount = gatedCandidates.filter(c => {
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            return itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+          }).length;
+          
+          perItemStats.push({
+            itemType,
+            strictGateCount: itemStrictGateCount,
+            gatedPoolCount: itemGatedPoolCount,
+          });
+        }
+        
+        const perItemStatsText = perItemStats.map(s => `${s.itemType}=${s.strictGateCount}/${s.gatedPoolCount}`).join(" ");
+        console.log(`[App Proxy] [Bundle Metrics] per_item_stats: ${perItemStatsText} | AI window: ${aiWindow} | Trust fallback: ${trustFallback} | Hard terms: ${hardTerms.length}`);
+      } else {
+        // Single-item metrics (existing logic)
+        console.log("[App Proxy] [Metrics] Strict gate:", strictGateCount || 0, "| AI window:", aiWindow, "| Trust fallback:", trustFallback, "| Hard terms:", hardTerms.length, "| Gated pool:", gatedCandidates.length);
+      }
       
       // Log final gating stage used and top matched tokens/fields
       if (hardTerms.length > 0) {
