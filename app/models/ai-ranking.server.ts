@@ -831,7 +831,7 @@ export async function rankProductsWithAI(
   selectedHandles: string[];
   reasoning?: string | null;
   trustFallback: boolean;
-  source: "ai" | "fallback";
+  source: "ai" | "fallback" | "ai_failed_fallback_bm25";
   parseFailReason?: string | null;
 }> {
   // Helper function to determine fallback scope and candidates
@@ -1185,8 +1185,7 @@ REQUIREMENTS:
 - No duplicate handles
 - label must be one of: "exact", "good", "fallback"
 - score must be 0-100 (higher = better match)
-  * Example GOOD: "This sophisticated navy suit is ideal for business meetings and formal events, with excellent tailoring for a polished look"
-  * Example BAD: "Matches suit category and navy color; satisfies formal wear requirements"
+- Examples are industry-agnostic and work for any product type (fashion, electronics, home goods, beauty, health, etc.)
 `
     : `You are an expert product recommendation assistant for an e-commerce store. Your task is to rank products from a pre-filtered candidate list based on strict matching rules.
 
@@ -1204,14 +1203,11 @@ ${hardTerms.length === 0 ? `- hardTerms is EMPTY: Rank products by soft terms + 
   b) ALL hardFacets must match when provided (size, color, material)
   c) Must NOT contain any avoidTerms in title/tags/descriptionSnippet (unless avoidTerms is empty)`}
 
-CATEGORY DRIFT PREVENTION:
-- If hardTerm includes a specific category (e.g., "suit", "sofa", "treadmill", "serum"), do NOT return adjacent categories:
-  * "suit" → do NOT return "shirt", "trousers", "blazer", "jacket" unless trustFallback=true AND labeled "alternative"
-  * "sofa" → do NOT return "chair", "loveseat", "futon" unless trustFallback=true AND labeled "alternative"
-  * "treadmill" → do NOT return "exercise bike", "elliptical", "rower" unless trustFallback=true AND labeled "alternative"
-  * "serum" → do NOT return "moisturizer", "cleanser", "toner" unless trustFallback=true AND labeled "alternative"
-- Only exact category matches can be labeled "exact"
-- Adjacent categories can only be "alternative" when trustFallback=true
+CATEGORY DRIFT PREVENTION (INDUSTRY-AGNOSTIC):
+- If hardTerm includes a specific product category, do NOT return adjacent or related categories unless trustFallback=true AND labeled "fallback"
+- Only exact category matches (where the hardTerm appears in the product's title, productType, or tags) can be labeled "exact"
+- Related but different categories can only be labeled "fallback" when trustFallback=true
+- This applies to ANY industry: if user requests a specific product type, return that type, not substitutes or related items
 
 MATCHING REQUIREMENTS:
 1. Check title, productType, tags, and descriptionSnippet for hardTerm matches
@@ -1231,8 +1227,10 @@ OUTPUT SCHEMA (MUST be exactly this structure - MINIMAL):
   ]
 }
 
-REQUIREMENTS:
-- "selected" array MUST contain exactly ${resultCount} items
+CRITICAL REQUIREMENT - YOU MUST FOLLOW THIS:
+- "selected" array MUST contain exactly ${resultCount} items (or all candidates if fewer than ${resultCount})
+- NEVER return an empty "selected" array - if candidates are available, you MUST select at least one item
+- If uncertain, pick the best ${resultCount} items from allowedHandles (see below)
 - All handles must exist in the candidate list (copy exactly as shown)
 - No duplicate handles
 - label must be one of: "exact", "good", "fallback"
@@ -1428,6 +1426,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
       };
     } else {
       // Single-item schema: minimal - only trustFallback and selected
+      // STRICT: selected array MUST have at least minItems (enforced by schema)
+      const minItems = Math.max(1, Math.min(resultCount, candidates.length)); // At least 1, up to requested count
       return {
         type: "object",
         properties: {
@@ -1435,6 +1435,8 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           selected: {
             type: "array",
             items: minimalItemSchema,
+            minItems: minItems, // STRICT: Require at least minItems (prevents empty arrays)
+            description: `Array of exactly ${resultCount} selected items (or all candidates if fewer than ${resultCount}). MUST NOT be empty.`,
           },
         },
         required: ["trustFallback", "selected"],
@@ -1558,11 +1560,18 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         // Add the current product ranking task as the final user message
         let taskContent = useCompressedPrompt ? buildUserPrompt(false, true) : userPrompt;
         
-        // If this is a retry after empty selection, add stronger instruction
-        if (lastParseFailReason?.includes("empty selected array") || lastParseFailReason?.includes("AI returned empty")) {
-          const strongerInstruction = `\n\nCRITICAL: You must select exactly ${resultCount} items (or all candidates if fewer than ${resultCount}). Never return an empty selected array. If candidates are available, you MUST select at least one item.`;
+        // If this is a retry after empty selection, add stronger instruction and reduce candidate count
+        if (lastParseFailReason?.includes("empty selected array") || lastParseFailReason?.includes("AI returned empty") || lastParseFailReason?.includes("selected.length === 0")) {
+          const strongerInstruction = `\n\nCRITICAL: You MUST return exactly ${resultCount} items in the "selected" array. Never return an empty list. If uncertain, pick the best ${resultCount} items from allowedHandles. This is a retry - you must provide results.`;
           taskContent = taskContent + strongerInstruction;
-          console.log("[AI Ranking] Adding stronger instruction for retry after empty selection");
+          console.log("[AI Ranking] ai_empty_selection=true retry_used=true - Adding stronger instruction for retry after empty selection");
+          
+          // Reduce candidate count on retry (top 12-20)
+          if (currentCandidates.length > 20) {
+            const reducedCount = Math.min(20, Math.max(12, resultCount * 2));
+            currentCandidates = currentCandidates.slice(0, reducedCount);
+            console.log(`[AI Ranking] Reduced candidate count for retry: ${candidates.length} -> ${currentCandidates.length}`);
+          }
         }
         
         if (taskContent && taskContent.trim().length > 0) {
@@ -2043,7 +2052,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           : `Built a bundle with ${bundleResult.selected_by_item.length} items.`;
         
         // Bundle mode: AI succeeded (structured output parsed and validated)
-        console.log("[AI Ranking] source=ai trustFallback=", finalTrustFallback);
+        console.log("[AI Ranking] source=ai trustFallback=", finalTrustFallback, "final_result_source=ai");
         return {
           selectedHandles: rankedHandles,
           reasoning,
@@ -2212,12 +2221,23 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         console.log("[AI Ranking] Validated", validSelectedItems.length, "out of", singleItemResult.selected.length, "selected items");
       
       // CRITICAL: Enforce "must return results" - treat empty selected array as retryable failure
-      if (singleItemResult.selected.length === 0 && candidates.length > 0) {
-        console.error("[AI Ranking] ❌ AI returned 0 selected items despite", candidates.length, "candidates available - treating as retryable failure");
+      // Post-validation: reject empty selections even if schema validation passed
+      if (singleItemResult.selected.length === 0 && currentCandidates.length > 0) {
+        console.error("[AI Ranking] ❌ ai_empty_selection=true - AI returned 0 selected items despite", currentCandidates.length, "candidates available - treating as retryable failure");
         lastError = new Error("AI returned empty selected array");
-        lastParseFailReason = "AI returned empty selected array - must select at least one item";
-        // Trigger retry with stronger instruction
-        continue; // Will retry with updated prompt
+        lastParseFailReason = "selected.length === 0 - must select at least one item";
+        console.log("[AI Ranking] ai_empty_selection=true ai_invalid_schema=false (post-validation)");
+        continue; // Retry if attempts remaining
+      }
+      
+      // Post-validation: ensure selected array has at least minItems (enforced by schema but double-check)
+      const minItems = Math.max(1, Math.min(resultCount, currentCandidates.length));
+      if (singleItemResult.selected.length < minItems && currentCandidates.length >= minItems) {
+        console.error("[AI Ranking] ❌ ai_invalid_schema=true - AI returned", singleItemResult.selected.length, "items but schema requires minItems=", minItems, "- treating as retryable failure");
+        lastError = new Error(`AI returned ${singleItemResult.selected.length} items but schema requires minItems=${minItems}`);
+        lastParseFailReason = `selected.length (${singleItemResult.selected.length}) < minItems (${minItems})`;
+        console.log("[AI Ranking] ai_invalid_schema=true ai_empty_selection=false");
+        continue; // Retry if attempts remaining
       }
       
       if (validSelectedItems.length === 0) {
@@ -2292,7 +2312,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
           }
       }
 
-      console.log("[AI Ranking] source=ai trustFallback=", trustFallback);
+      console.log("[AI Ranking] source=ai trustFallback=", trustFallback, "final_result_source=ai");
       console.log("[AI Ranking] Successfully ranked", selectedHandles.length, "products");
       
       // Cache the result for future requests (best-effort, don't block)
@@ -2430,9 +2450,9 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     }
   }
 
-  // All attempts failed - return deterministic fallback (structured result, not throwing)
+  // All attempts failed - use BM25 fallback (NOT random selection)
   const failReason = lastParseFailReason || (lastError instanceof Error ? lastError.message : String(lastError || "Unknown error"));
-  console.log("[AI Ranking] source=fallback parse_fail_reason=", failReason);
+  console.log("[AI Ranking] ai_failure=true final_result_source=ai_failed_fallback_bm25 parse_fail_reason=", failReason);
   
   // Determine fallback scope: if strictGateCount > 0, use strict gate pool only; otherwise use full candidates
   let fallbackCandidates = candidates;
@@ -2445,8 +2465,85 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
   
   console.log("[AI Ranking] fallback_scope=", fallbackScope);
   
-  // Return structured fallback result instead of throwing
+  // Use BM25 ranking for fallback (relevance-preserving, not random)
+  // Import BM25 utilities dynamically
+  const { tokenize: tokenizeBM25, bm25Score: bm25ScoreUtil, calculateIDF: calculateIDFUtil } = await import("~/utils/text-indexing.server");
+  
+  // Build query tokens from user intent
+  const queryText = enhancedIntent || userIntent;
+  const queryTokens = tokenizeBM25(queryText);
+  
+  if (queryTokens.length > 0 && fallbackCandidates.length > 0) {
+    // Build document tokens for each candidate
+    const candidateDocs = fallbackCandidates.map(c => {
+      const searchText = (c as any).searchText || 
+        `${c.title || ""} ${c.productType || ""} ${(c.tags || []).join(" ")} ${c.vendor || ""}`.trim();
+      return {
+        candidate: c,
+        tokens: tokenizeBM25(searchText),
+      };
+    });
+    
+    // Calculate IDF for BM25
+    const idf = calculateIDFUtil(candidateDocs.map(d => ({ tokens: d.tokens })));
+    
+    // Calculate average document length
+    const avgDocLen = candidateDocs.reduce((sum, d) => sum + d.tokens.length, 0) / candidateDocs.length || 1;
+    
+    // Score each candidate with BM25
+    const scoredCandidates = candidateDocs.map(d => {
+      const docTokenFreq = new Map<string, number>();
+      for (const token of d.tokens) {
+        docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+      }
+      
+      const score = bm25ScoreUtil(
+        queryTokens,
+        d.tokens,
+        docTokenFreq,
+        d.tokens.length,
+        avgDocLen,
+        idf
+      );
+      
+      return {
+        candidate: d.candidate,
+        score,
+      };
+    });
+    
+    // Sort by BM25 score (descending), then by availability, then by handle
+    scoredCandidates.sort((a, b) => {
+      if (Math.abs(b.score - a.score) > 0.01) {
+        return b.score - a.score; // Higher BM25 score first
+      }
+      // Tie-breaker: available first
+      if (a.candidate.available !== b.candidate.available) {
+        return a.candidate.available ? -1 : 1;
+      }
+      // Final tie-breaker: handle (deterministic)
+      return a.candidate.handle.localeCompare(b.candidate.handle);
+    });
+    
+    // Select top N by BM25
+    const bm25Handles = scoredCandidates
+      .slice(0, resultCount)
+      .map(s => s.candidate.handle);
+    
+    console.log(`[AI Ranking] BM25 fallback: selected ${bm25Handles.length} products from ${fallbackCandidates.length} candidates`);
+    
+    return {
+      selectedHandles: bm25Handles,
+      reasoning: "Selected the best matches based on relevance to your request.",
+      trustFallback: true,
+      source: "ai_failed_fallback_bm25" as any, // Use custom source type
+      parseFailReason: failReason,
+    };
+  }
+  
+  // Fallback to deterministic ranking if BM25 not applicable (no query tokens or no candidates)
   const fallbackResult = deterministicRanking(fallbackCandidates, resultCount, variantPreferences, failReason);
+  fallbackResult.source = "ai_failed_fallback_bm25" as any; // Mark as BM25 fallback attempt
   
   // SAFETY: Ensure fallback always returns at least some results
   if (fallbackResult.selectedHandles.length === 0 && fallbackCandidates.length > 0) {
