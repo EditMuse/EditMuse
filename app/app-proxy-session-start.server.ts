@@ -293,7 +293,7 @@ function unifiedNormalize(text: string | null | undefined): string {
     .trim();
 }
 
-function extractSearchText(candidate: any): string {
+function extractSearchText(candidate: any, indexMetafields?: Array<{ namespace: string; key: string }> | null): string {
   const parts: string[] = [];
   
   // Title
@@ -312,6 +312,30 @@ function extractSearchText(candidate: any): string {
     parts.push(productType);
   }
   
+  // ProductCategory/Taxonomy (if available from Shopify)
+  if (candidate.productCategory && typeof candidate.productCategory === "string") {
+    parts.push(candidate.productCategory);
+  }
+  if (candidate.taxonomy && typeof candidate.taxonomy === "string") {
+    parts.push(candidate.taxonomy);
+  }
+  
+  // Collections (if available from Shopify GraphQL)
+  if (candidate.collections && Array.isArray(candidate.collections)) {
+    for (const coll of candidate.collections) {
+      if (typeof coll === "string") {
+        parts.push(coll);
+      } else if (coll && typeof coll === "object") {
+        if (coll.title && typeof coll.title === "string") {
+          parts.push(coll.title);
+        }
+        if (coll.handle && typeof coll.handle === "string") {
+          parts.push(coll.handle);
+        }
+      }
+    }
+  }
+  
   // Tags (array or string)
   if (Array.isArray(candidate.tags)) {
     parts.push(...candidate.tags.filter((t: any) => typeof t === "string"));
@@ -322,6 +346,20 @@ function extractSearchText(candidate: any): string {
   // Vendor (optional)
   if (candidate.vendor && typeof candidate.vendor === "string") {
     parts.push(candidate.vendor);
+  }
+  
+  // Variant titles and SKUs (if available from Shopify GraphQL)
+  if (candidate.variants && Array.isArray(candidate.variants)) {
+    for (const variant of candidate.variants) {
+      if (variant && typeof variant === "object") {
+        if (variant.title && typeof variant.title === "string") {
+          parts.push(variant.title);
+        }
+        if (variant.sku && typeof variant.sku === "string") {
+          parts.push(variant.sku);
+        }
+      }
+    }
   }
   
   // Option values (all option names and values)
@@ -347,6 +385,26 @@ function extractSearchText(candidate: any): string {
   }
   if (Array.isArray(candidate.materials)) {
     parts.push(...candidate.materials.filter((m: any) => typeof m === "string"));
+  }
+  
+  // Metafields (if configured in Experience and available)
+  if (indexMetafields && Array.isArray(indexMetafields) && candidate.metafields) {
+    for (const metafieldConfig of indexMetafields) {
+      if (candidate.metafields[metafieldConfig.namespace] && 
+          candidate.metafields[metafieldConfig.namespace][metafieldConfig.key]) {
+        const value = candidate.metafields[metafieldConfig.namespace][metafieldConfig.key];
+        if (typeof value === "string") {
+          parts.push(value);
+        } else if (typeof value === "object" && value !== null) {
+          // Handle JSON metafields
+          try {
+            parts.push(JSON.stringify(value));
+          } catch (e) {
+            // Skip if not serializable
+          }
+        }
+      }
+    }
   }
   
   // Description snippet (use existing cleanDescription if available, or extract snippet)
@@ -2921,8 +2979,8 @@ async function processSessionInBackground({
   baseAiWindow: number;
 }): Promise<void> {
   try {
-    // Track total processing duration for safety clamp
-    const processStartTime = performance.now();
+  // Track total processing duration for safety clamp
+  const processStartTime = performance.now();
 
     // Fetch conversation messages for full context
     // CRITICAL: Retry fetching messages if none found (handles race condition where messages are still being saved)
@@ -3381,11 +3439,28 @@ async function processSessionInBackground({
       // Descriptions will be fetched later only for AI candidate window
       const enrichmentStart = performance.now();
       console.log("[App Proxy] [Layer 1] Building initial candidates (descriptions deferred for speed)");
+      
+      // Parse indexMetafields from experience config
+      let indexMetafields: Array<{ namespace: string; key: string }> = [];
+      try {
+        if (experience.indexMetafields && typeof experience.indexMetafields === "string") {
+          indexMetafields = JSON.parse(experience.indexMetafields);
+        } else if (Array.isArray(experience.indexMetafields)) {
+          indexMetafields = experience.indexMetafields;
+        }
+      } catch (e) {
+        console.warn("[Indexing] Failed to parse indexMetafields:", e);
+      }
+      
       let allCandidates = filteredProducts.map(p => {
         return {
         handle: p.handle,
         title: p.title,
         productType: (p as any).productType || null,
+        productCategory: (p as any).productCategory || (p as any).category || null,
+        taxonomy: (p as any).taxonomy || null,
+        collections: (p as any).collections || null, // May be array of objects or strings
+        variants: (p as any).variants || null, // May be array of variant objects
         tags: p.tags || [],
         vendor: (p as any).vendor || null,
         price: p.priceAmount || p.price || null,
@@ -3397,23 +3472,16 @@ async function processSessionInBackground({
         colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
         materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
         optionValues: (p as any).optionValues ?? {},
+        metafields: (p as any).metafields || null, // Metafields object (namespace -> key -> value)
         };
       });
       
       // Build searchText for each candidate (without description for now)
+      // Use extractSearchText which includes collections, variants, metafields
       type EnrichedCandidate = typeof allCandidates[0] & { searchText: string };
       const enrichedCandidates: EnrichedCandidate[] = allCandidates.map(c => {
-        const searchText = buildSearchText({
-          title: c.title,
-          productType: c.productType,
-          vendor: c.vendor,
-          tags: c.tags,
-          optionValues: c.optionValues,
-          sizes: c.sizes,
-          colors: c.colors,
-          materials: c.materials,
-          desc1000: undefined, // No description yet - will be added for AI candidates only
-        });
+        // Use extractSearchText which includes all fields including collections, variants, metafields
+        const searchText = extractSearchText(c, indexMetafields);
         return {
           ...c,
           searchText,
@@ -3500,6 +3568,52 @@ async function processSessionInBackground({
         hardTerms = Array.isArray(intent.hardTerms) ? intent.hardTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         softTerms = Array.isArray(intent.softTerms) ? intent.softTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         avoidTerms = Array.isArray(intent.avoidTerms) ? intent.avoidTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
+        
+        // SYNONYM EXPANSION: Expand hardTerms using Experience config (industry-agnostic)
+        // Parse searchSynonymsJson from experience config
+        let searchSynonyms: Record<string, string[]> = {};
+        try {
+          if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "string") {
+            searchSynonyms = JSON.parse(experience.searchSynonymsJson);
+          } else if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "object") {
+            searchSynonyms = experience.searchSynonymsJson;
+          }
+        } catch (e) {
+          console.warn("[Synonyms] Failed to parse searchSynonymsJson:", e);
+        }
+        
+        // Expand hardTerms with synonyms (one-hop expansion)
+        const originalHardTerms = [...hardTerms];
+        const expandedHardTerms = new Set<string>(hardTerms);
+        const termProvenance = new Map<string, "original" | "synonym">();
+        
+        // Mark originals
+        for (const term of hardTerms) {
+          termProvenance.set(term.toLowerCase(), "original");
+        }
+        
+        // Add synonyms
+        for (const term of hardTerms) {
+          const normalizedTerm = term.toLowerCase();
+          const synonyms = searchSynonyms[normalizedTerm] || searchSynonyms[term] || [];
+          for (const synonym of synonyms) {
+            if (typeof synonym === "string" && synonym.trim().length > 0) {
+              const normalizedSynonym = synonym.toLowerCase();
+              if (!expandedHardTerms.has(normalizedSynonym)) {
+                expandedHardTerms.add(normalizedSynonym);
+                termProvenance.set(normalizedSynonym, "synonym");
+              }
+            }
+          }
+        }
+        
+        const expandedHardTermsArray = Array.from(expandedHardTerms);
+        const synonymsApplied = expandedHardTermsArray.length > hardTerms.length;
+        
+        console.log(`[Synonyms] applied=${synonymsApplied} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
+        
+        // Use expanded terms for gating (but keep original for logging/reasoning)
+        hardTerms = expandedHardTermsArray;
         
         // Merge LLM-extracted facets with variant constraints from answers
         // This ensures we capture both LLM understanding and explicit user selections
@@ -3762,6 +3876,52 @@ async function processSessionInBackground({
         
         // Parse bundle intent using pattern-based approach
         bundleIntent = parseBundleIntentGeneric(userIntent);
+        
+        // SYNONYM EXPANSION: Expand hardTerms using Experience config (industry-agnostic)
+        // Parse searchSynonymsJson from experience config
+        let searchSynonyms: Record<string, string[]> = {};
+        try {
+          if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "string") {
+            searchSynonyms = JSON.parse(experience.searchSynonymsJson);
+          } else if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "object") {
+            searchSynonyms = experience.searchSynonymsJson;
+          }
+        } catch (e) {
+          console.warn("[Synonyms] Failed to parse searchSynonymsJson:", e);
+        }
+        
+        // Expand hardTerms with synonyms (one-hop expansion)
+        const originalHardTerms = [...hardTerms];
+        const expandedHardTerms = new Set<string>(hardTerms);
+        const termProvenance = new Map<string, "original" | "synonym">();
+        
+        // Mark originals
+        for (const term of hardTerms) {
+          termProvenance.set(term.toLowerCase(), "original");
+        }
+        
+        // Add synonyms
+        for (const term of hardTerms) {
+          const normalizedTerm = term.toLowerCase();
+          const synonyms = searchSynonyms[normalizedTerm] || searchSynonyms[term] || [];
+          for (const synonym of synonyms) {
+            if (typeof synonym === "string" && synonym.trim().length > 0) {
+              const normalizedSynonym = synonym.toLowerCase();
+              if (!expandedHardTerms.has(normalizedSynonym)) {
+                expandedHardTerms.add(normalizedSynonym);
+                termProvenance.set(normalizedSynonym, "synonym");
+              }
+            }
+          }
+        }
+        
+        const expandedHardTermsArray = Array.from(expandedHardTerms);
+        const synonymsApplied = expandedHardTermsArray.length > hardTerms.length;
+        
+        console.log(`[Synonyms] applied=${synonymsApplied} originalHardTerms=[${originalHardTerms.join(", ")}] expandedHardTerms=[${expandedHardTermsArray.join(", ")}]`);
+        
+        // Use expanded terms for gating (but keep original for logging/reasoning)
+        hardTerms = expandedHardTermsArray;
       }
       
       // Log intent parsing method used
@@ -4835,7 +4995,7 @@ async function processSessionInBackground({
         // Use unifiedNormalize for consistency
         for (const candidate of gatedCandidates) {
           // Use extractSearchText which includes all relevant fields, then normalize
-          const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate));
+          const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
           
           // Check hard terms with word-boundary matching (not substring/token matching)
           // Multi-word terms are matched as phrases, single-word terms use word boundaries
@@ -4865,11 +5025,97 @@ async function processSessionInBackground({
         
         console.log(`[Gating] strictGateCount=${strictGateCount} requestedCount=${finalResultCount} buffer=${buffer} minNeeded=${minNeededForRequested}`);
         
+        // Store original hardTerms before any expansion for NO_MATCH fallback
+        const originalHardTermsForNoMatch = hardTerms.filter(t => {
+          // Filter to only original terms (not synonyms) by checking if term was in original intent
+          // This is approximate - in practice, we'll use the expanded terms for retry
+          return true; // Keep all for now, will refine if needed
+        });
+        
         if (strictGateCount >= minNeededForRequested) {
           // Stage A: Strict gate is sufficient - keep it
           gatedCandidates = strictGate;
           trustFallback = false;
           console.log(`[Gating] Stage A: strict (hard terms + facets) - strictGateCount=${strictGateCount} >= minNeeded=${minNeededForRequested} trustFallback=false`);
+        } else if (strictGateCount === 0) {
+          // CRITICAL: strictGateCount==0 - retry with expandedHardTerms (synonyms) if available
+          console.log(`[Gating] strictGateCount=0 - retrying with expandedHardTerms (synonym expansion)`);
+          
+          // Check if we have synonyms (expandedHardTerms should already include synonyms from earlier)
+          // If strictGateCount==0, it means original terms didn't match, so try synonyms
+          // Re-run strict gate with expanded terms (they're already in hardTerms from synonym expansion above)
+          const retryStrictGate: EnrichedCandidate[] = [];
+          for (const candidate of gatedCandidates) {
+            const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+            const hasHardTermMatch = hardTerms.some(phrase => {
+              const normalizedPhrase = unifiedNormalize(phrase);
+              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
+            });
+            if (hasHardTermMatch) {
+              retryStrictGate.push(candidate);
+            }
+          }
+          
+          if (retryStrictGate.length > 0) {
+            strictGateCount = retryStrictGate.length;
+            gatedCandidates = retryStrictGate;
+            trustFallback = false;
+            console.log(`[Gating] Retry with synonyms succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+          } else {
+            // Still 0 - try BM25 with token filter
+            console.log(`[Gating] strictGateCount still 0 after synonym retry - trying BM25 with token filter`);
+            
+            // Build query tokens from expanded hardTerms
+            const hardTermTokens = new Set<string>();
+            hardTerms.forEach(term => {
+              const normalized = unifiedNormalize(term);
+              const tokens = tokenize(normalized);
+              tokens.forEach(t => hardTermTokens.add(t));
+            });
+            
+            // Filter candidates to require at least one token match
+            const bm25Filtered = gatedCandidates.filter(candidate => {
+              const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+              const candidateTokens = new Set(tokenize(haystack));
+              return Array.from(hardTermTokens).some(token => candidateTokens.has(token));
+            });
+            
+            if (bm25Filtered.length > 0) {
+              // Use BM25 ranking on filtered candidates
+              const candidateDocs = bm25Filtered.map(c => ({
+                candidate: c,
+                tokens: tokenize(c.searchText || extractSearchText(c, indexMetafields)),
+              }));
+              
+              const idf = calculateIDF(candidateDocs.map(d => ({ tokens: d.tokens })));
+              const avgDocLen = candidateDocs.reduce((sum, d) => sum + d.tokens.length, 0) / candidateDocs.length || 1;
+              
+              const queryTokensArray = Array.from(hardTermTokens);
+              const scoredCandidates = candidateDocs.map(d => {
+                const docTokenFreq = new Map<string, number>();
+                for (const token of d.tokens) {
+                  docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+                }
+                const score = bm25Score(queryTokensArray, d.tokens, docTokenFreq, d.tokens.length, avgDocLen, idf);
+                return { candidate: d.candidate, score };
+              });
+              
+              scoredCandidates.sort((a, b) => {
+                if (Math.abs(b.score - a.score) > 0.01) return b.score - a.score;
+                if (a.candidate.available !== b.candidate.available) return a.candidate.available ? -1 : 1;
+                return a.candidate.handle.localeCompare(b.candidate.handle);
+              });
+              
+              gatedCandidates = scoredCandidates.map(s => s.candidate);
+              strictGateCount = gatedCandidates.length;
+              trustFallback = false;
+              console.log(`[Gating] BM25 with token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+            } else {
+              // All stages failed - return NO_MATCH
+              console.log(`[Gating] no_match=true - all gating stages failed (strictGateCount=0, synonym retry=0, BM25 filter=0)`);
+              // Will be handled below to return NO_MATCH result
+            }
+          }
         } else {
           // Need to broaden - implement staged fallback
           console.log(`[Gating] strictGateCount=${strictGateCount} < minNeeded=${minNeededForRequested} - starting staged fallback`);
@@ -4877,7 +5123,7 @@ async function processSessionInBackground({
           // Stage B: Relax facets only (keep ALL hard terms)
           // Build candidates that match ALL hardTerms but relax facet constraints
           const stageB = gatedCandidates.filter(candidate => {
-            const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate));
+            const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
             
             // Must match ALL hard terms (keep all hardTerms, don't drop any)
             const matchesAllHardTerms = hardTerms.every(phrase => {
@@ -4893,7 +5139,7 @@ async function processSessionInBackground({
             gatedCandidates = stageB;
             trustFallback = false;
             console.log(`[Gating] Stage B: relax facets only (keep all hardTerms) - count=${stageB.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
-          } else {
+              } else {
             // Stage C: Relax hard terms (allow token containment matching)
             // Use token-based matching: check if any normalized hard term token appears in indexed text
             const hardTermTokens = new Set<string>();
@@ -4904,7 +5150,7 @@ async function processSessionInBackground({
             });
             
             const stageC = gatedCandidates.filter(candidate => {
-              const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate));
+              const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
               const candidateTokens = new Set(tokenize(haystack));
               
               // Check if at least one hard term token appears in candidate
@@ -4917,11 +5163,11 @@ async function processSessionInBackground({
               gatedCandidates = stageC;
               trustFallback = false;
               console.log(`[Gating] Stage C: relax hard terms (token containment, keep all terms) - count=${stageC.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
-            } else {
+          } else {
               // Stage D: BM25 over full pool but filtered to items that match at least 1 normalized hard token
               // Use BM25 ranking but only include candidates with at least one token match
               const stageD = gatedCandidates.filter(candidate => {
-                const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate));
+                const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
                 const candidateTokens = new Set(tokenize(haystack));
                 
                 // Must match at least one hard term token
@@ -4936,7 +5182,7 @@ async function processSessionInBackground({
                 console.log(`[Gating] Stage D: BM25 with token filter - count=${stageD.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
               } else {
                 // All stages failed - mark for emergency fallback (no billing)
-                trustFallback = true;
+            trustFallback = true;
                 relaxNotes.push(`No matches found for "${hardTerms.join(", ")}" after staged fallback.`);
                 console.log(`[Gating] All stages failed - emergency fallback required - count=${gatedCandidates.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=true`);
               }
@@ -4962,7 +5208,7 @@ async function processSessionInBackground({
       if (nonFacetTerms.length > 0 && !isBundleFlow && isStageA) {
         const beforeAnchor = gatedCandidates.length;
         gatedCandidates = gatedCandidates.filter(c => {
-          const searchText = extractSearchText(c);
+          const searchText = extractSearchText(c, indexMetafields);
           return nonFacetTerms.some(term => {
             const termLower = term.toLowerCase().trim();
             return searchText.includes(termLower);
@@ -4980,7 +5226,7 @@ async function processSessionInBackground({
       if (avoidTerms.length > 0 && !trustFallback) {
         const beforeAvoid = gatedCandidates.length;
         gatedCandidates = gatedCandidates.filter(c => {
-          const searchText = extractSearchText(c);
+          const searchText = extractSearchText(c, indexMetafields);
           return !avoidTerms.some(avoid => searchText.includes(avoid.toLowerCase()));
         });
         if (gatedCandidates.length < beforeAvoid) {
@@ -4992,6 +5238,54 @@ async function processSessionInBackground({
       // Store strict gate candidates for fallback ranking (if strictGateCount > 0, fallback must use strict gate only)
       const strictGateCandidates = strictGate.length > 0 ? [...strictGate] : undefined;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
+      
+      // NO_MATCH CHECK: If all gating stages failed and we have no candidates, return NO_MATCH result
+      if (gatedCandidates.length === 0 && hardTerms.length > 0) {
+        console.log(`[Gating] no_match=true - returning NO_MATCH result (all gating stages failed)`);
+        
+        // Generate suggested synonyms from searchSynonymsJson
+        let suggestedSynonyms: string[] = [];
+        try {
+          let searchSynonyms: Record<string, string[]> = {};
+          if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "string") {
+            searchSynonyms = JSON.parse(experience.searchSynonymsJson);
+          } else if (experience.searchSynonymsJson && typeof experience.searchSynonymsJson === "object") {
+            searchSynonyms = experience.searchSynonymsJson;
+          }
+          
+          // Find synonyms for the original hardTerms (before expansion)
+          const originalTerms = hardTerms; // These are already expanded, but we can suggest alternatives
+          for (const term of originalTerms) {
+            const normalizedTerm = term.toLowerCase();
+            const synonyms = searchSynonyms[normalizedTerm] || searchSynonyms[term] || [];
+            suggestedSynonyms.push(...synonyms.slice(0, 3)); // Limit to 3 per term
+          }
+          suggestedSynonyms = Array.from(new Set(suggestedSynonyms)); // Deduplicate
+        } catch (e) {
+          // Ignore errors in synonym lookup
+        }
+        
+        // Save NO_MATCH result
+        const noMatchReasoning = suggestedSynonyms.length > 0
+          ? `No strong matches found for "${hardTerms.join(", ")}". Try searching for: ${suggestedSynonyms.slice(0, 5).join(", ")}`
+          : `No strong matches found for "${hardTerms.join(", ")}". Please try adjusting your search terms.`;
+        
+        await saveConciergeResult({
+          sessionToken,
+          productHandles: [],
+          productIds: null,
+          reasoning: noMatchReasoning,
+        });
+        
+        // Mark session as COMPLETE (not FAILED - this is a valid "no results" outcome)
+        await prisma.conciergeSession.update({
+          where: { publicToken: sessionToken },
+          data: { status: ConciergeSessionStatus.COMPLETE },
+        });
+        
+        console.log("[App Proxy] NO_MATCH result saved - session marked COMPLETE with 0 products");
+        return; // Exit early - no further processing needed
+      }
       
       // BUNDLE/HARD-TERM PATH: Continue processing
       // Reduce AI window when no hardTerms (max 30 candidates for speed)
@@ -6016,87 +6310,87 @@ async function processSessionInBackground({
               // AI returned handles but source=fallback or trustFallback=true - use legacy as fallback
               console.log(`[Bundle] ⚠️  AI returned ${aiBundle.selectedHandles.length} handles but source=${aiBundle.source}, using legacy selection as fallback`);
               
-              // Build item pools from sortedCandidates
-              const itemPools = new Map<number, EnrichedCandidate[]>();
-              for (const c of sortedCandidates) {
-                const itemIdx = (c as any)._bundleItemIndex;
+            // Build item pools from sortedCandidates
+            const itemPools = new Map<number, EnrichedCandidate[]>();
+            for (const c of sortedCandidates) {
+              const itemIdx = (c as any)._bundleItemIndex;
+              if (typeof itemIdx === "number") {
+                if (!itemPools.has(itemIdx)) {
+                  itemPools.set(itemIdx, []);
+                }
+                itemPools.get(itemIdx)!.push(c);
+              }
+            }
+            
+            // Build ranked candidates by itemIndex from AI handles
+            const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
+            for (const handle of aiBundle.selectedHandles) {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const itemIdx = (candidate as any)._bundleItemIndex;
                 if (typeof itemIdx === "number") {
-                  if (!itemPools.has(itemIdx)) {
-                    itemPools.set(itemIdx, []);
+                  if (!rankedCandidatesByItem.has(itemIdx)) {
+                    rankedCandidatesByItem.set(itemIdx, []);
                   }
-                  itemPools.get(itemIdx)!.push(c);
+                  rankedCandidatesByItem.get(itemIdx)!.push(candidate);
                 }
               }
-              
-              // Build ranked candidates by itemIndex from AI handles
-              const rankedCandidatesByItem = new Map<number, EnrichedCandidate[]>();
-              for (const handle of aiBundle.selectedHandles) {
-                const candidate = sortedCandidates.find(c => c.handle === handle);
-                if (candidate) {
-                  const itemIdx = (candidate as any)._bundleItemIndex;
-                  if (typeof itemIdx === "number") {
-                    if (!rankedCandidatesByItem.has(itemIdx)) {
-                      rankedCandidatesByItem.set(itemIdx, []);
-                    }
-                    rankedCandidatesByItem.get(itemIdx)!.push(candidate);
-                  }
-                }
+            }
+            
+            // Build allocated budgets map
+            const allocatedBudgets = new Map<number, number>();
+            bundleItemsWithBudget.forEach((item, idx) => {
+              if (item.budgetMax !== undefined && item.budgetMax !== null) {
+                allocatedBudgets.set(idx, item.budgetMax);
               }
-              
-              // Build allocated budgets map
-              const allocatedBudgets = new Map<number, number>();
-              bundleItemsWithBudget.forEach((item, idx) => {
-                if (item.budgetMax !== undefined && item.budgetMax !== null) {
-                  allocatedBudgets.set(idx, item.budgetMax);
-                }
-              });
-              
+            });
+            
               // Use budget-aware selection helper (legacy fallback only)
-              const selectionResult = selectBundleWithinBudget(
-                itemPools,
-                allocatedBudgets,
-                bundleIntent.totalBudget,
-                finalResultCount,
-                bundleItemsWithBudget.length,
+            const selectionResult = selectBundleWithinBudget(
+              itemPools,
+              allocatedBudgets,
+              bundleIntent.totalBudget,
+              finalResultCount,
+              bundleItemsWithBudget.length,
                 rankedCandidatesByItem,
                 slotPlan
-              );
-              
+            );
+            
               // Only set if not already set by AI (guard against overwriting)
               if (finalSource !== "ai") {
-                finalHandles = selectionResult.handles;
+            finalHandles = selectionResult.handles;
                 finalSource = "legacy";
               }
-              bundleFinalHandles = finalHandles; // Store for top-up check
-              if (selectionResult.trustFallback) {
-                trustFallback = true;
-              }
-              
+            bundleFinalHandles = finalHandles; // Store for top-up check
+            if (selectionResult.trustFallback) {
+              trustFallback = true;
+            }
+            
               // Log budget selection details (legacy fallback)
-              const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
-                .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
+            const chosenPrimariesText = Array.from(selectionResult.chosenPrimaries.entries())
+              .map(([idx, handle]) => `item${idx}=${handle}`).join(" ");
               console.log("[Bundle Budget] [LEGACY FALLBACK] chosenPrimaries", chosenPrimariesText);
               console.log("[Bundle Budget] [LEGACY FALLBACK] totalBudget=" + (bundleIntent.totalBudget !== null ? bundleIntent.totalBudget : "null") + 
-                " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
-                " finalCount=" + finalHandles.length + 
-                " trustFallback=" + selectionResult.trustFallback +
-                " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
-              
+              " finalTotalPrice=" + selectionResult.totalPrice.toFixed(2) + 
+              " finalCount=" + finalHandles.length + 
+              " trustFallback=" + selectionResult.trustFallback +
+              " budgetExceeded=" + (selectionResult.budgetExceeded === null ? "null" : String(selectionResult.budgetExceeded)));
+            
               // Build reasoning for legacy fallback
-              let reasoningText = "";
-              if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
-                reasoningText = aiBundle.reasoning.trim();
-              } else {
-                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
+            let reasoningText = "";
+            if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
+              reasoningText = aiBundle.reasoning.trim();
+            } else {
+              const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
                 reasoningText = `Built a bundle: ${itemNames}.`;
               }
               
-              const deliveredAfterAI = finalHandles.length;
-              if (deliveredAfterAI < finalResultCount) {
-                reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
-              }
-              
-              reasoningParts.push(reasoningText);
+            const deliveredAfterAI = finalHandles.length;
+            if (deliveredAfterAI < finalResultCount) {
+              reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+            }
+            
+            reasoningParts.push(reasoningText);
               console.log("[Bundle] [LEGACY FALLBACK] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
             }
           } else {
@@ -6160,7 +6454,7 @@ async function processSessionInBackground({
             
             // Only set if not already set by AI (guard against overwriting)
             if (finalSource !== "ai") {
-              finalHandles = selectionResult.handles;
+            finalHandles = selectionResult.handles;
               finalSource = "legacy";
             }
             bundleFinalHandles = finalHandles; // Store for top-up check
@@ -6230,7 +6524,7 @@ async function processSessionInBackground({
           
           // Only set if not already set by AI (guard against overwriting)
           if (finalSource !== "ai") {
-            finalHandles = selectionResult.handles;
+          finalHandles = selectionResult.handles;
             finalSource = "legacy";
           }
           bundleFinalHandles = finalHandles; // Store for top-up check
@@ -7236,7 +7530,7 @@ async function processSessionInBackground({
 
       // CRITICAL: Only update finalHandles if it wasn't set by AI (preserve AI result)
       if (finalSource !== "ai") {
-        finalHandles = finalHandlesGuaranteed;
+      finalHandles = finalHandlesGuaranteed;
       } else {
         // AI source: ensure finalHandlesGuaranteed uses AI handles if validation didn't filter them all
         if (finalHandlesGuaranteed.length === 0 && finalHandles.length > 0) {
@@ -7945,11 +8239,11 @@ async function processSessionInBackground({
             console.log(`[Bundle Budget] ✅ canMeetBudget=true - keeping all ${handlesToSave.length} items (budget applies to primaries only, not alternatives)`);
           } else {
             // Cannot meet budget even with cheapest one-per-group - still keep all items but mark exceeded
-            constraintExceeded = true;
+          constraintExceeded = true;
             trustFallback = true;
             console.log("[Bundle Budget] ❌ cannot meet budget - cheapest one-per-group exceeds budget", {
               cheapestOnePerGroupTotal,
-              maxPriceCeiling,
+            maxPriceCeiling,
               difference: cheapestOnePerGroupTotal - maxPriceCeiling,
             });
             // Still keep all items - budget is a soft constraint
@@ -8391,27 +8685,27 @@ async function processSessionInBackground({
     // If error occurs in product fetching/processing, re-throw to be caught by outer try-catch
     console.error("[App Proxy] Error in product fetching/processing:", innerError);
     throw innerError;
-  }
+    }
   } catch (error: any) {
-    console.error("[App Proxy] Background processing failed:", error);
-    // Mark session as FAILED
-    await prisma.conciergeSession.update({
-      where: { publicToken: sessionToken },
-      data: { 
-        status: ConciergeSessionStatus.FAILED,
-      },
-    }).catch(() => {});
-    
-    // Save error result
-    await saveConciergeResult({
-      sessionToken,
-      productHandles: [],
-      productIds: null,
-      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
-    }).catch(() => {});
-    
-    // Re-throw to be caught by outer handler in setImmediate
-    throw error;
-  }
+      console.error("[App Proxy] Background processing failed:", error);
+      // Mark session as FAILED
+      await prisma.conciergeSession.update({
+        where: { publicToken: sessionToken },
+        data: { 
+          status: ConciergeSessionStatus.FAILED,
+        },
+      }).catch(() => {});
+      
+      // Save error result
+      await saveConciergeResult({
+        sessionToken,
+        productHandles: [],
+        productIds: null,
+        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+      }).catch(() => {});
+      
+      // Re-throw to be caught by outer handler in setImmediate
+      throw error;
+    }
 }
 
