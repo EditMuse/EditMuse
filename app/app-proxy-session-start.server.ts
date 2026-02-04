@@ -1346,6 +1346,61 @@ function normalizeItemLabel(text: string): string {
 }
 
 /**
+ * Industry-agnostic: Infer canonical type from product (consistent across bundle operations)
+ * Uses indexedText/title/handle/tags (not just productType)
+ * Supports singular/plural (trouser/trousers, shirt/shirts, suit/suits) with same tokenization as gating
+ */
+function inferCanonicalType(candidate: { title?: string | null; productType?: string | null; handle?: string; tags?: string[]; vendor?: string | null; searchText?: string | null }): string {
+  // Build searchable text from all relevant fields
+  const searchableText = [
+    candidate.title || "",
+    candidate.productType || "",
+    candidate.handle || "",
+    (candidate.tags || []).join(" "),
+    candidate.vendor || "",
+    candidate.searchText || "",
+  ].join(" ").toLowerCase();
+  
+  // Tokenize using same logic as gating
+  const tokens = tokenize(searchableText);
+  const tokenSet = new Set(tokens);
+  
+  // Common product type patterns (industry-agnostic, supports singular/plural)
+  const typePatterns: Array<{ pattern: RegExp; canonical: string }> = [
+    { pattern: /\b(suit|suits)\b/i, canonical: "suit" },
+    { pattern: /\b(shirt|shirts)\b/i, canonical: "shirt" },
+    { pattern: /\b(trouser|trousers|pant|pants)\b/i, canonical: "trouser" },
+    { pattern: /\b(jacket|jackets)\b/i, canonical: "jacket" },
+    { pattern: /\b(coat|coats|overcoat|overcoats)\b/i, canonical: "coat" },
+    { pattern: /\b(shoe|shoes|boot|boots|sneaker|sneakers)\b/i, canonical: "shoe" },
+    { pattern: /\b(tie|ties)\b/i, canonical: "tie" },
+    { pattern: /\b(vest|vests)\b/i, canonical: "vest" },
+  ];
+  
+  // Check patterns first (more specific)
+  for (const { pattern, canonical } of typePatterns) {
+    if (pattern.test(searchableText)) {
+      return canonical;
+    }
+  }
+  
+  // Fallback: use productType if available, otherwise use first significant token
+  if (candidate.productType) {
+    const normalized = normalizeItemLabel(candidate.productType);
+    if (normalized && normalized !== "unknown") {
+      return normalized;
+    }
+  }
+  
+  // Last resort: use first significant token from title
+  if (tokens.length > 0) {
+    return tokens[0];
+  }
+  
+  return "unknown";
+}
+
+/**
  * Industry-agnostic: Check if a term is a contextual modifier (occasion/style/use-case) not a product type
  */
 function isContextualModifier(term: string): boolean {
@@ -2379,6 +2434,7 @@ export async function proxySessionStartAction(
 
   const { experienceId, clientRequestId } = body;
   let answers = body.answers;
+  const messages = (body as any).messages; // Conversation messages (for chat mode)
   // NOTE: resultCount is ignored - Experience.resultCount is the ONLY source of truth
   const bodyResultCount = (body as any).resultCount; // Only for logging
   
@@ -2771,8 +2827,32 @@ export async function proxySessionStartAction(
     answers = [];
   }
 
-  // Answers provided - proceed with session creation and result processing
-  console.log("[App Proxy] Answers provided - creating session and processing");
+  // CRITICAL FIX: Check if both answersJson and conversation messages are empty
+  // If so, do NOT create a session - return early with NO_QUERY status
+  const hasMessages = messages !== undefined && messages !== null && 
+    ((Array.isArray(messages) && messages.length > 0) || (typeof messages === "string" && messages.trim() !== ""));
+  const answersJsonCheck = Array.isArray(answers) 
+    ? (answers.length === 0 || answers.every(a => !a || (typeof a === "string" && a.trim() === "")))
+    : (typeof answers === "string" ? answers.trim() === "" : !answers);
+  
+  if (answersJsonCheck && !hasMessages) {
+    console.log("[App Proxy] NO_QUERY detected - answersJson empty AND conversation messages empty - returning early without creating session");
+    console.log("[App Proxy] No billing, no Shopify fetch, no AI calls, no DB writes");
+    
+    return Response.json({
+      ok: true,
+      status: "NO_QUERY",
+      sid: null,
+      sessionId: null,
+      questions: questions, // Still return questions for UI
+      experienceIdUsed: experienceIdUsed,
+      modeUsed: modeUsed,
+      finalResultCount: finalResultCount,
+    });
+  }
+
+  // Answers or messages provided - proceed with session creation and result processing
+  console.log("[App Proxy] Answers or messages provided - creating session and processing");
 
   // Block access if subscription is cancelled or trial expired
   if (entitlements.planTier === "TRIAL" && !entitlements.showTrialBadge) {
@@ -4390,7 +4470,17 @@ async function processSessionInBackground({
         allocatedBudgets: Map<number, number>,
         totalBudget: number | null,
         requestedCount: number,
-        bundleItemsWithBudget: Array<{ hardTerms: string[]; quantity: number }>,
+        bundleItemsWithBudget: Array<{ 
+          hardTerms: string[]; 
+          quantity: number;
+          constraints?: {
+            optionConstraints?: {
+              size?: string | null;
+              color?: string | null;
+              material?: string | null;
+            };
+          };
+        }>,
         inStockOnly: boolean,
         experience: any
       ): {
@@ -4442,8 +4532,15 @@ async function processSessionInBackground({
             if (handles.length >= requestedCount) break;
             const pool = bundleItemPools.get(itemIdx) || [];
             const allocatedBudget = allocatedBudgets.get(itemIdx);
+            const bundleItem = bundleItemsWithBudget[itemIdx];
+            const itemOptionConstraints = bundleItem?.constraints?.optionConstraints;
+            const itemFacets = {
+              size: itemOptionConstraints?.size ?? null,
+              color: itemOptionConstraints?.color ?? null,
+              material: itemOptionConstraints?.material ?? null,
+            };
             
-            // Filter candidates: available if needed, within allocated budget, within total budget
+            // Filter candidates: available if needed, within allocated budget, within total budget, and per-item facets
             const candidates = pool
               .filter(c => !used.has(c.handle))
               .filter(c => isAvailable(c))
@@ -4457,6 +4554,38 @@ async function processSessionInBackground({
                   const projectedTotal = totalPrice + price;
                   if (projectedTotal > totalBudget) return false;
                 }
+                // Check per-item facets (size/color/material) if specified
+                // Do NOT fail items when product has no extracted colors/sizes/materials
+                if (itemFacets.size && c.sizes.length > 0) {
+                  const sizeMatch = c.sizes.some((s: string) => 
+                    normalizeText(s) === normalizeText(itemFacets.size) ||
+                    normalizeText(s).includes(normalizeText(itemFacets.size)) ||
+                    normalizeText(itemFacets.size).includes(normalizeText(s))
+                  );
+                  if (!sizeMatch) return false;
+                }
+                // If itemFacets.size is specified but candidate has no sizes, don't fail (passes check)
+                
+                if (itemFacets.color && c.colors.length > 0) {
+                  const colorMatch = c.colors.some((col: string) => 
+                    normalizeText(col) === normalizeText(itemFacets.color) ||
+                    normalizeText(col).includes(normalizeText(itemFacets.color)) ||
+                    normalizeText(itemFacets.color).includes(normalizeText(col))
+                  );
+                  if (!colorMatch) return false;
+                }
+                // If itemFacets.color is specified but candidate has no colors, don't fail (passes check)
+                
+                if (itemFacets.material && c.materials.length > 0) {
+                  const materialMatch = c.materials.some((m: string) => 
+                    normalizeText(m) === normalizeText(itemFacets.material) ||
+                    normalizeText(m).includes(normalizeText(itemFacets.material)) ||
+                    normalizeText(itemFacets.material).includes(normalizeText(m))
+                  );
+                  if (!materialMatch) return false;
+                }
+                // If itemFacets.material is specified but candidate has no materials, don't fail (passes check)
+                
                 return true;
               })
               .sort((a, b) => getPrice(a) - getPrice(b)); // cheapest first
@@ -5458,12 +5587,12 @@ async function processSessionInBackground({
                   noMatchDetected = true;
                   gatedCandidates = [];
                 }
-              } else {
-                // All stages failed - return NO_MATCH
-                console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
-                noMatchDetected = true; // Set flag to short-circuit pipeline
-                gatedCandidates = []; // Ensure gatedCandidates is empty
-                // Will be handled below to return NO_MATCH result
+            } else {
+              // All stages failed - return NO_MATCH
+              console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
+              noMatchDetected = true; // Set flag to short-circuit pipeline
+              gatedCandidates = []; // Ensure gatedCandidates is empty
+              // Will be handled below to return NO_MATCH result
               }
             }
           }
@@ -7592,21 +7721,65 @@ async function processSessionInBackground({
         } else {
           // (b) Constraint validation: Check availability and facets per item
           const constraintValid: string[] = [];
+          const validationDebugLogs: Array<{
+            handle: string;
+            inferredCanonicalType: string;
+            matchedItemIdx: number | null;
+            requestedItemType: string | null;
+            facetChecks: {
+              size?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+              color?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+              material?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+            };
+            availabilityCheck: { required: boolean; candidateAvailable: boolean; passed: boolean };
+            finalResult: "passed" | "failed" | "skipped";
+            failureReason?: string;
+          }> = [];
+          
           for (const handle of handleExistenceValid) {
             const candidate = candidateMap.get(handle);
-            if (!candidate) continue;
+            if (!candidate) {
+              validationDebugLogs.push({
+                handle,
+                inferredCanonicalType: "unknown",
+                matchedItemIdx: null,
+                requestedItemType: null,
+                facetChecks: {},
+                availabilityCheck: { required: false, candidateAvailable: false, passed: false },
+                finalResult: "skipped",
+                failureReason: "candidate not found in map"
+              });
+              continue;
+            }
+            
+            // Infer canonical type using consistent function
+            const inferredCanonicalType = inferCanonicalType(candidate);
             
             // Find which bundle item this handle matches using robust matcher
             let matchedItemIdx: number | null = null;
+            let requestedItemType: string | null = null;
             for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
               const bundleItem = bundleIntent.items[itemIdx];
               if (matchesBundleItem(candidate, bundleItem)) {
                 matchedItemIdx = itemIdx;
+                requestedItemType = bundleItem.hardTerms[0] || (bundleItem as any).canonicalType || `item${itemIdx}`;
                 break;
               }
             }
             
-            if (matchedItemIdx === null) continue; // Doesn't match any item type
+            if (matchedItemIdx === null) {
+              validationDebugLogs.push({
+                handle,
+                inferredCanonicalType,
+                matchedItemIdx: null,
+                requestedItemType: null,
+                facetChecks: {},
+                availabilityCheck: { required: false, candidateAvailable: candidate.available || false, passed: false },
+                finalResult: "failed",
+                failureReason: "does not match any bundle item type"
+              });
+              continue; // Doesn't match any item type
+            }
             
             // Check constraints for this item
             const bundleItem = bundleIntent.items[matchedItemIdx];
@@ -7618,23 +7791,60 @@ async function processSessionInBackground({
               material: itemOptionConstraints?.material ?? null,
             };
             
+            // Build debug info for facet checks
+            const facetChecks: {
+              size?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+              color?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+              material?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
+            } = {};
+            
             // Check availability (if inStockOnly is enabled)
+            const availabilityCheck = {
+              required: experience.inStockOnly || false,
+              candidateAvailable: candidate.available || false,
+              passed: !experience.inStockOnly || candidate.available || false
+            };
+            
             if (experience.inStockOnly && !candidate.available) {
+              validationDebugLogs.push({
+                handle,
+                inferredCanonicalType,
+                matchedItemIdx,
+                requestedItemType,
+                facetChecks,
+                availabilityCheck,
+                finalResult: "failed",
+                failureReason: "availability check failed (inStockOnly=true, candidate.available=false)"
+              });
               continue; // Skip unavailable items
             }
             
             // Check facets (size/color/material) if specified
             // Do NOT fail items when product has no extracted colors/sizes/materials
             let passesFacets = true;
-            if (itemFacets.size && candidate.sizes.length > 0) {
-              const sizeMatch = candidate.sizes.some((s: string) => 
-                normalizeText(s) === normalizeText(itemFacets.size) ||
-                normalizeText(s).includes(normalizeText(itemFacets.size)) ||
-                normalizeText(itemFacets.size).includes(normalizeText(s))
-              );
-              if (!sizeMatch) passesFacets = false;
+            let facetFailureReason: string | undefined;
+            
+            if (itemFacets.size) {
+              const candidateHasSizes = candidate.sizes.length > 0;
+              let sizeMatch = false;
+              if (candidateHasSizes) {
+                sizeMatch = candidate.sizes.some((s: string) => 
+                  normalizeText(s) === normalizeText(itemFacets.size) ||
+                  normalizeText(s).includes(normalizeText(itemFacets.size)) ||
+                  normalizeText(itemFacets.size).includes(normalizeText(s))
+                );
+              }
+              facetChecks.size = {
+                required: itemFacets.size,
+                candidateHas: candidateHasSizes,
+                passed: sizeMatch || !candidateHasSizes, // Pass if no sizes extracted
+                reason: candidateHasSizes && !sizeMatch ? `size mismatch: required=${itemFacets.size}, candidate has=${candidate.sizes.join(",")}` : undefined
+              };
+              if (candidateHasSizes && !sizeMatch) {
+                passesFacets = false;
+                facetFailureReason = facetChecks.size.reason;
+              }
             }
-            // If itemFacets.size is specified but candidate has no sizes, don't fail (passesFacets stays true)
             
             if (itemFacets.color && candidate.colors.length > 0 && passesFacets) {
               const colorMatch = candidate.colors.some((col: string) => 
@@ -7642,9 +7852,24 @@ async function processSessionInBackground({
                 normalizeText(col).includes(normalizeText(itemFacets.color)) ||
                 normalizeText(itemFacets.color).includes(normalizeText(col))
               );
-              if (!colorMatch) passesFacets = false;
+              facetChecks.color = {
+                required: itemFacets.color,
+                candidateHas: true,
+                passed: colorMatch,
+                reason: !colorMatch ? `color mismatch: required=${itemFacets.color}, candidate has=${candidate.colors.join(",")}` : undefined
+              };
+              if (!colorMatch) {
+                passesFacets = false;
+                facetFailureReason = facetChecks.color.reason;
+              }
+            } else if (itemFacets.color) {
+              facetChecks.color = {
+                required: itemFacets.color,
+                candidateHas: false,
+                passed: true, // Pass if no colors extracted
+                reason: undefined
+              };
             }
-            // If itemFacets.color is specified but candidate has no colors, don't fail (passesFacets stays true)
             
             if (itemFacets.material && candidate.materials.length > 0 && passesFacets) {
               const materialMatch = candidate.materials.some((m: string) => 
@@ -7652,37 +7877,99 @@ async function processSessionInBackground({
                 normalizeText(m).includes(normalizeText(itemFacets.material)) ||
                 normalizeText(itemFacets.material).includes(normalizeText(m))
               );
-              if (!materialMatch) passesFacets = false;
+              facetChecks.material = {
+                required: itemFacets.material,
+                candidateHas: true,
+                passed: materialMatch,
+                reason: !materialMatch ? `material mismatch: required=${itemFacets.material}, candidate has=${candidate.materials.join(",")}` : undefined
+              };
+              if (!materialMatch) {
+                passesFacets = false;
+                facetFailureReason = facetChecks.material.reason;
+              }
+            } else if (itemFacets.material) {
+              facetChecks.material = {
+                required: itemFacets.material,
+                candidateHas: false,
+                passed: true, // Pass if no materials extracted
+                reason: undefined
+              };
             }
-            // If itemFacets.material is specified but candidate has no materials, don't fail (passesFacets stays true)
             
             if (passesFacets) {
               constraintValid.push(handle);
+              validationDebugLogs.push({
+                handle,
+                inferredCanonicalType,
+                matchedItemIdx,
+                requestedItemType,
+                facetChecks,
+                availabilityCheck,
+                finalResult: "passed"
+              });
+            } else {
+              validationDebugLogs.push({
+                handle,
+                inferredCanonicalType,
+                matchedItemIdx,
+                requestedItemType,
+                facetChecks,
+                availabilityCheck,
+                finalResult: "failed",
+                failureReason: facetFailureReason || "facet check failed"
+              });
             }
           }
+          
+          // Log per-handle debug info
+          console.log(`[Bundle Validation] (b) per_handle_debug:`, JSON.stringify(validationDebugLogs, null, 2));
           console.log(`[Bundle Validation] (b) constraint_validation: ${constraintValid.length} out of ${handleExistenceValid.length} handles pass constraints`);
           
           if (constraintValid.length === 0) {
-            console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
-            // If bundle constraint validation results in 0 handles, do NOT refill and still claim source=ai
-            // Fallback to existenceValid (handles that exist + are available) and set resultSource to "fallback"
-            const existenceValidFallback = handleExistenceValid.filter(handle => {
-              const candidate = candidateMap.get(handle);
-              if (!candidate) return false;
-              // Only check availability (if inStockOnly is enabled)
-              if (experience.inStockOnly && !candidate.available) return false;
-              return true;
-            });
-            
-            if (existenceValidFallback.length > 0) {
-              // Use existence-valid handles as fallback
-              validatedHandles = existenceValidFallback;
-              // Mark that we used validation fallback (resultSource will be set to "fallback" later, not "ai")
-              usedValidationFallback = true;
-              console.log(`[Bundle Validation] (b) constraint_validation: using existence-valid fallback (${existenceValidFallback.length} handles)`);
+            // CRITICAL FIX: If source=ai and validation would return 0 handles, do NOT mark NO_MATCH
+            // Instead: keep the AI handles (after availability/dedupe checks), log validation_suspicious=true, and proceed
+            if (finalSource === "ai" && handleExistenceValid.length > 0) {
+              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT source=ai - keeping AI handles (validation_suspicious=true)`);
+              // Keep AI handles that exist and are available (if inStockOnly is enabled)
+              const aiHandlesKept = handleExistenceValid.filter(handle => {
+                const candidate = candidateMap.get(handle);
+                if (!candidate) return false;
+                // Only check availability (if inStockOnly is enabled)
+                if (experience.inStockOnly && !candidate.available) return false;
+                return true;
+              });
+              
+              if (aiHandlesKept.length > 0) {
+                validatedHandles = aiHandlesKept;
+                console.log(`[Bundle Validation] (b) constraint_validation: kept ${aiHandlesKept.length} AI handles despite validation failure (validation_suspicious=true)`);
+              } else {
+                // No available AI handles - fallback to existence-valid
+                validatedHandles = handleExistenceValid;
+                usedValidationFallback = true;
+                console.log(`[Bundle Validation] (b) constraint_validation: no available AI handles, using existence-valid fallback (${handleExistenceValid.length} handles)`);
+              }
             } else {
-              // No fallback available - return NO_MATCH
-              validatedHandles = [];
+              // Not AI source or no handles exist - use fallback logic
+              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
+              // Fallback to existenceValid (handles that exist + are available) and set resultSource to "fallback"
+              const existenceValidFallback = handleExistenceValid.filter(handle => {
+                const candidate = candidateMap.get(handle);
+                if (!candidate) return false;
+                // Only check availability (if inStockOnly is enabled)
+                if (experience.inStockOnly && !candidate.available) return false;
+                return true;
+              });
+              
+              if (existenceValidFallback.length > 0) {
+                // Use existence-valid handles as fallback
+                validatedHandles = existenceValidFallback;
+                // Mark that we used validation fallback (resultSource will be set to "fallback" later, not "ai")
+                usedValidationFallback = true;
+                console.log(`[Bundle Validation] (b) constraint_validation: using existence-valid fallback (${existenceValidFallback.length} handles)`);
+              } else {
+                // No fallback available - return NO_MATCH
+                validatedHandles = [];
+              }
             }
           } else {
             // (c) Bundle-type validation: Ensure each requested type has >=1 handle
@@ -7727,10 +8014,13 @@ async function processSessionInBackground({
               validatedHandles = constraintValid;
             }
             
-            // Log per-item counts for bundle-type validation
+            // Log per-item counts for bundle-type validation (using inferCanonicalType for consistency)
             const perItemCounts = Array.from(handlesByItemType.entries()).map(([idx, handles]) => {
-              const itemName = bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
-              return `${itemName}=${handles.length}`;
+              // Use inferCanonicalType for consistent type inference
+              const firstHandle = handles[0];
+              const firstCandidate = firstHandle ? candidateMap.get(firstHandle) : null;
+              const inferredType = firstCandidate ? inferCanonicalType(firstCandidate) : bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
+              return `${inferredType}=${handles.length}`;
             }).join(" ");
             console.log(`[Bundle Validation] (c) per_item_counts: ${perItemCounts}`);
           }
@@ -7927,14 +8217,18 @@ async function processSessionInBackground({
             }
           });
           
-          // Use 3-pass bundle top-up ladder
+          // Use 3-pass bundle top-up ladder (with per-item facet constraints)
           const topUpResult = bundleTopUp3Pass(
             finalHandlesGuaranteed,
             bundleItemPools,
             allocatedBudgets,
             bundleIntent.totalBudget,
             finalResultCount,
-            bundleItemsWithBudget,
+            bundleItemsWithBudget.map(item => ({
+              hardTerms: item.hardTerms,
+              quantity: item.quantity,
+              constraints: item.constraints, // Include constraints for per-item facet checks
+            })),
             experience.inStockOnly || false,
             experience
           );

@@ -2868,6 +2868,12 @@
         }
         var data = result.parsed;
         
+        // Handle NO_QUERY response - do not create session, do not show analysing spinner
+        if (data.status === 'NO_QUERY' || (data.ok && data.sid === null && data.status === 'NO_QUERY')) {
+          console.log('[EditMuse] NO_QUERY response - no session created');
+          return null; // Return null to indicate no session was created
+        }
+        
         if (data.ok && data.sessionId) {
           return data.sessionId;
         } else if (data.sid) {
@@ -3310,6 +3316,17 @@
           try {
             sid = await this.startSessionWithTimeout(requestBody, 25000);
             console.debug('[Concierge] startSessionWithTimeout succeeded sid=', sid);
+            
+            // Handle NO_QUERY response - do not show analysing spinner
+            if (sid === null) {
+              console.log('[EditMuse] NO_QUERY response - no session created, stopping submission');
+              this.state.loading = false;
+              this.state.error = null;
+              this.render();
+              window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
+              window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
+              return; // Exit early, do not show analysing spinner
+            }
           } catch (timeoutError) {
             // Timeout is NOT an error - backend is still processing
             console.log('[EditMuse] startSession timed out; switching to resume/poll flow');
