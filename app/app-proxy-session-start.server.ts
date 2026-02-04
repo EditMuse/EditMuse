@@ -1346,6 +1346,169 @@ function normalizeItemLabel(text: string): string {
 }
 
 /**
+ * Check if candidate satisfies constraints via structured options OR tag-derived facets
+ * Returns { ok: boolean, conflict?: {facet, expected, actual, source} }
+ * Industry-agnostic: works with any facet keys (size, color, material, scent, finish, etc.)
+ */
+async function satisfiesConstraintsStructuredOrTags(
+  candidate: any, // EnrichedCandidate type - defined later in scope
+  constraints: Array<{ key: string; value: string }>,
+  facetVocabulary?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> }
+): Promise<{ ok: boolean; conflict?: { facet: string; expected: string; actual: string; source: string } }> {
+  if (constraints.length === 0) {
+    return { ok: true };
+  }
+  
+  const { productSatisfiesConstraints, extractConstraintsFromTags, normalizeFacetValue } = await import("~/utils/facets.server");
+  
+  // Helper to check if two values match (with equivalence)
+  function valueMatchesConstraint(productValue: string, constraintValue: string): boolean {
+    const normalizedProduct = productValue.toLowerCase().trim();
+    const normalizedConstraint = constraintValue.toLowerCase().trim();
+    
+    // Exact match
+    if (normalizedProduct === normalizedConstraint) return true;
+    
+    // Partial match (conservative - only if one contains the other)
+    if (normalizedProduct.includes(normalizedConstraint) || normalizedConstraint.includes(normalizedProduct)) {
+      return true;
+    }
+    
+    // Size equivalences (only for size-related constraints)
+    const sizeEquivalences: Record<string, string[]> = {
+      "s": ["small", "s"],
+      "m": ["medium", "m"],
+      "l": ["large", "l"],
+      "xl": ["extra large", "x-large", "xl", "extra-large"],
+      "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
+    };
+    
+    if (sizeEquivalences[normalizedConstraint]) {
+      const aliases = sizeEquivalences[normalizedConstraint];
+      if (aliases.some(alias => normalizedProduct === alias)) return true;
+    }
+    
+    if (sizeEquivalences[normalizedProduct]) {
+      const aliases = sizeEquivalences[normalizedProduct];
+      if (aliases.some(alias => normalizedConstraint === alias)) return true;
+    }
+    
+    return false;
+  }
+  
+  // Step 1: Try structured matching (variants/options)
+  const structuredMatch = productSatisfiesConstraints(candidate, constraints, true);
+  if (structuredMatch) {
+    return { ok: true };
+  }
+  
+  // Step 2: Check for explicit conflicts in structured data
+  const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
+  const discoveredOptionNames = facetVocabulary?.optionNames || new Set<string>();
+  
+  // Check variants for conflicts
+  if (Array.isArray(candidate.variants)) {
+    for (const variant of candidate.variants) {
+      if (Array.isArray(variant.selectedOptions)) {
+        for (const opt of variant.selectedOptions) {
+          const optName = (opt.name || "").toLowerCase().trim();
+          const optValue = (opt.value || "").toLowerCase().trim();
+          
+          for (const constraint of constraints) {
+            const constraintKey = constraint.key.toLowerCase().trim();
+            const constraintValue = constraint.value.toLowerCase().trim();
+            
+            if (optName === constraintKey) {
+              // Check if values match (with equivalence)
+              const matches = valueMatchesConstraint(optValue, constraintValue);
+              if (!matches) {
+                // Explicit conflict in structured data
+                return {
+                  ok: false,
+                  conflict: {
+                    facet: constraint.key,
+                    expected: constraint.value,
+                    actual: opt.value,
+                    source: "variant_option"
+                  }
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // Step 3: Extract tag-derived constraints and check for conflicts
+  const tagConstraints = extractConstraintsFromTags(tags, discoveredOptionNames);
+  const tagConstraintsMap = new Map<string, string>();
+  for (const tc of tagConstraints) {
+    tagConstraintsMap.set(tc.key.toLowerCase(), tc.value.toLowerCase());
+  }
+  
+  // Check if tag constraints conflict with requested constraints
+  for (const constraint of constraints) {
+    const constraintKey = constraint.key.toLowerCase().trim();
+    const constraintValue = constraint.value.toLowerCase().trim();
+    const tagValue = tagConstraintsMap.get(constraintKey);
+    
+    if (tagValue) {
+      // Tag has this facet - check if it matches
+      const matches = valueMatchesConstraint(tagValue, constraintValue);
+      if (matches) {
+        // Tag matches - accept
+        return { ok: true };
+      } else {
+        // Tag conflicts - reject
+        return {
+          ok: false,
+          conflict: {
+            facet: constraint.key,
+            expected: constraint.value,
+            actual: tagValue,
+            source: "tag"
+          }
+        };
+      }
+    }
+  }
+  
+  // Step 4: If no structured facets exist and no tag facets, allow token fallback
+  const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
+    candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
+  const hasTagFacets = tagConstraints.length > 0;
+  
+  if (!hasStructuredFacets && !hasTagFacets) {
+    // No structured or tag facets - use token containment fallback
+    const indexedText = [
+      candidate.title || "",
+      candidate.handle || "",
+      candidate.productType || "",
+      tags.join(" "),
+      candidate.vendor || "",
+      candidate.searchText || "",
+    ].join(" ").toLowerCase();
+    
+    let tokenFallbackMatch = true;
+    for (const constraint of constraints) {
+      const constraintValue = constraint.value.toLowerCase().trim();
+      if (!indexedText.includes(constraintValue)) {
+        tokenFallbackMatch = false;
+        break;
+      }
+    }
+    
+    if (tokenFallbackMatch) {
+      return { ok: true };
+    }
+  }
+  
+  // Step 5: If structured facets exist but didn't match and no tag match, reject
+  return { ok: false };
+}
+
+/**
  * Industry-agnostic: Infer canonical type from product (consistent across bundle operations)
  * Uses indexedText/title/handle/tags (not just productType)
  * Supports singular/plural (trouser/trousers, shirt/shirts, suit/suits) with same tokenization as gating
@@ -6577,16 +6740,20 @@ async function processSessionInBackground({
           
           console.log(`[Constraints] bundle_item=${itemIdx} global=[${globalFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] per_item=[${itemFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] merged=[${mergedItemConstraints.map(c => `${c.key}:${c.value}`).join(", ")}]`);
           
-          // Gate with constraints using new facet system
-          let itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
-            // Check constraints using new facet system
+          // Gate with constraints using new helper that checks structured OR tag-derived facets
+          let itemGatedUnfiltered: EnrichedCandidate[] = [];
+          for (const c of allCandidatesEnriched) {
             if (mergedItemConstraints.length > 0) {
-              if (!productSatisfiesConstraints(c, mergedItemConstraints, true)) {
-                return false;
+              const constraintResult = await satisfiesConstraintsStructuredOrTags(c, mergedItemConstraints, facetVocabulary);
+              if (!constraintResult.ok) {
+                continue; // Skip this candidate
               }
             }
-            
-            // Apply token-based slot matching for this item (industry-agnostic)
+            itemGatedUnfiltered.push(c);
+          }
+          
+          // Apply token-based slot matching for this item (industry-agnostic)
+          itemGatedUnfiltered = itemGatedUnfiltered.filter(c => {
             // Build slot descriptor from item hardTerms
             const slotDescriptor = itemHardTerms.join(" ");
             const slotScore = scoreProductForSlot(c, slotDescriptor);
@@ -7963,113 +8130,18 @@ async function processSessionInBackground({
           // Check availability
           if (!candidate.available) continue;
           
-          // Check constraints using new facet system (industry-agnostic)
+          // Check constraints using new helper that accepts structured OR tag-derived facets
           let passesConstraints = true;
           if (facetConstraints.length > 0) {
-            // First attempt: structured matching (variants/options/tags)
-            const structuredMatch = productSatisfiesConstraints(candidate, facetConstraints, true);
+            const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, facetConstraints, facetVocabularyForBundle);
             
-            if (!structuredMatch) {
-              // Check if structured facets exist for this product
-              const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
-                candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
-              
-              // Check for tag-based facets (cf-color-*, cf-size-*, etc)
-              const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
-              const hasTagFacets = tags.some((tag: string) => 
-                typeof tag === "string" && (
-                  tag.startsWith("cf-color-") ||
-                  tag.startsWith("cf-size-") ||
-                  tag.startsWith("cf-material-")
-                )
-              );
-              
-              // Check for conflicting structured values
-              let hasConflictingStructuredValue = false;
-              if (hasStructuredFacets || hasTagFacets) {
-                // Product has structured facets but didn't match - check for conflicts
-                for (const constraint of facetConstraints) {
-                  const normalizedConstraintValue = constraint.value.toLowerCase().trim();
-                  
-                  // Check variants
-                  if (Array.isArray(candidate.variants)) {
-                    for (const variant of candidate.variants) {
-                      if (Array.isArray(variant.selectedOptions)) {
-                        for (const opt of variant.selectedOptions) {
-                          const normalizedName = (opt.name || "").toLowerCase().trim();
-                          const normalizedValue = (opt.value || "").toLowerCase().trim();
-                          
-                          if (normalizedName === constraint.key.toLowerCase() && 
-                              normalizedValue !== normalizedConstraintValue &&
-                              !normalizedValue.includes(normalizedConstraintValue) &&
-                              !normalizedConstraintValue.includes(normalizedValue)) {
-                            hasConflictingStructuredValue = true;
-                            console.log(`[Validation] rejected_due_to_conflicting_structured_facet facet=${constraint.key} expected=${constraint.value} actual=${opt.value}`);
-                            break;
-                          }
-                        }
-                      }
-                      if (hasConflictingStructuredValue) break;
-                    }
-                  }
-                  
-                  // Check tags
-                  if (!hasConflictingStructuredValue && hasTagFacets) {
-                    const tagPrefix = `cf-${constraint.key}-`;
-                    const matchingTags = tags.filter((tag: string) => 
-                      typeof tag === "string" && tag.toLowerCase().startsWith(tagPrefix.toLowerCase())
-                    );
-                    if (matchingTags.length > 0) {
-                      const tagValue = matchingTags[0].replace(new RegExp(`^${tagPrefix}`, "i"), "").toLowerCase().trim();
-                      if (tagValue !== normalizedConstraintValue &&
-                          !tagValue.includes(normalizedConstraintValue) &&
-                          !normalizedConstraintValue.includes(tagValue)) {
-                        hasConflictingStructuredValue = true;
-                        console.log(`[Validation] rejected_due_to_conflicting_structured_facet facet=${constraint.key} expected=${constraint.value} actual=${tagValue} (from tag)`);
-                        break;
-                      }
-                    }
-                  }
-                  if (hasConflictingStructuredValue) break;
-                }
-              }
-              
-              // If no conflicting structured value, try token fallback
-              if (!hasConflictingStructuredValue && (!hasStructuredFacets && !hasTagFacets)) {
-                // No structured facets - use token containment fallback
-                const indexedText = [
-                  candidate.title || "",
-                  candidate.handle || "",
-                  candidate.productType || "",
-                  (candidate.tags || []).join(" "),
-                  candidate.vendor || "",
-                  candidate.searchText || "",
-                ].join(" ").toLowerCase();
-                
-                let tokenFallbackMatch = true;
-                for (const constraint of facetConstraints) {
-                  const constraintValue = constraint.value.toLowerCase().trim();
-                  if (!indexedText.includes(constraintValue)) {
-                    tokenFallbackMatch = false;
-                    break;
-                  }
-                }
-                
-                if (tokenFallbackMatch) {
-                  console.log(`[Validation] facet_missing_structured=true facet=${facetConstraints.map(c => c.key).join(",")} value=${facetConstraints.map(c => c.value).join(",")} using_token_fallback=true`);
-                  passesConstraints = true; // Token fallback passed
-                } else {
-                  passesConstraints = false;
-                }
-              } else if (hasConflictingStructuredValue) {
-                // Explicit conflict - reject
-                passesConstraints = false;
-              } else {
-                // Structured facets exist but didn't match and no token fallback
-                passesConstraints = false;
+            if (!constraintResult.ok) {
+              passesConstraints = false;
+              if (constraintResult.conflict) {
+                console.log(`[Validation] rejected_due_to_conflicting_structured_facet facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source}`);
               }
             } else {
-              passesConstraints = true; // Structured match succeeded
+              passesConstraints = true;
             }
           }
           
@@ -8530,6 +8602,20 @@ async function processSessionInBackground({
       
       // BUG FIX #2: Log actual validated array (no later mutation)
       console.log("[App Proxy] [Layer 3] Validated handles (FINAL):", validatedHandles.length, "out of", finalHandles.length, "preview=", validatedHandles.slice(0, 5).join(", "));
+      
+      // Safe fallback: if validation returns 0, use gated pool instead of unsafe token matching
+      if (validatedHandles.length === 0 && finalHandles.length > 0 && !trustFallback) {
+        // Fallback to first resultCount handles from gated pool (already ranked/gated candidates)
+        const gatedPoolHandles = gatedCandidates
+          .filter(c => c.available !== false)
+          .slice(0, finalResultCount)
+          .map(c => c.handle);
+        
+        if (gatedPoolHandles.length > 0) {
+          validatedHandles = gatedPoolHandles;
+          console.log(`[Layer 3] Safe fallback from gated pool: ${validatedHandles.length} handles (validation returned 0)`);
+        }
+      }
       
       // Bundle budget validation - ONLY when totalBudget is a number
       if (isBundleMode && bundleIntent.totalBudget !== null && typeof bundleIntent.totalBudget === "number") {
@@ -10263,4 +10349,5 @@ async function processSessionInBackground({
       throw error;
     }
 }
+
 
