@@ -192,3 +192,107 @@ export function calculateIDF(
   return idf;
 }
 
+/**
+ * Expand token morphology: add singular/plural variants
+ * Industry-agnostic: handles basic English pluralization rules
+ */
+export function expandTokenMorphology(token: string): Set<string> {
+  const variants = new Set<string>();
+  const normalized = token.toLowerCase().trim();
+  
+  if (!normalized || normalized.length < 2) {
+    variants.add(normalized);
+    return variants;
+  }
+  
+  variants.add(normalized);
+  
+  // Handle plural forms ending in "es" (e.g., "coats" -> "coat", "boxes" -> "box")
+  if (normalized.endsWith("es") && normalized.length > 4) {
+    const singular = normalized.slice(0, -2);
+    if (singular.length >= 2) {
+      variants.add(singular);
+    }
+  }
+  // Handle plural forms ending in "s" (e.g., "coats" -> "coat")
+  else if (normalized.endsWith("s") && normalized.length > 3) {
+    const singular = normalized.slice(0, -1);
+    if (singular.length >= 2) {
+      variants.add(singular);
+    }
+  }
+  // Handle singular -> plural: add "s" or "es"
+  else {
+    // Words ending in x, z, ch, sh -> add "es"
+    if (/[xz]|[cs]h$/.test(normalized)) {
+      variants.add(normalized + "es");
+    } else {
+      variants.add(normalized + "s");
+    }
+  }
+  
+  return variants;
+}
+
+/**
+ * Expand tokens via decompounding: find sub-tokens in vocabulary
+ * Only used when strictGateCount == 0
+ * Example: "overcoat" contains "coat" -> add "coat" as fallback token
+ */
+export function expandDecompoundTokens(
+  tokens: string[],
+  vocab: Set<string>,
+  maxExpansionsPerToken: number = 3
+): Set<string> {
+  const expanded = new Set<string>(tokens);
+  
+  for (const token of tokens) {
+    if (token.length < 6) continue; // Only decompound longer tokens
+    
+    let expansions = 0;
+    for (const vocabToken of vocab) {
+      if (vocabToken.length < 4) continue; // Only consider vocab tokens length >= 4
+      if (expansions >= maxExpansionsPerToken) break;
+      
+      // Check if token contains vocabToken (e.g., "overcoat" contains "coat")
+      if (token.includes(vocabToken) && token !== vocabToken) {
+        expanded.add(vocabToken);
+        expansions++;
+      }
+    }
+  }
+  
+  return expanded;
+}
+
+/**
+ * Expand query tokens: combine morphology and decompounding
+ * @param tokens - Original query tokens
+ * @param vocab - Optional vocabulary set for decompounding (only used when strictGateCount == 0)
+ * @returns Set of expanded tokens including morphology variants and optionally decompound-derived tokens
+ */
+export function expandQueryTokens(
+  tokens: string[],
+  vocab?: Set<string>
+): Set<string> {
+  const expanded = new Set<string>();
+  
+  // First, add morphology variants for all tokens
+  for (const token of tokens) {
+    const morphVariants = expandTokenMorphology(token);
+    for (const variant of morphVariants) {
+      expanded.add(variant);
+    }
+  }
+  
+  // If vocab provided, add decompound expansions
+  if (vocab && vocab.size > 0) {
+    const decompoundVariants = expandDecompoundTokens(Array.from(expanded), vocab);
+    for (const variant of decompoundVariants) {
+      expanded.add(variant);
+    }
+  }
+  
+  return expanded;
+}
+

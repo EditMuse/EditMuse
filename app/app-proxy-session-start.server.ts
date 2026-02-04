@@ -2,7 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { validateAppProxySignature, getShopFromAppProxy } from "~/app-proxy.server";
 import prisma from "~/db.server";
 import { createConciergeSession, saveConciergeResult, addConciergeMessage } from "~/models/concierge.server";
-import { getAccessTokenForShop, fetchShopifyProducts, fetchShopifyProductDescriptionsByHandles } from "~/shopify-admin.server";
+import { getAccessTokenForShop, fetchShopifyProducts, fetchShopifyProductDescriptionsByHandles, fetchShopifyProductsBySearchQuery } from "~/shopify-admin.server";
 import { rankProductsWithAI, fallbackRanking } from "~/models/ai-ranking.server";
 import { parseIntentWithLLM } from "~/models/intent-parsing.server";
 import { ConciergeSessionStatus, ConciergeRole } from "@prisma/client";
@@ -17,6 +17,8 @@ import {
   buildSearchText,
   bm25Score,
   calculateIDF,
+  expandQueryTokens,
+  expandTokenMorphology,
 } from "~/utils/text-indexing.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
@@ -3164,6 +3166,11 @@ async function processSessionInBackground({
   // Even if an exception occurs before its normal initialization
   let finalHandlesGuaranteed: string[] = [];
   
+  // Track result source changes (for bundle mode validation fallback and refills)
+  let usedValidationFallback = false;
+  let usedRefillFromRemaining = false;
+  let usedRefillFromBM25 = false;
+  
   try {
     if (accessToken) {
       const shopifyFetchStart = performance.now();
@@ -3809,7 +3816,8 @@ async function processSessionInBackground({
             items: deduplicatedItems.map(item => ({
               hardTerms: item.hardTerms,
               quantity: item.quantity,
-              constraints: item.constraints
+              constraints: item.constraints,
+              canonicalType: item.canonicalType // Preserve canonicalType for robust matching
             })),
             totalBudget: typeof intent.totalBudget === "number" && intent.totalBudget > 0 ? intent.totalBudget : null,
             totalBudgetCurrency: typeof intent.totalBudgetCurrency === "string" ? intent.totalBudgetCurrency : null
@@ -4851,7 +4859,35 @@ async function processSessionInBackground({
       // Initialize variantConstraints2 BEFORE gating (needed in filter callback)
       // Build variantPreferences with priority (Answers > Text) - needed for constraints
       const prefsFromAnswers = parsePreferencesFromAnswers(answersJson, knownOptionNames);
-      const prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
+      
+      // In bundle mode, only parse preferences from text if user explicitly indicates global constraints
+      let prefsFromText: VariantPreferences = {};
+      if (bundleIntent.isBundle) {
+        // Check for global facet indicators in userIntent (same logic as hasGlobalFacetIndicator)
+        const globalFacetPatterns = [
+          /\b(?:all|every|everything|both|each)\s+(?:items?|pieces?|things?|products?)\s+(?:are|is|in|should\s+be)\s+(\w+)/i,
+          /\b(?:all|every|everything|both|each)\s+in\s+(\w+)/i,
+          /\b(\w+)\s+(?:for|on)\s+(?:all|every|everything|both|each)/i
+        ];
+        
+        let hasGlobalFacetIndicator = false;
+        for (const pattern of globalFacetPatterns) {
+          if (pattern.test(userIntent)) {
+            hasGlobalFacetIndicator = true;
+            break;
+          }
+        }
+        
+        if (hasGlobalFacetIndicator) {
+          prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
+        } else {
+          // Bundle mode without global indicator: ignore parsePreferencesFromText for global constraints
+          prefsFromText = {};
+        }
+      } else {
+        prefsFromText = parsePreferencesFromText(userIntent, knownOptionNames);
+      }
+      
       const variantPreferences = mergePreferences(prefsFromAnswers, prefsFromText);
       
       // Build variant constraints for gating (with OR allow-list support)
@@ -4859,14 +4895,73 @@ async function processSessionInBackground({
       const colorKey = knownOptionNames.find(n => ["color","colour","shade"].includes(n.toLowerCase())) ?? null;
       const materialKey = knownOptionNames.find(n => ["material","fabric"].includes(n.toLowerCase())) ?? null;
 
-      const derived = {
+      // In bundle mode, disable global variant constraints unless explicitly global
+      let derived = {
         size: sizeKey ? (variantPreferences[sizeKey] ?? null) : null,
         color: colorKey ? (variantPreferences[colorKey] ?? null) : null,
         material: materialKey ? (variantPreferences[materialKey] ?? null) : null,
       };
+      
+      if (bundleIntent.isBundle) {
+        // Check for global facet indicators in userIntent
+        const globalFacetPatterns = [
+          /\b(?:all|every|everything|both|each)\s+(?:items?|pieces?|things?|products?)\s+(?:are|is|in|should\s+be)\s+(\w+)/i,
+          /\b(?:all|every|everything|both|each)\s+in\s+(\w+)/i,
+          /\b(\w+)\s+(?:for|on)\s+(?:all|every|everything|both|each)/i
+        ];
+        
+        let hasGlobalFacetIndicator = false;
+        for (const pattern of globalFacetPatterns) {
+          if (pattern.test(userIntent)) {
+            hasGlobalFacetIndicator = true;
+            break;
+          }
+        }
+        
+        if (!hasGlobalFacetIndicator) {
+          // Bundle mode without global indicator: set derived constraints to null
+          derived = {
+            size: null,
+            color: null,
+            material: null,
+          };
+          console.log("[Bundle] global_variant_constraints=false");
+        }
+      }
 
       const fromAnswersForVariant = parseConstraintsFromAnswers(answersJson);
-      const fromTextForVariant = parseConstraintsFromText(userIntent);
+      
+      // In bundle mode, skip free-text-derived global variant constraints unless explicitly global
+      let fromTextForVariant: VariantConstraints = { size: null, color: null, material: null };
+      if (bundleIntent.isBundle) {
+        // Check for global facet indicators in userIntent
+        const globalFacetPatterns = [
+          /\b(?:all|every|everything|both|each)\s+(?:items?|pieces?|things?|products?)\s+(?:are|is|in|should\s+be)\s+(\w+)/i,
+          /\b(?:all|every|everything|both|each)\s+in\s+(\w+)/i,
+          /\b(\w+)\s+(?:for|on)\s+(?:all|every|everything|both|each)/i
+        ];
+        
+        let hasGlobalFacetIndicator = false;
+        for (const pattern of globalFacetPatterns) {
+          if (pattern.test(userIntent)) {
+            hasGlobalFacetIndicator = true;
+            break;
+          }
+        }
+        
+        if (hasGlobalFacetIndicator) {
+          // Bundle mode with global indicator: allow free-text-derived constraints
+          fromTextForVariant = parseConstraintsFromText(userIntent);
+        } else {
+          // Bundle mode without global indicator: skip free-text-derived constraints
+          fromTextForVariant = { size: null, color: null, material: null };
+          console.log("[Bundle] global_variant_constraints_skipped=true reason=\"bundle_mode\"");
+        }
+      } else {
+        // Single-item mode: use free-text-derived constraints
+        fromTextForVariant = parseConstraintsFromText(userIntent);
+      }
+      
       const variantConstraints = mergeConstraints(fromAnswersForVariant, fromTextForVariant);
       const variantConstraints2 = mergeConstraints(variantConstraints, derived);
       console.log("[App Proxy] Variant constraints:", variantConstraints2);
@@ -5028,29 +5123,66 @@ async function processSessionInBackground({
       const strictGate: EnrichedCandidate[] = [];
       let strictGateCount = 0; // Declare outside if block for use in type anchor gating
       
+      // Keep baseCandidates separate from gatedCandidates (candidates after facet gating)
+      const baseCandidates = [...gatedCandidates];
+      
       if (hardTerms.length > 0) {
         // Build normalized haystack using extractSearchText (includes ALL fields: title, handle, productType, tags, vendor, options, description)
         // Use unifiedNormalize for consistency
         const requireAllHardTerms = hardTerms.length >= 2; // AND logic when 2+ terms
         
+        // Build hardTermTokens with morphology variants
+        const hardTermTokens = new Set<string>();
+        for (const term of hardTerms) {
+          const normalized = unifiedNormalize(term);
+          const tokens = tokenize(normalized);
+          // Add morphology variants for each token
+          for (const token of tokens) {
+            const morphVariants = expandTokenMorphology(token);
+            for (const variant of morphVariants) {
+              hardTermTokens.add(variant);
+            }
+          }
+        }
+        
+        // For single-term queries, allow any morphology variant match
+        // For multi-term queries, still require all original terms (morphology helps with individual term matching)
         for (const candidate of gatedCandidates) {
           // Use extractSearchText which includes all relevant fields, then normalize
           const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+          const candidateTokens = new Set(tokenize(haystack));
           
           // STRICT GATING: Require ALL hard terms when count >= 2 (AND logic)
           let matchesHardTerms: boolean;
           if (requireAllHardTerms) {
-            // AND logic: ALL hard terms must match
+            // AND logic: ALL hard terms must match (check original phrases OR token variants for single terms)
             matchesHardTerms = hardTerms.every(phrase => {
               const normalizedPhrase = unifiedNormalize(phrase);
-              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
+              // First try phrase match
+              if (matchesHardTermWithBoundary(haystack, normalizedPhrase)) {
+                return true;
+              }
+              // For single-word terms, also check morphology variants
+              const phraseTokens = tokenize(normalizedPhrase);
+              if (phraseTokens.length === 1) {
+                const morphVariants = expandTokenMorphology(phraseTokens[0]);
+                return Array.from(morphVariants).some(variant => candidateTokens.has(variant));
+              }
+              return false;
             });
           } else {
             // OR logic: at least one hard term must match (when only 1 term)
-            matchesHardTerms = hardTerms.some(phrase => {
-              const normalizedPhrase = unifiedNormalize(phrase);
-              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
-            });
+            // For single term, check phrase OR any morphology variant
+            const normalizedPhrase = unifiedNormalize(hardTerms[0]);
+            matchesHardTerms = matchesHardTermWithBoundary(haystack, normalizedPhrase);
+            if (!matchesHardTerms) {
+              // Try morphology variants
+              const phraseTokens = tokenize(normalizedPhrase);
+              if (phraseTokens.length === 1) {
+                const morphVariants = expandTokenMorphology(phraseTokens[0]);
+                matchesHardTerms = Array.from(morphVariants).some(variant => candidateTokens.has(variant));
+              }
+            }
           }
           
           // Also check boost terms (if user intent suggests them) - boost terms are optional, not required
@@ -5088,20 +5220,51 @@ async function processSessionInBackground({
           trustFallback = false;
           console.log(`[Gating] Stage A: strict (hard terms + facets) - strictGateCount=${strictGateCount} >= minNeeded=${minNeededForRequested} trustFallback=false`);
         } else if (strictGateCount === 0) {
-          // CRITICAL: strictGateCount==0 - retry with expandedHardTerms (synonyms) if available
-          console.log(`[Gating] strictGateCount=0 - retrying with expandedHardTerms (synonym expansion)`);
+          // CRITICAL: strictGateCount==0 - retry with morphology + decompounding expansion
+          console.log(`[Gating] strictGateCount=0 - retrying with morphology and decompounding expansion`);
           
-          // Check if we have synonyms (expandedHardTerms should already include synonyms from earlier)
-          // If strictGateCount==0, it means original terms didn't match, so try synonyms
-          // Re-run strict gate with expanded terms (they're already in hardTerms from synonym expansion above)
-          const retryStrictGate: EnrichedCandidate[] = [];
-          for (const candidate of gatedCandidates) {
+          // Build vocabulary from baseCandidates (candidates after facet gating)
+          const vocab = new Set<string>();
+          for (const candidate of baseCandidates) {
             const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
-            const hasHardTermMatch = hardTerms.some(phrase => {
-              const normalizedPhrase = unifiedNormalize(phrase);
-              return matchesHardTermWithBoundary(haystack, normalizedPhrase);
-            });
-            if (hasHardTermMatch) {
+            const tokens = tokenize(haystack);
+            for (const token of tokens) {
+              if (token.length >= 4) { // Only consider tokens length >= 4 for vocab
+                vocab.add(token);
+              }
+            }
+          }
+          
+          // Build original query tokens
+          const originalQueryTokens: string[] = [];
+          for (const term of hardTerms) {
+            const normalized = unifiedNormalize(term);
+            const tokens = tokenize(normalized);
+            originalQueryTokens.push(...tokens);
+          }
+          
+          // Expand query tokens with morphology + decompounding
+          const expandedTokens = expandQueryTokens(originalQueryTokens, vocab);
+          const originalTokensArray = Array.from(new Set(originalQueryTokens));
+          const expandedTokensArray = Array.from(expandedTokens);
+          const addedTokens = expandedTokensArray.filter(t => !originalTokensArray.includes(t));
+          
+          if (addedTokens.length > 0) {
+            console.log(`[Morphology] originalTokens=[${originalTokensArray.join(",")}] expandedTokens=[${expandedTokensArray.join(",")}] applied=true`);
+            if (addedTokens.some(t => vocab.has(t))) {
+              console.log(`[Decompound] applied=true addedTokens=[${addedTokens.filter(t => vocab.has(t)).join(",")}]`);
+            }
+          }
+          
+          // Retry strict gate using expanded tokens (OR logic - match any expanded token)
+          const retryStrictGate: EnrichedCandidate[] = [];
+          for (const candidate of baseCandidates) {
+            const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+            const candidateTokens = new Set(tokenize(haystack));
+            
+            // Check if any expanded token matches
+            const hasMatch = Array.from(expandedTokens).some(token => candidateTokens.has(token));
+            if (hasMatch) {
               retryStrictGate.push(candidate);
             }
           }
@@ -5110,24 +5273,16 @@ async function processSessionInBackground({
             strictGateCount = retryStrictGate.length;
             gatedCandidates = retryStrictGate;
             trustFallback = false;
-            console.log(`[Gating] Retry with synonyms succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+            console.log(`[Gating] Retry with morphology/decompound succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
           } else {
-            // Still 0 - try BM25 with token filter
-            console.log(`[Gating] strictGateCount still 0 after synonym retry - trying BM25 with token filter`);
+            // Still 0 - try BM25 with expanded token filter
+            console.log(`[Gating] strictGateCount still 0 after morphology retry - trying BM25 with expanded token filter`);
             
-            // Build query tokens from expanded hardTerms
-            const hardTermTokens = new Set<string>();
-            hardTerms.forEach(term => {
-              const normalized = unifiedNormalize(term);
-              const tokens = tokenize(normalized);
-              tokens.forEach(t => hardTermTokens.add(t));
-            });
-            
-            // Filter candidates to require at least one token match
-            const bm25Filtered = gatedCandidates.filter(candidate => {
+            // Filter candidates to require at least one expanded token match
+            const bm25Filtered = baseCandidates.filter(candidate => {
               const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
               const candidateTokens = new Set(tokenize(haystack));
-              return Array.from(hardTermTokens).some(token => candidateTokens.has(token));
+              return Array.from(expandedTokens).some(token => candidateTokens.has(token));
             });
             
             if (bm25Filtered.length > 0) {
@@ -5140,7 +5295,7 @@ async function processSessionInBackground({
               const idf = calculateIDF(candidateDocs.map(d => ({ tokens: d.tokens })));
               const avgDocLen = candidateDocs.reduce((sum, d) => sum + d.tokens.length, 0) / candidateDocs.length || 1;
               
-              const queryTokensArray = Array.from(hardTermTokens);
+              const queryTokensArray = Array.from(expandedTokens);
               const scoredCandidates = candidateDocs.map(d => {
                 const docTokenFreq = new Map<string, number>();
                 for (const token of d.tokens) {
@@ -5159,13 +5314,157 @@ async function processSessionInBackground({
               gatedCandidates = scoredCandidates.map(s => s.candidate);
               strictGateCount = gatedCandidates.length;
               trustFallback = false;
-              console.log(`[Gating] BM25 with token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+              console.log(`[Gating] BM25 with expanded token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
             } else {
-              // All stages failed - return NO_MATCH
-              console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
-              noMatchDetected = true; // Set flag to short-circuit pipeline
-              gatedCandidates = []; // Ensure gatedCandidates is empty
-              // Will be handled below to return NO_MATCH result
+              // All stages failed - try targeted Shopify search fallback if conditions are met
+              if (hardTerms.length > 0 && mightHaveMorePages && accessToken && shopDomain) {
+                console.log(`[Gating] strictGateCount=0 - attempting targeted Shopify search fallback`);
+                
+                try {
+                  // Build search queries with built-in synonym expansion if experience.searchSynonymsJson is empty
+                  const searchQueries: string[] = [];
+                  const hasSearchSynonyms = experience.searchSynonymsJson !== null && experience.searchSynonymsJson !== undefined && experience.searchSynonymsJson !== "";
+                  
+                  for (const hardTerm of hardTerms) {
+                    // Use the hard term as-is for search query
+                    // If synonyms are configured in experience.searchSynonymsJson, they should already be in hardTerms
+                    // Otherwise, Shopify's search will handle partial matches and relevance
+                    searchQueries.push(hardTerm);
+                  }
+                  
+                  // Fetch products for each search query (cap at 250-300 per query, total cap to avoid huge payloads)
+                  const MAX_SEARCH_RESULTS_PER_QUERY = 250;
+                  const MAX_TOTAL_SEARCH_RESULTS = 500;
+                  const fallbackProducts: any[] = [];
+                  // Track handles from all existing candidates to avoid duplicates
+                  const seenHandles = new Set<string>(allCandidatesEnriched.map(c => c.handle));
+                  
+                  for (const searchQuery of searchQueries) {
+                    if (fallbackProducts.length >= MAX_TOTAL_SEARCH_RESULTS) break;
+                    
+                    const remaining = MAX_TOTAL_SEARCH_RESULTS - fallbackProducts.length;
+                    const queryLimit = Math.min(MAX_SEARCH_RESULTS_PER_QUERY, remaining);
+                    
+                    try {
+                      const searchResults = await fetchShopifyProductsBySearchQuery({
+                        shopDomain,
+                        accessToken,
+                        query: searchQuery,
+                        targetCount: queryLimit,
+                      });
+                      
+                      // Filter and dedupe
+                      for (const product of searchResults) {
+                        if (seenHandles.has(product.handle)) continue;
+                        if ((product as any).status === "ARCHIVED" || (product as any).status === "DRAFT") continue;
+                        if (excludedTags.length > 0) {
+                          const productTags = product.tags || [];
+                          if (excludedTags.some(excludedTag => 
+                            productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
+                          )) continue;
+                        }
+                        if (experience.inStockOnly && !product.available) continue;
+                        
+                        seenHandles.add(product.handle);
+                        fallbackProducts.push(product);
+                      }
+                      
+                      console.log(`[Shopify Search Fallback] enabled=true term="${searchQuery}" fetched=${searchResults.length} merged_total=${fallbackProducts.length}`);
+                    } catch (error) {
+                      console.error(`[Shopify Search Fallback] Error fetching for term "${searchQuery}":`, error);
+                    }
+                  }
+                  
+                  if (fallbackProducts.length > 0) {
+                    // Merge into product pool and rerun indexing/gating
+                    const mergedProducts = [...baseProducts, ...fallbackProducts];
+                    const mergedTotal = mergedProducts.length;
+                    
+                    console.log(`[Shopify Search Fallback] merged_total=${mergedTotal} (added ${fallbackProducts.length} from search)`);
+                    
+                    // Re-enrich candidates with merged products
+                    // Note: We need to rebuild allCandidatesEnriched with the merged products
+                    // This is a simplified approach - in practice, you'd want to properly re-index
+                    const mergedEnriched: EnrichedCandidate[] = mergedProducts.map((p: any) => {
+                      const descPlain = cleanDescription(p.description || null);
+                      const desc1000 = descPlain.substring(0, 1000);
+                      return {
+                        handle: p.handle,
+                        title: p.title,
+                        tags: p.tags || [],
+                        productType: p.productType || null,
+                        vendor: p.vendor || null,
+                        price: p.priceAmount || p.price || null,
+                        description: p.description || null,
+                        descPlain,
+                        desc1000,
+                        searchText: buildSearchText({
+                          title: p.title,
+                          productType: p.productType || null,
+                          vendor: p.vendor || null,
+                          tags: p.tags || [],
+                          optionValues: (p as any).optionValues ?? {},
+                          sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                          colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                          materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                          desc1000,
+                        }),
+                        available: p.available,
+                        sizes: Array.isArray((p as any).sizes) ? (p as any).sizes : [],
+                        colors: Array.isArray((p as any).colors) ? (p as any).colors : [],
+                        materials: Array.isArray((p as any).materials) ? (p as any).materials : [],
+                        optionValues: (p as any).optionValues ?? {},
+                      } as EnrichedCandidate;
+                    });
+                    
+                    // Update allCandidatesEnriched and rerun strict gate
+                    allCandidatesEnriched = mergedEnriched;
+                    gatedCandidates = allCandidatesEnriched; // Reset to all candidates
+                    
+                    // Rerun strict gate
+                    const retryStrictGate: EnrichedCandidate[] = [];
+                    for (const candidate of allCandidatesEnriched) {
+                      const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+                      const hasHardTermMatch = hardTerms.some(phrase => {
+                        const normalizedPhrase = unifiedNormalize(phrase);
+                        return matchesHardTermWithBoundary(haystack, normalizedPhrase);
+                      });
+                      if (hasHardTermMatch) {
+                        retryStrictGate.push(candidate);
+                      }
+                    }
+                    
+                    if (retryStrictGate.length > 0) {
+                      strictGateCount = retryStrictGate.length;
+                      gatedCandidates = retryStrictGate;
+                      trustFallback = false;
+                      console.log(`[Gating] fallback_search_used=true strictGateCount_before=0 strictGateCount_after=${strictGateCount}`);
+                    } else {
+                      // Still 0 after search fallback - return NO_MATCH
+                      console.log(`[Gating] no_match=true reason=all_gating_stages_failed_including_search_fallback`);
+                      noMatchDetected = true;
+                      gatedCandidates = [];
+                    }
+                  } else {
+                    // No search results - return NO_MATCH
+                    console.log(`[Gating] no_match=true reason=all_gating_stages_failed_search_fallback_returned_0`);
+                    noMatchDetected = true;
+                    gatedCandidates = [];
+                  }
+                } catch (error) {
+                  console.error(`[Gating] Error in targeted search fallback:`, error);
+                  // Fall through to NO_MATCH
+                  console.log(`[Gating] no_match=true reason=all_gating_stages_failed_search_fallback_error`);
+                  noMatchDetected = true;
+                  gatedCandidates = [];
+                }
+              } else {
+                // All stages failed - return NO_MATCH
+                console.log(`[Gating] no_match=true reason=all_gating_stages_failed (strictGateCount=0, synonym_retry=0, bm25_filter=0)`);
+                noMatchDetected = true; // Set flag to short-circuit pipeline
+                gatedCandidates = []; // Ensure gatedCandidates is empty
+                // Will be handled below to return NO_MATCH result
+              }
             }
           }
         } else {
@@ -6055,13 +6354,60 @@ async function processSessionInBackground({
           let itemGatedAfterAnchor = itemGatedUnfiltered;
           if (nonFacetItemTerms.length > 0) {
             const beforeAnchor = itemGatedUnfiltered.length;
-            itemGatedAfterAnchor = itemGatedUnfiltered.filter(c => {
-              const searchText = extractSearchText(c);
-              return nonFacetItemTerms.some(term => {
-                const termLower = term.toLowerCase().trim();
-                return searchText.includes(termLower);
-              });
+            
+            // Build item-specific query tokens with morphology variants
+            const itemQueryTokens: string[] = [];
+            for (const term of nonFacetItemTerms) {
+              const normalized = unifiedNormalize(term);
+              const tokens = tokenize(normalized);
+              itemQueryTokens.push(...tokens);
+            }
+            
+            // Expand with morphology variants
+            const itemExpandedTokens = expandQueryTokens(itemQueryTokens);
+            
+            // If initial anchor gating yields 0, try with decompounding
+            let itemGatedWithMorphology = itemGatedUnfiltered.filter(c => {
+              const searchText = unifiedNormalize(extractSearchText(c));
+              const candidateTokens = new Set(tokenize(searchText));
+              return Array.from(itemExpandedTokens).some(token => candidateTokens.has(token));
             });
+            
+            if (itemGatedWithMorphology.length === 0 && itemGatedUnfiltered.length > 0) {
+              // Build vocabulary from itemGatedUnfiltered for decompounding
+              const itemVocab = new Set<string>();
+              for (const candidate of itemGatedUnfiltered) {
+                const searchText = unifiedNormalize(extractSearchText(candidate));
+                const tokens = tokenize(searchText);
+                for (const token of tokens) {
+                  if (token.length >= 4) {
+                    itemVocab.add(token);
+                  }
+                }
+              }
+              
+              // Expand with decompounding
+              const itemExpandedWithDecompound = expandQueryTokens(itemQueryTokens, itemVocab);
+              const originalItemTokens = Array.from(new Set(itemQueryTokens));
+              const expandedItemTokens = Array.from(itemExpandedWithDecompound);
+              const addedItemTokens = expandedItemTokens.filter(t => !originalItemTokens.includes(t));
+              
+              if (addedItemTokens.length > 0) {
+                console.log(`[Morphology] bundle_item=${itemIdx} originalTokens=[${originalItemTokens.join(",")}] expandedTokens=[${expandedItemTokens.join(",")}] applied=true`);
+                if (addedItemTokens.some(t => itemVocab.has(t))) {
+                  console.log(`[Decompound] bundle_item=${itemIdx} applied=true addedTokens=[${addedItemTokens.filter(t => itemVocab.has(t)).join(",")}]`);
+                }
+              }
+              
+              // Retry with decompounded tokens
+              itemGatedWithMorphology = itemGatedUnfiltered.filter(c => {
+                const searchText = unifiedNormalize(extractSearchText(c));
+                const candidateTokens = new Set(tokenize(searchText));
+                return Array.from(itemExpandedWithDecompound).some(token => candidateTokens.has(token));
+              });
+            }
+            
+            itemGatedAfterAnchor = itemGatedWithMorphology;
             const afterAnchor = itemGatedAfterAnchor.length;
             console.log(`[Gating] mode=${modeUsed} flow=bundle bundle_item=${itemIdx} anchor_terms=[${nonFacetItemTerms.join(", ")}] before=${beforeAnchor} after=${afterAnchor}`);
           } else {
@@ -7156,6 +7502,84 @@ async function processSessionInBackground({
       if (isBundleMode && !trustFallback) {
         // BUNDLE VALIDATION: Three separate validation stages
         
+        // Helper function for robust bundle item matching
+        // Accepts plural forms, prefers canonicalType, uses token-based or substring matching
+        function matchesBundleItem(candidate: EnrichedCandidate, bundleItem: { hardTerms: string[]; canonicalType?: string }): boolean {
+          const haystack = [
+            candidate.title || "",
+            candidate.productType || "",
+            (candidate.tags || []).join(" "),
+            candidate.vendor || "",
+            candidate.searchText || "",
+          ].join(" ");
+          const normalizedHaystack = normalizeText(haystack);
+          
+          // Plural form mappings (singular <-> plural)
+          const pluralForms: Record<string, string[]> = {
+            "trouser": ["trousers", "trouser"],
+            "trousers": ["trouser", "trousers"],
+            "suit": ["suits", "suit"],
+            "suits": ["suit", "suits"],
+            "shirt": ["shirts", "shirt"],
+            "shirts": ["shirt", "shirts"],
+            "coat": ["coats", "coat"],
+            "coats": ["coat", "coats"],
+          };
+          
+          // Prefer matching by canonicalType if available
+          if (bundleItem.canonicalType) {
+            const normalizedCanonical = normalizeText(bundleItem.canonicalType);
+            // Check exact match or substring match
+            if (normalizedHaystack.includes(normalizedCanonical) || normalizedCanonical.includes(normalizedHaystack.split(/\s+/)[0])) {
+              return true;
+            }
+            // Check plural forms
+            const canonicalPlurals = pluralForms[normalizedCanonical] || [];
+            for (const plural of canonicalPlurals) {
+              if (normalizedHaystack.includes(normalizeText(plural))) {
+                return true;
+              }
+            }
+          }
+          
+          // Match any of the item hardTerms using token-based or substring matching
+          for (const term of bundleItem.hardTerms) {
+            const normalizedTerm = normalizeText(term);
+            
+            // Token-based matching: check if any token from term appears in haystack
+            const termTokens = normalizedTerm.split(/\s+/).filter(t => t.length > 2); // Filter out short tokens
+            if (termTokens.length > 0) {
+              const allTokensMatch = termTokens.every(token => normalizedHaystack.includes(token));
+              if (allTokensMatch) {
+                return true;
+              }
+            }
+            
+            // Substring matching (not strict word-boundary only)
+            if (normalizedHaystack.includes(normalizedTerm) || normalizedTerm.includes(normalizedHaystack.split(/\s+/)[0])) {
+              return true;
+            }
+            
+            // Check plural forms
+            const termPlurals = pluralForms[normalizedTerm] || [];
+            for (const plural of termPlurals) {
+              if (normalizedHaystack.includes(normalizeText(plural))) {
+                return true;
+              }
+            }
+            
+            // Fallback to word-boundary matching for single-word terms
+            if (!normalizedTerm.includes(" ")) {
+              const regex = new RegExp(`\\b${normalizedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+              if (regex.test(normalizedHaystack)) {
+                return true;
+              }
+            }
+          }
+          
+          return false;
+        }
+        
         // (a) Handle existence validation: Check if handle exists in enriched candidates
         const handleExistenceValid = finalHandles.filter(handle => {
           return candidateMap.has(handle);
@@ -7172,21 +7596,11 @@ async function processSessionInBackground({
             const candidate = candidateMap.get(handle);
             if (!candidate) continue;
             
-            // Find which bundle item this handle matches
+            // Find which bundle item this handle matches using robust matcher
             let matchedItemIdx: number | null = null;
             for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
               const bundleItem = bundleIntent.items[itemIdx];
-              const itemHardTerms = bundleItem.hardTerms;
-              const haystack = [
-                candidate.title || "",
-                candidate.productType || "",
-                (candidate.tags || []).join(" "),
-                candidate.vendor || "",
-                candidate.searchText || "",
-              ].join(" ");
-              
-              const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-              if (hasItemMatch) {
+              if (matchesBundleItem(candidate, bundleItem)) {
                 matchedItemIdx = itemIdx;
                 break;
               }
@@ -7210,6 +7624,7 @@ async function processSessionInBackground({
             }
             
             // Check facets (size/color/material) if specified
+            // Do NOT fail items when product has no extracted colors/sizes/materials
             let passesFacets = true;
             if (itemFacets.size && candidate.sizes.length > 0) {
               const sizeMatch = candidate.sizes.some((s: string) => 
@@ -7219,6 +7634,8 @@ async function processSessionInBackground({
               );
               if (!sizeMatch) passesFacets = false;
             }
+            // If itemFacets.size is specified but candidate has no sizes, don't fail (passesFacets stays true)
+            
             if (itemFacets.color && candidate.colors.length > 0 && passesFacets) {
               const colorMatch = candidate.colors.some((col: string) => 
                 normalizeText(col) === normalizeText(itemFacets.color) ||
@@ -7227,6 +7644,8 @@ async function processSessionInBackground({
               );
               if (!colorMatch) passesFacets = false;
             }
+            // If itemFacets.color is specified but candidate has no colors, don't fail (passesFacets stays true)
+            
             if (itemFacets.material && candidate.materials.length > 0 && passesFacets) {
               const materialMatch = candidate.materials.some((m: string) => 
                 normalizeText(m) === normalizeText(itemFacets.material) ||
@@ -7235,6 +7654,7 @@ async function processSessionInBackground({
               );
               if (!materialMatch) passesFacets = false;
             }
+            // If itemFacets.material is specified but candidate has no materials, don't fail (passesFacets stays true)
             
             if (passesFacets) {
               constraintValid.push(handle);
@@ -7244,7 +7664,26 @@ async function processSessionInBackground({
           
           if (constraintValid.length === 0) {
             console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
-            validatedHandles = [];
+            // If bundle constraint validation results in 0 handles, do NOT refill and still claim source=ai
+            // Fallback to existenceValid (handles that exist + are available) and set resultSource to "fallback"
+            const existenceValidFallback = handleExistenceValid.filter(handle => {
+              const candidate = candidateMap.get(handle);
+              if (!candidate) return false;
+              // Only check availability (if inStockOnly is enabled)
+              if (experience.inStockOnly && !candidate.available) return false;
+              return true;
+            });
+            
+            if (existenceValidFallback.length > 0) {
+              // Use existence-valid handles as fallback
+              validatedHandles = existenceValidFallback;
+              // Mark that we used validation fallback (resultSource will be set to "fallback" later, not "ai")
+              usedValidationFallback = true;
+              console.log(`[Bundle Validation] (b) constraint_validation: using existence-valid fallback (${existenceValidFallback.length} handles)`);
+            } else {
+              // No fallback available - return NO_MATCH
+              validatedHandles = [];
+            }
           } else {
             // (c) Bundle-type validation: Ensure each requested type has >=1 handle
             const handlesByItemType = new Map<number, string[]>();
@@ -7252,20 +7691,10 @@ async function processSessionInBackground({
               const candidate = candidateMap.get(handle);
               if (!candidate) continue;
               
-              // Find which bundle item this handle matches
+              // Find which bundle item this handle matches using robust matcher
               for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
                 const bundleItem = bundleIntent.items[itemIdx];
-                const itemHardTerms = bundleItem.hardTerms;
-                const haystack = [
-                  candidate.title || "",
-                  candidate.productType || "",
-                  (candidate.tags || []).join(" "),
-                  candidate.vendor || "",
-                  candidate.searchText || "",
-                ].join(" ");
-                
-                const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-                if (hasItemMatch) {
+                if (matchesBundleItem(candidate, bundleItem)) {
                   if (!handlesByItemType.has(itemIdx)) {
                     handlesByItemType.set(itemIdx, []);
                   }
@@ -7900,6 +8329,8 @@ async function processSessionInBackground({
         // Add refilled handles to diverseHandles
         if (refillHandles.length > 0) {
           diverseHandles = [...diverseHandles, ...refillHandles].slice(0, finalResultCount);
+          // Mark that we refilled from remaining candidates (resultSource will be set to "fallback" later, not "ai")
+          usedRefillFromRemaining = true;
           console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${refillHandles.length} source=remaining_candidates`);
         } else {
           console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${beforeRefill} added=0 reason=no_valid_candidates`);
@@ -8555,6 +8986,10 @@ async function processSessionInBackground({
               }
               
               filteredHandles.push(...refillHandles);
+              // Mark that we refilled from remaining candidates (resultSource will be set to "fallback" later, not "ai")
+              if (refillHandles.length > 0) {
+                usedRefillFromRemaining = true;
+              }
               console.log(`[Refill] after_budget delivered=${filteredHandles.length} requested=${finalResultCount} added=${refillHandles.length} reason=budget collectionIntent=true`);
             } else {
               // Standard refill: just take top remaining candidates
@@ -8563,6 +8998,10 @@ async function processSessionInBackground({
                 .map(c => c.handle);
               
               filteredHandles.push(...refillHandles);
+              // Mark that we refilled from remaining candidates (resultSource will be set to "fallback" later, not "ai")
+              if (refillHandles.length > 0) {
+                usedRefillFromRemaining = true;
+              }
               console.log(`[Refill] after_budget delivered=${filteredHandles.length} requested=${finalResultCount} added=${refillHandles.length} reason=budget`);
             }
             
@@ -8576,6 +9015,13 @@ async function processSessionInBackground({
       // Track if emergency fallback was used (for billing protection)
       let emergencyFallbackUsed = false;
       let resultSource: "ai" | "fallback" | "emergency_fallback_unmatched" = "ai";
+      
+      // Update resultSource based on validation fallback or refills
+      // If we used validation fallback or refilled from remaining_candidates/BM25, set to "fallback" (not "ai")
+      if (usedValidationFallback || usedRefillFromRemaining || usedRefillFromBM25) {
+        resultSource = "fallback";
+        console.log(`[App Proxy] resultSource set to "fallback" (validationFallback=${usedValidationFallback}, refillRemaining=${usedRefillFromRemaining}, refillBM25=${usedRefillFromBM25})`);
+      }
       
       // FINAL SAFETY CHECK: Only use emergency fallback if absolutely no results (rare occurrence)
       // AI ranking should handle most cases - this is truly a last resort

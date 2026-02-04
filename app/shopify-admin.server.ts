@@ -462,11 +462,13 @@ export async function fetchShopifyProductsGraphQL({
   accessToken,
   limit = 50,
   collectionIds,
+  query,
 }: {
   shopDomain: string;
   accessToken: string;
   limit?: number;
   collectionIds?: string[];
+  query?: string;
 }): Promise<Array<{
   handle: string;
   title: string;
@@ -485,8 +487,8 @@ export async function fetchShopifyProductsGraphQL({
   const apiVersion = "2025-01";
   const url = `https://${shopDomain}/admin/api/${apiVersion}/graphql.json`;
 
-  // Build query based on whether we're filtering by collections
-  let query: string;
+  // Build GraphQL query based on whether we're filtering by collections or using search query
+  let graphqlQuery: string;
   let variables: any;
 
   const TARGET_COUNT = limit;
@@ -513,7 +515,7 @@ export async function fetchShopifyProductsGraphQL({
       while (hasNextPage && allProducts.length < TARGET_COUNT) {
         const pageSize = Math.min(PAGE_SIZE, TARGET_COUNT - allProducts.length);
         
-        query = `
+        graphqlQuery = `
           query getProductsFromCollection($id: ID!, $first: Int!, $after: String) {
             node(id: $id) {
               ... on Collection {
@@ -603,7 +605,7 @@ export async function fetchShopifyProductsGraphQL({
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            query,
+            query: graphqlQuery,
             variables,
           }),
           redirect: "manual",
@@ -655,12 +657,135 @@ export async function fetchShopifyProductsGraphQL({
         }
       }
     }
-  } else {
-    // Query all products with cursor pagination
+  } else if (query) {
+    // Query products with search query (no sortKey for relevance, or use RELEVANCE if supported)
     while (hasNextPage && allProducts.length < TARGET_COUNT) {
       const pageSize = Math.min(PAGE_SIZE, TARGET_COUNT - allProducts.length);
       
-      query = `
+      graphqlQuery = `
+        query getProductsByQuery($first: Int!, $after: String, $query: String!) {
+          products(first: $first, after: $after, query: $query) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                handle
+                title
+                featuredImage {
+                  url
+                }
+                priceRange {
+                  minVariantPrice {
+                    amount
+                    currencyCode
+                  }
+                }
+                onlineStoreUrl
+                tags
+                totalInventory
+                productType
+                vendor
+                status
+                options {
+                  name
+                  values
+                }
+                variants(first: 50) {
+                  edges {
+                    node {
+                      title
+                      availableForSale
+                      selectedOptions {
+                        name
+                        value
+                      }
+                      inventoryPolicy
+                    }
+                  }
+                }
+                collections(first: 10) {
+                  edges {
+                    node {
+                      title
+                      handle
+                    }
+                  }
+                }
+                metafields(first: 20) {
+                  edges {
+                    node {
+                      namespace
+                      key
+                      value
+                      type
+                    }
+                  }
+                }
+                productCategory {
+                  productTaxonomyNode {
+                    fullName
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      
+      variables = { 
+        first: pageSize,
+        after: cursor,
+        query: query
+      };
+      
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "X-Shopify-Access-Token": accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: graphqlQuery,
+          variables,
+        }),
+        redirect: "manual",
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        throw new Error(
+          `Shopify GraphQL API error: ${response.status} ${response.statusText}\n` +
+          `URL: ${url}\n` +
+          `Response: ${errorBody.substring(0, 500)}`
+        );
+      }
+
+      const data = await response.json();
+
+      if (data.errors) {
+        throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+      }
+
+      const productsData = data.data?.products;
+      if (productsData?.edges) {
+        const pageProducts = productsData.edges.map((edge: any) => edge.node);
+        allProducts.push(...pageProducts);
+        
+        const pageInfo = productsData.pageInfo;
+        hasNextPage = pageInfo?.hasNextPage || false;
+        cursor = pageInfo?.endCursor || null;
+      } else {
+        hasNextPage = false;
+      }
+    }
+  } else {
+    // Query all products with cursor pagination (no search query)
+    while (hasNextPage && allProducts.length < TARGET_COUNT) {
+      const pageSize = Math.min(PAGE_SIZE, TARGET_COUNT - allProducts.length);
+      
+      graphqlQuery = `
         query getProducts($first: Int!, $after: String) {
           products(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
             pageInfo {
@@ -744,7 +869,7 @@ export async function fetchShopifyProductsGraphQL({
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          query,
+          query: graphqlQuery,
           variables,
         }),
         redirect: "manual",
@@ -974,6 +1099,43 @@ export async function fetchShopifyProductsGraphQL({
   });
   
   return mapped;
+}
+
+/**
+ * Fetches products from Shopify Admin GraphQL API using a search query
+ * Used as a fallback when strict gating yields 0 results and there are more products available
+ */
+export async function fetchShopifyProductsBySearchQuery({
+  shopDomain,
+  accessToken,
+  query,
+  targetCount = 250,
+}: {
+  shopDomain: string;
+  accessToken: string;
+  query: string;
+  targetCount?: number;
+}): Promise<Array<{
+  handle: string;
+  title: string;
+  image: string | null;
+  price: string | null;
+  priceAmount: string | null;
+  currencyCode: string | null;
+  url: string;
+  tags: string[];
+  available: boolean;
+  productType: string | null;
+  vendor: string | null;
+  description: string | null;
+  status: string | null;
+}>> {
+  return fetchShopifyProductsGraphQL({
+    shopDomain,
+    accessToken,
+    limit: targetCount,
+    query,
+  });
 }
 
 /**
@@ -1231,4 +1393,3 @@ export async function fetchShopifyProductDescriptionsByHandles({
 
   return descriptionMap;
 }
-
