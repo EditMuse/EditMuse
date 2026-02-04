@@ -3932,12 +3932,45 @@ async function processSessionInBackground({
                 canonicalType = normalizeItemLabel(nonFacetTerms[0]);
                 console.log(`[Bundle Normalization] repaired canonicalType from "${extractedCanonicalType}" to "${canonicalType}" (was facet value)`);
               } else {
-                // Last resort: extract from userIntent around this item (simple heuristic)
-                // For now, use the longest hardTerm as fallback
-                canonicalType = normalizeItemLabel(filteredHardTerms.reduce((longest, current) => 
-                  current.length > longest.length ? current : longest, filteredHardTerms[0]
-                ));
-                console.log(`[Bundle Normalization] fallback canonicalType="${canonicalType}" (no non-facet terms found)`);
+                // Last resort: extract from userIntent text (e.g. "black suit", "white shirt")
+                // Pattern: "<facet> <noun>" where facet matches the item's facet value
+                let inferredFromUserText = false;
+                if (userIntent && typeof userIntent === "string") {
+                  const userTextLower = userIntent.toLowerCase();
+                  const stopWords = new Set(["and", "with", "a", "an", "the", "in", "for", "under", "over", "on", "at", "to", "of"]);
+                  
+                  // Find facet value from item (color/size/material)
+                  const itemFacetValue = facets.color || facets.size || facets.material || 
+                                        existingFacets.color || existingFacets.size || existingFacets.material;
+                  
+                  if (itemFacetValue) {
+                    const facetValueLower = itemFacetValue.toLowerCase().trim();
+                    // Look for pattern: "<facet> <noun>" in userIntent
+                    // Use regex to find facet followed by a non-stopword noun
+                    const pattern = new RegExp(`\\b${facetValueLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+([a-z]+(?:\\s+[a-z]+)?)`, "i");
+                    const matches = userTextLower.match(pattern);
+                    
+                    if (matches && matches[1]) {
+                      const potentialNoun = matches[1].trim();
+                      const nounTokens = potentialNoun.split(/\s+/).filter(t => !stopWords.has(t) && t.length > 2);
+                      
+                      if (nounTokens.length > 0) {
+                        // Use first non-stopword token as canonicalType
+                        canonicalType = normalizeItemLabel(nounTokens[0]);
+                        inferredFromUserText = true;
+                        console.log(`[Bundle Normalization] inferred canonicalType from user text facet="${itemFacetValue}" noun="${nounTokens[0]}" itemIndex=${normalizedBundleItems.length}`);
+                      }
+                    }
+                  }
+                }
+                
+                if (!inferredFromUserText) {
+                  // Final fallback: use the longest hardTerm
+                  canonicalType = normalizeItemLabel(filteredHardTerms.reduce((longest, current) => 
+                    current.length > longest.length ? current : longest, filteredHardTerms[0]
+                  ));
+                  console.log(`[Bundle Normalization] fallback canonicalType="${canonicalType}" (no non-facet terms found, userIntent extraction failed)`);
+                }
               }
             }
             
@@ -6861,8 +6894,54 @@ async function processSessionInBackground({
             console.log(`[Gating] mode=${modeUsed} flow=bundle bundle_item=${itemIdx} anchor_terms_empty=true (skipping anchor filter)`);
           }
           
-          // Second pass: apply budget filter (item-specific price ceiling or allocated budget)
+          // STRONG vs WEAK productType matching: prefer productType-aligned matches
           let itemGated: EnrichedCandidate[] = itemGatedAfterAnchor;
+          if (itemGatedAfterAnchor.length > 0 && itemTypeForFilter) {
+            const itemTypeTokens = itemTypeForFilter.toLowerCase().split(/[\s\-_]+/).filter((t: string) => t.length > 2);
+            
+            if (itemTypeTokens.length > 0) {
+              const strongMatches: EnrichedCandidate[] = [];
+              const weakMatches: EnrichedCandidate[] = [];
+              
+              for (const candidate of itemGatedAfterAnchor) {
+                const candidateProductType = (candidate.productType || "").toLowerCase();
+                const candidateText = [
+                  candidate.title || "",
+                  candidate.handle || "",
+                  candidate.searchText || "",
+                ].join(" ").toLowerCase();
+                
+                // Check if productType contains itemType tokens (STRONG match)
+                const productTypeHasTokens = itemTypeTokens.every((token: string) => candidateProductType.includes(token));
+                
+                // Check if indexed text contains tokens but productType does NOT (WEAK match)
+                const textHasTokens = itemTypeTokens.every((token: string) => candidateText.includes(token));
+                const isWeakMatch = textHasTokens && !productTypeHasTokens;
+                
+                if (productTypeHasTokens) {
+                  strongMatches.push(candidate);
+                } else if (isWeakMatch) {
+                  weakMatches.push(candidate);
+                } else {
+                  // Neither strong nor weak - exclude (doesn't match itemType at all)
+                }
+              }
+              
+              // Determine if we should use STRONG only or STRONG + WEAK
+              const slotsForItem = Math.ceil(finalResultCount / bundleItemsWithBudget.length);
+              const minStrongThreshold = Math.max(8, slotsForItem);
+              
+              if (strongMatches.length >= minStrongThreshold) {
+                itemGated = strongMatches;
+                console.log(`[Bundle] strong_productType_match itemIndex=${itemIdx} itemType=${itemTypeForFilter} strong=${strongMatches.length} weak=${weakMatches.length} appliedStrongOnly=true`);
+              } else {
+                itemGated = [...strongMatches, ...weakMatches];
+                console.log(`[Bundle] strong_productType_match itemIndex=${itemIdx} itemType=${itemTypeForFilter} strong=${strongMatches.length} weak=${weakMatches.length} appliedStrongOnly=false`);
+              }
+            }
+          }
+          
+          // Second pass: apply budget filter (item-specific price ceiling or allocated budget)
           
           // Prefer item-specific price ceiling over allocated budget
           const itemPriceCeiling = itemConstraints?.priceCeiling;
@@ -8006,10 +8085,11 @@ async function processSessionInBackground({
             ].join(" ");
             
             // Use word-boundary matching for all hard terms (not token matching)
-            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(haystack, phrase));
+            // FIX: matchesHardTermWithBoundary takes (searchText, hardTerm) - arguments were reversed
+            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(phrase, haystack));
             
             // Also check boost terms
-            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
+            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(term, haystack));
             
             if (!hasHardTermMatch && !hasBoostTerm) {
               passesConstraints = false;
@@ -8443,6 +8523,9 @@ async function processSessionInBackground({
       } else {
         // Single-item validation (non-bundle or trustFallback)
         validatedHandles = await validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+        
+        // Safety test log: confirm validation fix
+        console.log(`[Validation] final_validated_count=${validatedHandles.length} from_ai_count=${finalHandles.length}`);
       }
       
       // BUG FIX #2: Log actual validated array (no later mutation)
