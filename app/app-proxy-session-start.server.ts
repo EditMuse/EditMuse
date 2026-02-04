@@ -7220,6 +7220,7 @@ async function processSessionInBackground({
       let bundleAiSucceeded = false;
       let parseFailReason: string | undefined = undefined;
       let bundleFinalHandles: string[] = []; // Store AI results for top-up check
+      let aiItemIndexMap: Map<string, number> | undefined = undefined; // Store AI itemIndex mapping for validation
 
       // Bundle handling: use AI bundle ranking
       if (isBundleMode && bundleIntent.items.length >= 2) {
@@ -7370,6 +7371,15 @@ async function processSessionInBackground({
               bundleFinalHandles = finalHandles; // Store for top-up check
               if (aiBundle.trustFallback) {
                 trustFallback = true;
+              }
+              
+              // Store AI itemIndex mapping for validation (use AI's mapping, not inferred)
+              aiItemIndexMap = new Map<string, number>();
+              if (aiBundle.bundleSelections) {
+                for (const sel of aiBundle.bundleSelections) {
+                  aiItemIndexMap.set(sel.handle, sel.itemIndex);
+                }
+                console.log(`[Bundle] AI itemIndex mapping: ${aiBundle.bundleSelections.length} handles mapped to ${new Set(aiBundle.bundleSelections.map((s: { itemIndex: number; handle: string }) => s.itemIndex)).size} items`);
               }
               
               // Log AI result (budget already checked in ai-ranking.server.ts)
@@ -8163,6 +8173,7 @@ async function processSessionInBackground({
             // CORRECT ORDER: matchesHardTermWithBoundary(haystackText, term) - haystack is the text to search in, term is what we're looking for
             const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(haystack, phrase));
             
+            
             // Also check boost terms
             const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
             
@@ -8273,6 +8284,65 @@ async function processSessionInBackground({
           return false;
         }
         
+        // Helper function to score a candidate against a bundle item (for robust mapping)
+        async function scoreCandidateForBundleItem(
+          candidate: EnrichedCandidate,
+          bundleItem: { hardTerms: string[]; constraints?: { optionConstraints?: { size?: string; color?: string; material?: string } } },
+          itemIdx: number
+        ): Promise<number> {
+          const haystack = [
+            candidate.title || "",
+            candidate.productType || "",
+            (candidate.tags || []).join(" "),
+            candidate.vendor || "",
+            candidate.handle || "",
+            candidate.searchText || "",
+          ].join(" ");
+          const normalizedHaystack = normalizeText(haystack);
+          
+          let score = 0;
+          
+          // Score +10 for each hardTerm hit in combined text
+          for (const term of bundleItem.hardTerms) {
+            const normalizedTerm = normalizeText(term);
+            if (normalizedHaystack.includes(normalizedTerm)) {
+              score += 10;
+            }
+          }
+          
+          // Score +8 extra if productType indicates suit (contains suit/tux/blazer) when item hardTerms include "suit"
+          const productTypeLower = (candidate.productType || "").toLowerCase();
+          const hasSuitTerm = bundleItem.hardTerms.some(t => normalizeText(t).includes("suit"));
+          if (hasSuitTerm && (productTypeLower.includes("suit") || productTypeLower.includes("tux") || productTypeLower.includes("blazer"))) {
+            score += 8;
+          }
+          
+          // Score +8 extra if productType indicates shirt (contains shirt/cuff/collar) when item hardTerms include "shirt"
+          const hasShirtTerm = bundleItem.hardTerms.some(t => normalizeText(t).includes("shirt"));
+          if (hasShirtTerm && (productTypeLower.includes("shirt") || productTypeLower.includes("cuff") || productTypeLower.includes("collar"))) {
+            score += 8;
+          }
+          
+          // Pre-check constraints: if item has optionConstraints, validate candidate passes them
+          const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+          if (itemOptionConstraints && (itemOptionConstraints.size || itemOptionConstraints.color || itemOptionConstraints.material)) {
+            const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+            if (itemOptionConstraints.size) itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+            if (itemOptionConstraints.color) itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+            if (itemOptionConstraints.material) itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+            
+            if (itemGenericConstraints.length > 0) {
+              const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemGenericConstraints, facetVocabulary);
+              if (!constraintResult.ok) {
+                // Candidate fails constraints for this item - return invalid score
+                return -1;
+              }
+            }
+          }
+          
+          return score;
+        }
+        
         // (a) Handle existence validation: Check if handle exists in enriched candidates
         const handleExistenceValid = finalHandles.filter(handle => {
           return candidateMap.has(handle);
@@ -8284,24 +8354,55 @@ async function processSessionInBackground({
           validatedHandles = [];
         } else {
           // (b) Per-item constraint validation: Validate each handle against its item's merged constraints using satisfiesConstraintsStructuredOrTags()
-          // Group handles by itemIndex first (using same mapping as grouping)
+          // Group handles by itemIndex using AI's mapping (if available) or scored assignment
           const handlesByItemIndex = new Map<number, string[]>();
+          let assignedCount = 0;
+          let unassignedCount = 0;
+          
           for (const handle of handleExistenceValid) {
-            const candidate = candidateMap.get(handle);
-            if (!candidate) continue;
-            
-            // Find which bundle item this handle matches
-            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-              const bundleItem = bundleIntent.items[itemIdx];
-              if (matchesBundleItem(candidate, bundleItem)) {
-                if (!handlesByItemIndex.has(itemIdx)) {
-                  handlesByItemIndex.set(itemIdx, []);
+            // Use AI itemIndex mapping if available (preferred), otherwise use scored assignment
+            let itemIdx: number | null = null;
+            if (aiItemIndexMap && aiItemIndexMap.has(handle)) {
+              itemIdx = aiItemIndexMap.get(handle)!;
+              assignedCount++;
+            } else {
+              // Fallback: scored assignment to best matching bundle item
+              const candidate = candidateMap.get(handle);
+              if (candidate) {
+                let bestScore = -1;
+                let bestItemIdx: number | null = null;
+                
+                for (let idx = 0; idx < bundleIntent.items.length; idx++) {
+                  const bundleItem = bundleIntent.items[idx];
+                  const score = await scoreCandidateForBundleItem(candidate, bundleItem, idx);
+                  
+                  if (score > bestScore) {
+                    bestScore = score;
+                    bestItemIdx = idx;
+                  }
                 }
-                handlesByItemIndex.get(itemIdx)!.push(handle);
-                break; // Handle can only match one item type
+                
+                if (bestItemIdx !== null && bestScore >= 0) {
+                  itemIdx = bestItemIdx;
+                  assignedCount++;
+                } else {
+                  unassignedCount++;
+                  console.warn(`[BundleMapping] handle=${handle} could not be assigned to any itemIdx (all scores invalid or < 0)`);
+                }
+              } else {
+                unassignedCount++;
               }
             }
+            
+            if (itemIdx !== null) {
+              if (!handlesByItemIndex.has(itemIdx)) {
+                handlesByItemIndex.set(itemIdx, []);
+              }
+              handlesByItemIndex.get(itemIdx)!.push(handle);
+            }
           }
+          
+          console.log(`[BundleMapping] assigned=${assignedCount} unassigned=${unassignedCount} total=${handleExistenceValid.length}`);
           
           // Validate per-item and remove invalid handles (conflicts)
           const validatedHandlesByItem = new Map<number, string[]>();
@@ -8313,7 +8414,7 @@ async function processSessionInBackground({
             const bundleItem = bundleIntent.items[itemIdx];
             const itemHandles = handlesByItemIndex.get(itemIdx) || [];
             
-            // Get merged per-item constraints (global + item-specific)
+            // Get merged per-item constraints (item-specific only in bundle mode, global + item-specific in non-bundle)
             const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
             const itemGenericConstraints: Array<{ key: string; value: string }> = [];
             
@@ -8328,15 +8429,18 @@ async function processSessionInBackground({
               itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
             }
             
-            // Add global hardFacets (if not overridden by item-specific)
-            if (hardFacets.size && !itemOptionConstraints?.size) {
-              itemGenericConstraints.push({ key: "size", value: hardFacets.size });
-            }
-            if (hardFacets.color && !itemOptionConstraints?.color) {
-              itemGenericConstraints.push({ key: "color", value: hardFacets.color });
-            }
-            if (hardFacets.material && !itemOptionConstraints?.material) {
-              itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+            // Add global hardFacets (if not overridden by item-specific) - ONLY in non-bundle mode
+            // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
+            if (!bundleIntent.isBundle) {
+              if (hardFacets.size && !itemOptionConstraints?.size) {
+                itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+              }
+              if (hardFacets.color && !itemOptionConstraints?.color) {
+                itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+              }
+              if (hardFacets.material && !itemOptionConstraints?.material) {
+                itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+              }
             }
             
             if (itemGenericConstraints.length > 0) {
@@ -8453,9 +8557,12 @@ async function processSessionInBackground({
                 if (itemOptionConstraints?.color) itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
                 if (itemOptionConstraints?.material) itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
                 
-                if (hardFacets.size && !itemOptionConstraints?.size) itemGenericConstraints.push({ key: "size", value: hardFacets.size });
-                if (hardFacets.color && !itemOptionConstraints?.color) itemGenericConstraints.push({ key: "color", value: hardFacets.color });
-                if (hardFacets.material && !itemOptionConstraints?.material) itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+                // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
+                if (!bundleIntent.isBundle) {
+                  if (hardFacets.size && !itemOptionConstraints?.size) itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+                  if (hardFacets.color && !itemOptionConstraints?.color) itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+                  if (hardFacets.material && !itemOptionConstraints?.material) itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+                }
                 
                 const itemPool: EnrichedCandidate[] = [];
                 for (const c of sortedCandidates) {
@@ -8483,23 +8590,27 @@ async function processSessionInBackground({
               
               // Refill each itemIndex independently from its constraint-gated itemPool
               const usedRefillHandles = new Set(constraintValid);
+              const targetPerItem = Math.ceil(finalResultCount / bundleIntent.items.length);
+              
               for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
                 const currentValid = validatedHandlesByItem.get(itemIdx) || [];
-                const removed = removedHandlesByItem.get(itemIdx) || [];
+                const needed = Math.max(0, targetPerItem - currentValid.length);
                 
-                if (currentValid.length === 0 && removed.length > 0) {
+                // Fix: refill when currentValid.length === 0 (not just when removed.length > 0)
+                // This handles mapping failures where removed=0 but currentValid=0
+                if (needed > 0) {
                   // This item needs refill - get from its itemPool
                   const itemPool = refillItemPools.get(itemIdx) || [];
                   const refillCandidates = itemPool
                     .filter((c: EnrichedCandidate) => !usedRefillHandles.has(c.handle) && (experience.inStockOnly ? c.available : true))
-                    .slice(0, Math.ceil(finalResultCount / bundleIntent.items.length)); // Rough target per item
+                    .slice(0, needed);
                   
                   if (refillCandidates.length > 0) {
                     const refillHandles = refillCandidates.map((c: EnrichedCandidate) => c.handle);
                     constraintValid.push(...refillHandles);
                     refillHandles.forEach((h: string) => usedRefillHandles.add(h));
-                    validatedHandlesByItem.set(itemIdx, refillHandles);
-                    console.log(`[BundleRefill] itemIndex=${itemIdx} added=${refillHandles.length} reason=validation_removed_all_handles`);
+                    validatedHandlesByItem.set(itemIdx, [...currentValid, ...refillHandles]);
+                    console.log(`[BundleRefill] itemIndex=${itemIdx} added=${refillHandles.length} reason=needed_${needed}_slots`);
                   } else {
                     console.log(`[BundleRefill] itemIndex=${itemIdx} added=0 reason=no_valid_candidates_in_pool`);
                   }
@@ -8528,10 +8639,11 @@ async function processSessionInBackground({
       // BUG FIX #2: Log actual validated array (no later mutation)
       console.log("[App Proxy] [Layer 3] Validated handles (FINAL):", validatedHandles.length, "out of", finalHandles.length, "preview=", validatedHandles.slice(0, 5).join(", "));
       
-      // Safe fallback: if validation returns 0, use gated pool instead of unsafe token matching
-      if (validatedHandles.length === 0 && finalHandles.length > 0 && !trustFallback) {
-        // Fallback to first resultCount handles from gated pool (already ranked/gated candidates)
-        // Dedupe handles, filter unavailable, respect resultCount
+      // Bundle mode: Do NOT use global fallback if validation returns 0 for an itemIndex
+      // Instead, treat that itemIndex as NO_MATCH and return fewer results for that item
+      // (Single-item mode can still use safe fallback)
+      if (validatedHandles.length === 0 && finalHandles.length > 0 && !trustFallback && !isBundleMode) {
+        // Safe fallback for single-item only: use gated pool instead of unsafe token matching
         const gatedPoolHandles = Array.from(new Set(
           gatedCandidates
             .filter(c => c.available !== false && c.handle)
@@ -8541,8 +8653,14 @@ async function processSessionInBackground({
         
         if (gatedPoolHandles.length > 0) {
           validatedHandles = gatedPoolHandles;
+          usedValidationFallback = true;
           console.log(`[Layer 3] Safe fallback from gated pool: ${validatedHandles.length} handles (validation returned 0)`);
         }
+      }
+      
+      // Bundle mode: If validation returned 0 for an itemIndex, log it but don't use global fallback
+      if (isBundleMode && validatedHandles.length === 0 && finalHandles.length > 0) {
+        console.warn(`[Bundle Validation] Validation returned 0 handles - treating as NO_MATCH for affected items (NOT using global remaining_candidates)`);
       }
       
       // Bundle budget validation - ONLY when totalBudget is a number
@@ -10347,5 +10465,6 @@ async function processSessionInBackground({
       throw error;
     }
 }
+
 
 

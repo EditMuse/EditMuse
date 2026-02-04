@@ -833,6 +833,7 @@ export async function rankProductsWithAI(
   trustFallback: boolean;
   source: "ai" | "fallback" | "ai_failed_fallback_bm25";
   parseFailReason?: string | null;
+  bundleSelections?: Array<{ itemIndex: number; handle: string }>;
 }> {
   // Helper function to determine fallback scope and candidates
   const getFallbackCandidates = (): { candidates: ProductCandidate[]; scope: "strict_gate" | "full_pool" } => {
@@ -2053,12 +2054,17 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         
         // Bundle mode: AI succeeded (structured output parsed and validated)
         console.log("[AI Ranking] source=ai trustFallback=", finalTrustFallback, "final_result_source=ai");
+        
         return {
           selectedHandles: rankedHandles,
           reasoning,
           trustFallback: finalTrustFallback,
           source: "ai",
           parseFailReason: null,
+          bundleSelections: bundleResult.selected_by_item.map((item: BundleSelectedItem) => ({
+            itemIndex: item.itemIndex,
+            handle: item.handle,
+          })),
         };
       }
 
