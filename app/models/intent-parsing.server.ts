@@ -200,6 +200,10 @@ Your task is to analyze the user's query and extract:
 2. **Soft Terms**: Abstract concepts, context, or style preferences (e.g., "formal", "casual", "work", "wedding", "eco-friendly", "comfortable", "stylish")
 3. **Avoid Terms**: Things the user wants to exclude (e.g., "no prints", "avoid plastic", "not red", "without batteries", "no floral", "don't want X")
 4. **Hard Facets**: Specific size, color, or material constraints if mentioned (works for any industry)
+   - **CRITICAL**: Explicit sizes/colors/materials MUST be assigned to hardFacets (and per-item optionConstraints in bundle mode), NOT left in hardTerms
+   - If user says "in large" after listing multiple items, treat it as a global size unless an item-specific size is clearly stated
+   - Example: "suit, shirt and trousers in large" → hardFacets: {size: "large", color: null, material: null}, bundleItems with size applied globally
+   - Example: "blue shirt in medium, black trousers in large" → per-item optionConstraints: shirt {size: "medium", color: "blue"}, trousers {size: "large", color: "black"}
 5. **Bundle Detection**: Whether the user wants MULTIPLE DISTINCT products (e.g., "laptop and mouse", "sofa and table", "suit and shirt") vs a single item
 6. **Preferences**: Style or feature preferences that guide selection (e.g., "plain", "wireless", "organic", "rechargeable", "waterproof", "eco-friendly")
 

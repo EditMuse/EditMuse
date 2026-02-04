@@ -3598,6 +3598,15 @@ async function processSessionInBackground({
       // Use enrichedCandidates for all subsequent operations
       let allCandidatesEnriched: EnrichedCandidate[] = enrichedCandidates;
       
+      // Discover facet vocabulary from candidate pool (industry-agnostic)
+      const { discoverFacetVocabulary } = await import("~/utils/facets.server");
+      const facetVocabulary = discoverFacetVocabulary(enrichedCandidates);
+      const discoveredOptionNames = Array.from(facetVocabulary.optionNames);
+      console.log(`[Facets] discovered_options=[${discoveredOptionNames.join(", ")}]`);
+      
+      // Store facetVocabulary for use in bundle gating
+      const facetVocabularyForBundle = facetVocabulary;
+      
       // Tokenize all candidates for indexing
       const candidateDocs = enrichedCandidates.map(c => ({
         candidate: c,
@@ -3952,6 +3961,58 @@ async function processSessionInBackground({
             color: variantConstraintsForIntent.color || intent.hardFacets?.color || null,
             material: variantConstraintsForIntent.material || intent.hardFacets?.material || null
           };
+        }
+        
+        // Bundle mode: apply global hardFacets.size (and material if present) to every bundle item that lacks an explicit per-item size/material
+        // Keep global color only when an explicit global indicator exists (do NOT force global color)
+        if (bundleIntent.isBundle) {
+          let globalSizeAppliedCount = 0;
+          let globalMaterialAppliedCount = 0;
+          
+          // Apply global size to items that don't have explicit per-item size
+          if (hardFacets.size) {
+            for (let i = 0; i < bundleIntent.items.length; i++) {
+              const item = bundleIntent.items[i];
+              const itemSize = item.constraints?.optionConstraints?.size;
+              if (!itemSize) {
+                // Item lacks explicit size - apply global size
+                if (!item.constraints) {
+                  item.constraints = { optionConstraints: {} };
+                }
+                if (!item.constraints.optionConstraints) {
+                  item.constraints.optionConstraints = {};
+                }
+                item.constraints.optionConstraints.size = hardFacets.size;
+                globalSizeAppliedCount++;
+              }
+            }
+          }
+          
+          // Apply global material to items that don't have explicit per-item material
+          if (hardFacets.material) {
+            for (let i = 0; i < bundleIntent.items.length; i++) {
+              const item = bundleIntent.items[i];
+              const itemMaterial = item.constraints?.optionConstraints?.material;
+              if (!itemMaterial) {
+                // Item lacks explicit material - apply global material
+                if (!item.constraints) {
+                  item.constraints = { optionConstraints: {} };
+                }
+                if (!item.constraints.optionConstraints) {
+                  item.constraints.optionConstraints = {};
+                }
+                item.constraints.optionConstraints.material = hardFacets.material;
+                globalMaterialAppliedCount++;
+              }
+            }
+          }
+          
+          if (globalSizeAppliedCount > 0) {
+            console.log(`[Bundle] global_size_applied_to_items count=${globalSizeAppliedCount}`);
+          }
+          if (globalMaterialAppliedCount > 0) {
+            console.log(`[Bundle] global_material_applied_to_items count=${globalMaterialAppliedCount}`);
+          }
         }
         
         // Merge preferences into softTerms if not already present
@@ -6367,79 +6428,22 @@ async function processSessionInBackground({
           // First pass: item-specific facet + hard term matching (no budget filter)
           const itemConstraints = bundleItem.constraints;
           const itemOptionConstraints = itemConstraints?.optionConstraints;
-          const allowValues = itemOptionConstraints?.allowValues;
           
-          const itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
-            // Apply item-specific option constraints (size, color, material) if present
-            // Otherwise fall back to global hardFacets
-            // Check allowValues first (OR logic - match any), then single constraints
-            
-            // Size constraint: check allowValues first, then single value
-            if (allowValues?.size && allowValues.size.length > 0 && c.sizes.length > 0) {
-              // OR logic: match any value in the allow-list
-              const sizeMatch = c.sizes.some((s: string) => 
-                allowValues.size.some(allowedSize => 
-                  normalizeText(s) === normalizeText(allowedSize) ||
-                  normalizeText(s).includes(normalizeText(allowedSize)) ||
-                  normalizeText(allowedSize).includes(normalizeText(s))
-                )
-              );
-              if (!sizeMatch) return false;
-            } else {
-              const sizeConstraint = itemOptionConstraints?.size || hardFacets.size;
-              if (sizeConstraint && c.sizes.length > 0) {
-                const sizeMatch = c.sizes.some((s: string) => 
-                  normalizeText(s) === normalizeText(sizeConstraint) ||
-                  normalizeText(s).includes(normalizeText(sizeConstraint)) ||
-                  normalizeText(sizeConstraint).includes(normalizeText(s))
-              );
-              if (!sizeMatch) return false;
-            }
-            }
-            
-            // Color constraint: check allowValues first, then single value
-            if (allowValues?.color && allowValues.color.length > 0 && c.colors.length > 0) {
-              // OR logic: match any value in the allow-list
-              const colorMatch = c.colors.some((col: string) => 
-                allowValues.color.some(allowedColor => 
-                  normalizeText(col) === normalizeText(allowedColor) ||
-                  normalizeText(col).includes(normalizeText(allowedColor)) ||
-                  normalizeText(allowedColor).includes(normalizeText(col))
-                )
-              );
-              if (!colorMatch) return false;
-            } else {
-              const colorConstraint = itemOptionConstraints?.color || hardFacets.color;
-              if (colorConstraint && c.colors.length > 0) {
-                const colorMatch = c.colors.some((col: string) => 
-                  normalizeText(col) === normalizeText(colorConstraint) ||
-                  normalizeText(col).includes(normalizeText(colorConstraint)) ||
-                  normalizeText(colorConstraint).includes(normalizeText(col))
-              );
-              if (!colorMatch) return false;
-            }
-            }
-            
-            // Material constraint: check allowValues first, then single value
-            if (allowValues?.material && allowValues.material.length > 0 && c.materials.length > 0) {
-              // OR logic: match any value in the allow-list
-              const materialMatch = c.materials.some((m: string) => 
-                allowValues.material.some(allowedMaterial => 
-                  normalizeText(m) === normalizeText(allowedMaterial) ||
-                  normalizeText(m).includes(normalizeText(allowedMaterial)) ||
-                  normalizeText(allowedMaterial).includes(normalizeText(m))
-                )
-              );
-              if (!materialMatch) return false;
-            } else {
-              const materialConstraint = itemOptionConstraints?.material || hardFacets.material;
-              if (materialConstraint && c.materials.length > 0) {
-                const materialMatch = c.materials.some((m: string) => 
-                  normalizeText(m) === normalizeText(materialConstraint) ||
-                  normalizeText(m).includes(normalizeText(materialConstraint)) ||
-                  normalizeText(materialConstraint).includes(normalizeText(m))
-              );
-              if (!materialMatch) return false;
+          // Convert old format to generic constraints
+          const { convertOptionConstraintsToConstraints, convertHardFacetsToConstraints, mergeConstraints: mergeFacetConstraints, productSatisfiesConstraints, relaxConstraints } = await import("~/utils/facets.server");
+          
+          const globalFacetConstraints = convertHardFacetsToConstraints(hardFacets, "global");
+          const itemFacetConstraints = convertOptionConstraintsToConstraints(itemOptionConstraints || {}, "item");
+          const mergedItemConstraints = mergeFacetConstraints(globalFacetConstraints, itemFacetConstraints);
+          
+          console.log(`[Constraints] bundle_item=${itemIdx} global=[${globalFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] per_item=[${itemFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] merged=[${mergedItemConstraints.map(c => `${c.key}:${c.value}`).join(", ")}]`);
+          
+          // Gate with constraints using new facet system
+          let itemGatedUnfiltered: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+            // Check constraints using new facet system
+            if (mergedItemConstraints.length > 0) {
+              if (!productSatisfiesConstraints(c, mergedItemConstraints, true)) {
+                return false;
               }
             }
             
@@ -6465,6 +6469,71 @@ async function processSessionInBackground({
             
             return true;
           });
+          
+          // Staged fallback: if constraints cause zero matches, relax constraints
+          if (itemGatedUnfiltered.length === 0 && mergedItemConstraints.length > 0) {
+            console.log(`[Constraints] bundle_item=${itemIdx} strict_gate_count=0 - applying staged fallback`);
+            
+            // Stage 1: relax least important constraint
+            const stage1Result = relaxConstraints(mergedItemConstraints, facetVocabularyForBundle.optionNames, 1);
+            const stage1Gated = allCandidatesEnriched.filter(c => {
+              if (stage1Result.relaxed.length > 0) {
+                if (!productSatisfiesConstraints(c, stage1Result.relaxed, true)) {
+                  return false;
+                }
+              }
+              
+              const slotDescriptor = itemHardTerms.join(" ");
+              const slotScore = scoreProductForSlot(c, slotDescriptor);
+              if (slotScore < 0.1) return false;
+              
+              if (itemConstraints?.includeTerms && itemConstraints.includeTerms.length > 0) {
+                const includeDescriptor = itemConstraints.includeTerms.join(" ");
+                const includeScore = scoreProductForSlot(c, includeDescriptor);
+                if (includeScore < 0.1) return false;
+              }
+              
+              if (itemConstraints?.excludeTerms && itemConstraints.excludeTerms.length > 0) {
+                const excludeDescriptor = itemConstraints.excludeTerms.join(" ");
+                const excludeScore = scoreProductForSlot(c, excludeDescriptor);
+                if (excludeScore >= 0.1) return false;
+              }
+              
+              return true;
+            });
+            
+            if (stage1Gated.length > 0) {
+              itemGatedUnfiltered = stage1Gated;
+              console.log(`[Constraints] relaxed bundle_item=${itemIdx} removed=[${stage1Result.removed.map(c => `${c.key}:${c.value}`).join(", ")}] reason=${stage1Result.reason} stage1_count=${stage1Gated.length}`);
+            } else {
+              // Stage 2: remove all constraints (keep anchor terms only)
+              const stage2Result = relaxConstraints(mergedItemConstraints, facetVocabularyForBundle.optionNames, 2);
+              const stage2Gated = allCandidatesEnriched.filter(c => {
+                const slotDescriptor = itemHardTerms.join(" ");
+                const slotScore = scoreProductForSlot(c, slotDescriptor);
+                if (slotScore < 0.1) return false;
+                
+                if (itemConstraints?.includeTerms && itemConstraints.includeTerms.length > 0) {
+                  const includeDescriptor = itemConstraints.includeTerms.join(" ");
+                  const includeScore = scoreProductForSlot(c, includeDescriptor);
+                  if (includeScore < 0.1) return false;
+                }
+                
+                if (itemConstraints?.excludeTerms && itemConstraints.excludeTerms.length > 0) {
+                  const excludeDescriptor = itemConstraints.excludeTerms.join(" ");
+                  const excludeScore = scoreProductForSlot(c, excludeDescriptor);
+                  if (excludeScore >= 0.1) return false;
+                }
+                
+                return true;
+              });
+              
+              if (stage2Gated.length > 0) {
+                itemGatedUnfiltered = stage2Gated;
+                console.log(`[Constraints] relaxed bundle_item=${itemIdx} removed=[${stage2Result.removed.map(c => `${c.key}:${c.value}`).join(", ")}] reason=${stage2Result.reason} stage2_count=${stage2Gated.length}`);
+              }
+            }
+          }
           
           // Type anchor gating for bundle item: filter by non-facet hard terms
           // Combine item hardTerms with includeTerms to get all item terms
@@ -7539,14 +7608,15 @@ async function processSessionInBackground({
       
       /**
        * Validate final handles against hard constraints (when trustFallback=false)
+       * Industry-agnostic: uses new facet system
        */
-      function validateFinalHandles(
+      async function validateFinalHandles(
         handles: string[],
         candidates: EnrichedCandidate[],
         hardTerms: string[],
         hardFacets: { size: string | null; color: string | null; material: string | null },
         trustFallback: boolean
-      ): string[] {
+      ): Promise<string[]> {
         if (trustFallback) {
           // Trust fallback: allow all handles
           return handles;
@@ -7554,39 +7624,27 @@ async function processSessionInBackground({
         
         const validHandles: string[] = [];
         
+        // Convert hardFacets to generic constraints using new facet system
+        const { convertHardFacetsToConstraints, productSatisfiesConstraints } = await import("~/utils/facets.server");
+        const facetConstraints = convertHardFacetsToConstraints(hardFacets);
+        
         for (const handle of handles) {
           const candidate = candidates.find(c => c.handle === handle);
           if (!candidate) continue;
           
-          // Check hard facets
-          let passesFacets = true;
-          if (hardFacets.size && candidate.sizes.length > 0) {
-            const sizeMatch = candidate.sizes.some((s: string) => 
-              normalizeText(s) === normalizeText(hardFacets.size) ||
-              normalizeText(s).includes(normalizeText(hardFacets.size)) ||
-              normalizeText(hardFacets.size).includes(normalizeText(s))
-            );
-            if (!sizeMatch) passesFacets = false;
-          }
-          if (hardFacets.color && candidate.colors.length > 0 && passesFacets) {
-            const colorMatch = candidate.colors.some((col: string) => 
-              normalizeText(col) === normalizeText(hardFacets.color) ||
-              normalizeText(col).includes(normalizeText(hardFacets.color)) ||
-              normalizeText(hardFacets.color).includes(normalizeText(col))
-            );
-            if (!colorMatch) passesFacets = false;
-          }
-          if (hardFacets.material && candidate.materials.length > 0 && passesFacets) {
-            const materialMatch = candidate.materials.some((m: string) => 
-              normalizeText(m) === normalizeText(hardFacets.material) ||
-              normalizeText(m).includes(normalizeText(hardFacets.material)) ||
-              normalizeText(hardFacets.material).includes(normalizeText(m))
-            );
-            if (!materialMatch) passesFacets = false;
+          // Check availability
+          if (!candidate.available) continue;
+          
+          // Check constraints using new facet system (industry-agnostic)
+          let passesConstraints = true;
+          if (facetConstraints.length > 0) {
+            if (!productSatisfiesConstraints(candidate, facetConstraints, true)) {
+              passesConstraints = false;
+            }
           }
           
           // Check hard terms (if any) using word-boundary matching on normalized haystack
-          if (hardTerms.length > 0 && passesFacets) {
+          if (hardTerms.length > 0 && passesConstraints) {
             // Build normalized haystack: title + productType + tags.join(" ") + vendor + searchText
             const haystack = [
               candidate.title || "",
@@ -7603,11 +7661,11 @@ async function processSessionInBackground({
             const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
             
             if (!hasHardTermMatch && !hasBoostTerm) {
-              passesFacets = false;
+              passesConstraints = false;
             }
           }
           
-          if (passesFacets) {
+          if (passesConstraints) {
             validHandles.push(handle);
           }
         }
@@ -8033,7 +8091,7 @@ async function processSessionInBackground({
         }
       } else {
         // Single-item validation (non-bundle or trustFallback)
-        validatedHandles = validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+        validatedHandles = await validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
       }
       
       // BUG FIX #2: Log actual validated array (no later mutation)

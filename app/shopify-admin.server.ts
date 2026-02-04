@@ -62,6 +62,75 @@ function uniqLower(values: (string | null | undefined)[]): string[] {
 }
 
 /**
+ * Parse size tags (cf-size-*) from tags array
+ * Returns array of size values (lowercase, prefix stripped)
+ * Example: ["cf-size-m", "cf-size-l"] -> ["m", "l"]
+ */
+function parseSizeTags(tags: string[]): string[] {
+  const sizes: string[] = [];
+  const seen = new Set<string>();
+  
+  if (!Array.isArray(tags)) return sizes;
+  
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    
+    // Match cf-size-* pattern
+    if (tag.startsWith("cf-size-")) {
+      const size = tag.replace("cf-size-", "").trim().toLowerCase();
+      if (size && !seen.has(size)) {
+        seen.add(size);
+        sizes.push(size);
+      }
+    }
+  }
+  
+  return sizes;
+}
+
+/**
+ * Parse material tags (cf-material-*) from tags array
+ * Returns array of material tokens (lowercase, percentages removed, split into tokens)
+ * Example: ["cf-material-80-cotton-20-polyester"] -> ["cotton", "polyester"]
+ * Example: ["cf-material-cotton"] -> ["cotton"]
+ */
+function parseMaterialTags(tags: string[]): string[] {
+  const materials: string[] = [];
+  const seen = new Set<string>();
+  
+  if (!Array.isArray(tags)) return materials;
+  
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    
+    // Match cf-material-* pattern
+    if (tag.startsWith("cf-material-")) {
+      // Remove prefix
+      let materialStr = tag.replace("cf-material-", "").trim().toLowerCase();
+      if (!materialStr) continue;
+      
+      // Remove numeric percentages (e.g., "80-", "20-", "-80", "-20")
+      // Pattern: digits followed by hyphen, or hyphen followed by digits
+      materialStr = materialStr.replace(/\d+-/g, "").replace(/-\d+/g, "");
+      
+      // Split by hyphens and filter out empty strings
+      const tokens = materialStr.split("-").filter(t => t.trim().length > 0);
+      
+      // Add each token (dedupe)
+      for (const token of tokens) {
+        const trimmed = token.trim();
+        if (trimmed && !seen.has(trimmed)) {
+          seen.add(trimmed);
+          materials.push(trimmed);
+        }
+      }
+    }
+  }
+  
+  return materials;
+}
+
+/**
  * Classify option name as size, color, or material
  */
 function classifyOptionName(name: string | null): "size" | "color" | "material" | null {
@@ -1020,22 +1089,31 @@ export async function fetchShopifyProductsGraphQL({
     const categoryFullName: string | null = node.productCategory?.productTaxonomyNode?.fullName || null;
     
     // Build convenience arrays for sizes/colors/materials
-    // Also parse from tags (e.g., cf-color-*)
-    const sizes: string[] = optionValues["size"] || [];
-    const colors: string[] = (optionValues["color"] || []).concat(optionValues["colour"] || []);
-    const materials: string[] = optionValues["material"] || [];
+    // Start with option-based values
+    const sizesFromOptions: string[] = optionValues["size"] || [];
+    const colorsFromOptions: string[] = (optionValues["color"] || []).concat(optionValues["colour"] || []);
+    const materialsFromOptions: string[] = optionValues["material"] || [];
+    
+    // Parse from tags (cf-size-*, cf-material-*, cf-color-*)
+    const tags = Array.isArray(node.tags) ? node.tags : [];
+    const sizesFromTags = parseSizeTags(tags);
+    const materialsFromTags = parseMaterialTags(tags);
+    const colorsFromTags: string[] = [];
     
     // Parse color tags (cf-color-*)
-    if (Array.isArray(node.tags)) {
-      for (const tag of node.tags) {
-        if (typeof tag === "string" && tag.startsWith("cf-color-")) {
-          const color = tag.replace("cf-color-", "").trim();
-          if (color && !colors.includes(color.toLowerCase())) {
-            colors.push(color.toLowerCase());
-          }
+    for (const tag of tags) {
+      if (typeof tag === "string" && tag.startsWith("cf-color-")) {
+        const color = tag.replace("cf-color-", "").trim().toLowerCase();
+        if (color && !colorsFromTags.includes(color)) {
+          colorsFromTags.push(color);
         }
       }
     }
+    
+    // Merge option-based and tag-based values, dedupe
+    const sizes = uniqLower([...sizesFromOptions, ...sizesFromTags]);
+    const colors = uniqLower([...colorsFromOptions, ...colorsFromTags]);
+    const materials = uniqLower([...materialsFromOptions, ...materialsFromTags]);
     
     // Improved availability heuristic using variants
     let available = false;
@@ -1100,6 +1178,9 @@ export async function fetchShopifyProductsGraphQL({
   
   return mapped;
 }
+
+// Export parseSizeTags and parseMaterialTags for testing
+export { parseSizeTags, parseMaterialTags };
 
 /**
  * Fetches products from Shopify Admin GraphQL API using a search query

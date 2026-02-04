@@ -2430,52 +2430,95 @@
         var mode = this.state.mode;
         
         if (mode === 'chat') {
-          // Chat mode: fetch questions first to check if any exist
+          // Chat mode: show input immediately, fetch questions in background
+          // CHANGE 1: Immediately set state and render (no loading UI)
+          var chatQuestionForUI = { ...EM_CHAT_QUESTION };
+          chatQuestionForUI._skipQuestions = true; // Mark as skip case
+          this.state.questions = [chatQuestionForUI];
+          this.state.current = 0;
+          this.state.answers = {};
+          this.state.skipQuestions = true; // Flag to indicate we're skipping questions
+          this.state.loading = false;
+          this.state.error = null;
+          this.render();
+          this.updateNavState();
+          this.updateProgressBar();
+          
+          // CHANGE 3: Check cache first to avoid unnecessary fetch
+          var experienceId = this.getExperienceId();
+          var cacheKey = 'editmuse_chat_questions_count:' + (experienceId || window.location.hostname);
+          var cachedCount = null;
           try {
-            var fetchedQuestions = await this.fetchQuestions();
-            var questionsCount = fetchedQuestions ? fetchedQuestions.length : 0;
-            console.log('[Widget] chat_mode_questions_count=' + questionsCount);
-            
-            if (questionsCount === 0) {
-              // Zero questions: skip question flow, allow direct chat
-              // Use EM_CHAT_QUESTION for UI, but mark as skipQuestions so handleSubmit knows
-              console.log('[Widget] skipping_questions=true');
-              var chatQuestionForUI = { ...EM_CHAT_QUESTION };
-              chatQuestionForUI._skipQuestions = true; // Mark as skip case
-              this.state.questions = [chatQuestionForUI];
-              this.state.current = 0;
-              this.state.answers = {};
-              this.state.loading = false;
-              this.state.error = null;
-              this.state.skipQuestions = true; // Flag to indicate we're skipping questions
-              this.render();
-              this.updateNavState();
-              this.updateProgressBar();
-            } else {
-              // Questions exist: use single textarea step (existing behavior)
-              this.state.questions = [EM_CHAT_QUESTION];
-              this.state.current = 0;
-              this.state.answers = {};
-              this.state.loading = false;
-              this.state.error = null;
-              this.state.skipQuestions = false;
-              this.render();
-              this.updateNavState();
-              this.updateProgressBar();
+            var cached = sessionStorage.getItem(cacheKey);
+            if (cached !== null) {
+              cachedCount = parseInt(cached, 10);
+              if (cachedCount === 0) {
+                // Cached as 0 - skip fetch entirely
+                console.log('[Widget] chat_mode_questions_count=0 (cached)');
+                return; // Exit early, no fetch needed
+              }
             }
-          } catch (fetchError) {
-            // If fetch fails, fall back to default chat question
-            console.warn('[EditMuse] Failed to fetch questions in chat mode, using default:', fetchError);
-            this.state.questions = [EM_CHAT_QUESTION];
-            this.state.current = 0;
-            this.state.answers = {};
-            this.state.loading = false;
-            this.state.error = null;
-            this.state.skipQuestions = false;
-            this.render();
-            this.updateNavState();
-            this.updateProgressBar();
+          } catch (e) {
+            // Ignore cache errors
           }
+          
+          // CHANGE 1: Run fetchQuestions in background (no await, no loading UI)
+          (async () => {
+            try {
+              var fetchedQuestions = await this.fetchQuestions();
+              var questionsCount = fetchedQuestions ? fetchedQuestions.length : 0;
+              console.log('[Widget] chat_mode_questions_count=' + questionsCount);
+              
+              // CHANGE 3: Cache questionsCount
+              try {
+                sessionStorage.setItem(cacheKey, String(questionsCount));
+              } catch (e) {
+                // Ignore cache errors
+              }
+              
+              // CHANGE 2: Only switch to question flow if safe (user hasn't typed)
+              if (questionsCount > 0) {
+                // Check if user has typed anything
+                var hasTyped = false;
+                
+                // Check state answers
+                if (Object.keys(this.state.answers).length > 0) {
+                  hasTyped = true;
+                }
+                
+                // Check current textarea/input value from DOM
+                if (!hasTyped) {
+                  var currentStepEl = this.getStepEl(this.state.current);
+                  if (currentStepEl) {
+                    var textInput = currentStepEl.querySelector('textarea[data-editmuse-quiz-input], input[type="text"][data-editmuse-quiz-input]');
+                    if (textInput && textInput.value && textInput.value.trim() !== '') {
+                      hasTyped = true;
+                    }
+                  }
+                }
+                
+                // Only switch if safe (user hasn't typed)
+                if (!hasTyped) {
+                  // Questions exist: use single textarea step (existing behavior)
+                  this.state.questions = [EM_CHAT_QUESTION];
+                  this.state.skipQuestions = false;
+                  this.render();
+                  this.updateNavState();
+                  this.updateProgressBar();
+                } else {
+                  // User has typed - keep skipQuestions=true to preserve their input
+                  console.log('[Widget] User has typed, keeping skipQuestions=true despite questionsCount=' + questionsCount);
+                }
+              } else {
+                // Zero questions: keep skipQuestions=true (already set above)
+                console.log('[Widget] skipping_questions=true (questionsCount=0)');
+              }
+            } catch (fetchError) {
+              // If fetch fails, keep current state (skipQuestions=true)
+              console.warn('[EditMuse] Failed to fetch questions in chat mode (background), keeping skipQuestions=true:', fetchError);
+              // Don't update UI on error - user can still use the input
+            }
+          })();
         } else if (mode === 'quiz') {
           // Quiz mode: fetch questions and use as-is
           var fetchPromise = this.fetchQuestions();
