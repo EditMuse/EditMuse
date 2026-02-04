@@ -3223,7 +3223,6 @@ async function processSessionInBackground({
   modeUsed: string;
   baseAiWindow: number;
 }): Promise<void> {
-  try {
   // Track total processing duration for safety clamp
   const processStartTime = performance.now();
 
@@ -8573,15 +8572,15 @@ async function processSessionInBackground({
               if (map.has(handle)) {
                 itemIdx = map.get(handle)!;
               }
-                  } else {
-                    // Fallback: find itemIdx from handlesByItemIndex
-                    for (const [idx, handles] of handlesByItemIndex.entries()) {
-                      if (handles.includes(handle)) {
-                        itemIdx = idx;
-                        break;
-                      }
-                    }
-                  }
+            } else {
+              // Fallback: find itemIdx from handlesByItemIndex
+              for (const [idx, handles] of handlesByItemIndex.entries()) {
+                if (handles.includes(handle)) {
+                  itemIdx = idx;
+                  break;
+                }
+              }
+            }
                   
                   if (itemIdx !== null) {
                     if (!keptByItem.has(itemIdx)) {
@@ -8611,10 +8610,10 @@ async function processSessionInBackground({
               const needsRefill = Array.from(validatedHandlesByItem.entries()).some(([idx, handles]) => handles.length === 0);
               
               if (needsRefill && finalSource === "ai") {
-              // Refill per-item from constraint-gated itemPools
-              // Build itemPools from sortedCandidates with constraints (bundleItemPools may not be in scope here)
-              const refillItemPools = new Map<number, EnrichedCandidate[]>();
-              for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+                  // Refill per-item from constraint-gated itemPools
+                // Build itemPools from sortedCandidates with constraints (bundleItemPools may not be in scope here)
+                const refillItemPools = new Map<number, EnrichedCandidate[]>();
+                for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
                 const bundleItem = bundleItemsWithBudget[itemIdx];
                 const itemHardTerms = bundleItem.hardTerms;
                 const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
@@ -8682,9 +8681,10 @@ async function processSessionInBackground({
                     console.log(`[BundleRefill] itemIndex=${itemIdx} added=0 reason=no_valid_candidates_in_pool`);
                   }
                 }
+                }
+                
+                validatedHandles = constraintValid;
               }
-              
-              validatedHandles = constraintValid;
             }
           }
         }
@@ -10633,32 +10633,28 @@ async function processSessionInBackground({
         total: intentParseCallCount + aiCallCount
       });
     }
-  } catch (innerError: any) {
-    // If error occurs in product fetching/processing, re-throw to be caught by outer try-catch
-    console.error("[App Proxy] Error in product fetching/processing:", innerError);
-    throw innerError;
-    }
   } catch (error: any) {
-      console.error("[App Proxy] Background processing failed:", error);
-      // Mark session as FAILED
-      await prisma.conciergeSession.update({
-        where: { publicToken: sessionToken },
-        data: { 
-          status: ConciergeSessionStatus.FAILED,
-        },
-      }).catch(() => {});
-      
-      // Save error result
-      await saveConciergeResult({
-        sessionToken,
-        productHandles: [],
-        productIds: null,
-        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
-      }).catch(() => {});
-      
-      // Re-throw to be caught by outer handler in setImmediate
-      throw error;
-    }
+    // If error occurs in product fetching/processing, re-throw to be caught by outer try-catch
+    console.error("[App Proxy] Error in product fetching/processing:", error);
+    // Mark session as FAILED
+    await prisma.conciergeSession.update({
+      where: { publicToken: sessionToken },
+      data: { 
+        status: ConciergeSessionStatus.FAILED,
+      },
+    }).catch(() => {});
+    
+    // Save error result
+    await saveConciergeResult({
+      sessionToken,
+      productHandles: [],
+      productIds: null,
+      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+    }).catch(() => {});
+    
+    // Re-throw to be caught by outer handler in setImmediate
+    throw error;
+  }
 }
 
 
