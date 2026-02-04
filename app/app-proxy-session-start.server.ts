@@ -8404,146 +8404,213 @@ async function processSessionInBackground({
           
           console.log(`[BundleMapping] assigned=${assignedCount} unassigned=${unassignedCount} total=${handleExistenceValid.length}`);
           
+          // First pass: Check if ANY item has constraints (size/color/material)
+          let hasAnyConstraints = false;
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const bundleItem = bundleIntent.items[itemIdx];
+            const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+            if (itemOptionConstraints?.size || itemOptionConstraints?.color || itemOptionConstraints?.material) {
+              hasAnyConstraints = true;
+              break;
+            }
+          }
+          
           // Validate per-item and remove invalid handles (conflicts)
           const validatedHandlesByItem = new Map<number, string[]>();
           const removedHandlesByItem = new Map<number, string[]>();
           let allCandidatesMissingFacets = true; // Track if ALL candidates are missing facets (for suspicious check)
-          let hasAnyConstraints = false; // Track if ANY item has constraints
           
-          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-            const bundleItem = bundleIntent.items[itemIdx];
-            const itemHandles = handlesByItemIndex.get(itemIdx) || [];
-            
-            // Get merged per-item constraints (item-specific only in bundle mode, global + item-specific in non-bundle)
-            const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
-            const itemGenericConstraints: Array<{ key: string; value: string }> = [];
-            
-            // Add item-specific constraints
-            if (itemOptionConstraints?.size) {
-              itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
-            }
-            if (itemOptionConstraints?.color) {
-              itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
-            }
-            if (itemOptionConstraints?.material) {
-              itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
-            }
-            
-            // Add global hardFacets (if not overridden by item-specific) - ONLY in non-bundle mode
-            // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
-            if (!bundleIntent.isBundle) {
-              if (hardFacets.size && !itemOptionConstraints?.size) {
-                itemGenericConstraints.push({ key: "size", value: hardFacets.size });
-              }
-              if (hardFacets.color && !itemOptionConstraints?.color) {
-                itemGenericConstraints.push({ key: "color", value: hardFacets.color });
-              }
-              if (hardFacets.material && !itemOptionConstraints?.material) {
-                itemGenericConstraints.push({ key: "material", value: hardFacets.material });
-              }
-            }
-            
-            if (itemGenericConstraints.length > 0) {
-              hasAnyConstraints = true;
-            }
-            
-            const validHandlesForItem: string[] = [];
-            const removedHandlesForItem: string[] = [];
-            
-            // Check if any candidate has facets (structured or tags) - for suspicious detection
-            let hasAnyFacets = false;
-            for (const handle of itemHandles) {
-              const candidate = candidateMap.get(handle);
-              if (!candidate) continue;
+          // REQUIREMENT 1: If hasAnyConstraints == false, skip constraint filtering entirely
+          if (!hasAnyConstraints) {
+            console.log(`[BundleValidation] skipped_constraints=true reason=no_constraints`);
+            // Keep AI handles after existence + inStock checks only
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const itemHandles = handlesByItemIndex.get(itemIdx) || [];
+              const validHandlesForItem: string[] = [];
               
-              // Check availability first
-              if (experience.inStockOnly && !candidate.available) {
-                removedHandlesForItem.push(handle);
-                continue;
-              }
-              
-              // Check if candidate has any facets (structured or tags)
-              const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
-                candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
-              const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
-              const hasTagFacets = tags.some((tag: string) => 
-                typeof tag === "string" && (
-                  tag.startsWith("cf-color-") ||
-                  tag.startsWith("cf-size-") ||
-                  tag.startsWith("cf-material-")
-                )
-              );
-              
-              if (hasStructuredFacets || hasTagFacets) {
-                hasAnyFacets = true;
-              }
-              
-              // Validate constraints using satisfiesConstraintsStructuredOrTags
-              if (itemGenericConstraints.length > 0) {
-                const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemGenericConstraints, facetVocabulary);
-                if (!constraintResult.ok) {
-                  // Invalid - remove this handle (conflict detected)
-                  removedHandlesForItem.push(handle);
+              for (const handle of itemHandles) {
+                const candidate = candidateMap.get(handle);
+                if (!candidate) continue;
+                
+                // Check availability only
+                if (experience.inStockOnly && !candidate.available) {
                   continue;
+                }
+                
+                // Valid - keep this handle
+                validHandlesForItem.push(handle);
+              }
+              
+              validatedHandlesByItem.set(itemIdx, validHandlesForItem);
+              removedHandlesByItem.set(itemIdx, []);
+            }
+            
+            // Combine validated handles from all items
+            const constraintValid: string[] = [];
+            for (const handles of validatedHandlesByItem.values()) {
+              constraintValid.push(...handles);
+            }
+            validatedHandles = constraintValid;
+            
+            // Preserve aiItemIndexMap mapping for these handles
+            // (aiItemIndexMap is already in scope from earlier)
+          } else {
+            // Constraints exist - run constraint validation
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const bundleItem = bundleIntent.items[itemIdx];
+              const itemHandles = handlesByItemIndex.get(itemIdx) || [];
+              
+              // Get merged per-item constraints (item-specific only in bundle mode, global + item-specific in non-bundle)
+              const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+              const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+              
+              // Add item-specific constraints
+              if (itemOptionConstraints?.size) {
+                itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+              }
+              if (itemOptionConstraints?.color) {
+                itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+              }
+              if (itemOptionConstraints?.material) {
+                itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+              }
+              
+              // Add global hardFacets (if not overridden by item-specific) - ONLY in non-bundle mode
+              // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
+              if (!bundleIntent.isBundle) {
+                if (hardFacets.size && !itemOptionConstraints?.size) {
+                  itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+                }
+                if (hardFacets.color && !itemOptionConstraints?.color) {
+                  itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+                }
+                if (hardFacets.material && !itemOptionConstraints?.material) {
+                  itemGenericConstraints.push({ key: "material", value: hardFacets.material });
                 }
               }
               
-              // Valid - keep this handle
-              validHandlesForItem.push(handle);
-            }
-            
-            // Update allCandidatesMissingFacets (only false if at least one item has facets)
-            if (hasAnyFacets) {
-              allCandidatesMissingFacets = false;
-            }
-            
-            validatedHandlesByItem.set(itemIdx, validHandlesForItem);
-            removedHandlesByItem.set(itemIdx, removedHandlesForItem);
-            
-            // Log per-item validation results
-            console.log(`[BundleValidation] kept=${validHandlesForItem.length} removed=${removedHandlesForItem.length} itemIndex=${itemIdx}`);
-          }
-          
-          // Combine validated handles from all items
-          const constraintValid: string[] = [];
-          for (const handles of validatedHandlesByItem.values()) {
-            constraintValid.push(...handles);
-          }
-          
-          // Determine if validation is "suspicious" (truly impossible)
-          // Only suspicious if: (1) no constraints exist, OR (2) all candidates missing facets (both structured and tags)
-          const isSuspicious = !hasAnyConstraints || (hasAnyConstraints && allCandidatesMissingFacets);
-          
-          if (constraintValid.length === 0) {
-            if (isSuspicious && finalSource === "ai" && handleExistenceValid.length > 0) {
-              // Truly suspicious - keep AI handles (but only if no constraints OR all missing facets)
-              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT validation_suspicious=true (no_constraints=${!hasAnyConstraints} all_missing_facets=${allCandidatesMissingFacets}) - keeping AI handles`);
-              const aiHandlesKept = handleExistenceValid.filter(handle => {
-                const candidate = candidateMap.get(handle);
-                if (!candidate) return false;
-                if (experience.inStockOnly && !candidate.available) return false;
-                return true;
-              });
+              const validHandlesForItem: string[] = [];
+              const removedHandlesForItem: string[] = [];
               
-              if (aiHandlesKept.length > 0) {
+              // Check if any candidate has facets (structured or tags) - for suspicious detection
+              let hasAnyFacets = false;
+              for (const handle of itemHandles) {
+                const candidate = candidateMap.get(handle);
+                if (!candidate) continue;
+                
+                // Check availability first
+                if (experience.inStockOnly && !candidate.available) {
+                  removedHandlesForItem.push(handle);
+                  continue;
+                }
+                
+                // Check if candidate has any facets (structured or tags)
+                const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
+                  candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
+                const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
+                const hasTagFacets = tags.some((tag: string) => 
+                  typeof tag === "string" && (
+                    tag.startsWith("cf-color-") ||
+                    tag.startsWith("cf-size-") ||
+                    tag.startsWith("cf-material-")
+                  )
+                );
+                
+                if (hasStructuredFacets || hasTagFacets) {
+                  hasAnyFacets = true;
+                }
+                
+                // Validate constraints using satisfiesConstraintsStructuredOrTags
+                if (itemGenericConstraints.length > 0) {
+                  const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemGenericConstraints, facetVocabulary);
+                  if (!constraintResult.ok) {
+                    // Invalid - remove this handle (conflict detected)
+                    removedHandlesForItem.push(handle);
+                    continue;
+                  }
+                }
+                
+                // Valid - keep this handle
+                validHandlesForItem.push(handle);
+              }
+              
+              // Update allCandidatesMissingFacets (only false if at least one item has facets)
+              if (hasAnyFacets) {
+                allCandidatesMissingFacets = false;
+              }
+              
+              validatedHandlesByItem.set(itemIdx, validHandlesForItem);
+              removedHandlesByItem.set(itemIdx, removedHandlesForItem);
+              
+              // Log per-item validation results
+              console.log(`[BundleValidation] kept=${validHandlesForItem.length} removed=${removedHandlesForItem.length} itemIndex=${itemIdx}`);
+            }
+            
+            // Combine validated handles from all items
+            const constraintValid: string[] = [];
+            for (const handles of validatedHandlesByItem.values()) {
+              constraintValid.push(...handles);
+            }
+            
+            // REQUIREMENT 2: If constraint validation returns 0, keep AI handles if source=ai
+            if (constraintValid.length === 0) {
+              if (finalSource === "ai" && handleExistenceValid.length > 0) {
+                // Keep AI handles (existence + inStock filtered) - treat as suspicious
+                console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT source=ai - keeping AI handles (validation_suspicious=true)`);
+                const aiHandlesKept = handleExistenceValid.filter(handle => {
+                  const candidate = candidateMap.get(handle);
+                  if (!candidate) return false;
+                  if (experience.inStockOnly && !candidate.available) return false;
+                  return true;
+                });
+                
+                // Rebuild validatedHandlesByItem from kept AI handles using aiItemIndexMap
+                const keptByItem = new Map<number, string[]>();
+                for (const handle of aiHandlesKept) {
+                  let itemIdx: number | null = null;
+            if (aiItemIndexMap && 'has' in aiItemIndexMap) {
+              const map = aiItemIndexMap as Map<string, number>;
+              if (map.has(handle)) {
+                itemIdx = map.get(handle)!;
+              }
+                  } else {
+                    // Fallback: find itemIdx from handlesByItemIndex
+                    for (const [idx, handles] of handlesByItemIndex.entries()) {
+                      if (handles.includes(handle)) {
+                        itemIdx = idx;
+                        break;
+                      }
+                    }
+                  }
+                  
+                  if (itemIdx !== null) {
+                    if (!keptByItem.has(itemIdx)) {
+                      keptByItem.set(itemIdx, []);
+                    }
+                    keptByItem.get(itemIdx)!.push(handle);
+                  }
+                }
+                
+                validatedHandlesByItem.clear();
+                for (const [idx, handles] of keptByItem.entries()) {
+                  validatedHandlesByItem.set(idx, handles);
+                }
+                
                 validatedHandles = aiHandlesKept;
                 console.log(`[Bundle Validation] (b) constraint_validation: kept ${aiHandlesKept.length} AI handles (validation_suspicious=true)`);
               } else {
+                // Not AI source - validation correctly filtered invalid handles
+                console.warn(`[Bundle Validation] (b) constraint_validation: 0 handles pass constraints - removing invalid handles (NOT suspicious)`);
                 validatedHandles = [];
               }
             } else {
-              // Not suspicious - validation correctly filtered invalid handles
-              console.warn(`[Bundle Validation] (b) constraint_validation: 0 handles pass constraints - removing invalid handles (NOT suspicious)`);
-              validatedHandles = [];
-            }
-          } else {
-            // Some handles passed - use them
-            validatedHandles = constraintValid;
-            
-            // Check if any items need refill (missing handles after validation)
-            const needsRefill = Array.from(validatedHandlesByItem.entries()).some(([idx, handles]) => handles.length === 0);
-            
-            if (needsRefill && finalSource === "ai") {
+              // Some handles passed - use them
+              validatedHandles = constraintValid;
+              
+              // Check if any items need refill (missing handles after validation)
+              const needsRefill = Array.from(validatedHandlesByItem.entries()).some(([idx, handles]) => handles.length === 0);
+              
+              if (needsRefill && finalSource === "ai") {
               // Refill per-item from constraint-gated itemPools
               // Build itemPools from sortedCandidates with constraints (bundleItemPools may not be in scope here)
               const refillItemPools = new Map<number, EnrichedCandidate[]>();
@@ -8620,13 +8687,6 @@ async function processSessionInBackground({
               validatedHandles = constraintValid;
             }
           }
-          
-          // Log final per-item counts
-          const perItemCounts = Array.from(validatedHandlesByItem.entries()).map(([idx, handles]) => {
-            const itemName = bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
-            return `${itemName}=${handles.length}`;
-          }).join(" ");
-          console.log(`[Bundle Validation] (b) per_item_counts: ${perItemCounts}`);
         }
       } else {
         // Single-item validation (non-bundle or trustFallback)
@@ -9118,13 +9178,9 @@ async function processSessionInBackground({
         finalHandles = finalHandlesGuaranteed;
       }
       
-      // Hard guard: If validation failed AND we don't have AI handles, this is a true NO_MATCH
-      if (finalSource === "ai" && finalHandles.length === 0 && finalHandlesGuaranteed.length === 0) {
-        // Both AI and validation returned 0 - this is a true NO_MATCH
-        // But if we have original AI handles, we should have kept them above
-        // This log indicates a problem - validation cleared everything including AI handles
-        console.warn("[Bundle] ERROR: AI source but validation returned 0 handles - treating as NO_MATCH (DO NOT restore invalid handles)");
-      }
+      // REQUIREMENT 2: Remove downstream code that converts 0 validated handles into NO_MATCH for AI source
+      // This is now handled in validation block above - if source=ai and validation returns 0, we keep AI handles
+      // No need for this guard anymore
 
       // Prioritize AI reasoning over technical matching details
       // Only add trust signals if AI didn't provide reasoning (fallback case)
@@ -9186,10 +9242,10 @@ async function processSessionInBackground({
       }
       
       // ============================================
-      // POST-DIVERSITY REFILL (for bundle mode)
+      // POST-DIVERSITY REFILL (for bundle mode) - REQUIREMENT 3: Per-item refill from itemGatedPools
       // ============================================
       // If diversity reduced handles below requestedCount, refill back to requestedCount
-      // by selecting additional valid handles from remaining candidates while respecting per-item slotPlan and constraints
+      // by selecting additional valid handles from itemGatedPools while respecting per-item slotPlan and constraints
       if (isBundleMode && diverseHandles.length < finalResultCount && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
         const beforeRefill = diverseHandles.length;
         const usedHandlesSet = new Set(diverseHandles);
@@ -9198,45 +9254,79 @@ async function processSessionInBackground({
         // Get slotPlan for bundle items
         const slotPlan = allocateSlotsAcrossTypes(bundleIntent.items, finalResultCount);
         
-        // Count current handles per item type
+        // Count current handles per item type using aiItemIndexMap (preferred) or inferring
         const handlesPerItem = new Map<number, string[]>();
         diverseHandles.forEach(handle => {
-          const candidate = allCandidatesEnriched.find(c => c.handle === handle);
-          if (candidate) {
-            // Find which bundle item this handle matches
-            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-              const item = bundleIntent.items[itemIdx];
-              const itemHardTerms = item.hardTerms || [];
-              const slotDescriptor = itemHardTerms.join(" ");
-              const slotScore = scoreProductForSlot(candidate, slotDescriptor);
-              
-              if (slotScore >= 0.1) {
-                // This handle matches this item type
-                if (!handlesPerItem.has(itemIdx)) {
-                  handlesPerItem.set(itemIdx, []);
+          let itemIdx: number | null = null;
+          // Use aiItemIndexMap if available (preferred)
+          if (aiItemIndexMap && aiItemIndexMap.has(handle)) {
+            itemIdx = aiItemIndexMap.get(handle)!;
+          } else {
+            // Fallback: infer from candidate matching
+            const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+            if (candidate) {
+              for (let idx = 0; idx < bundleIntent.items.length; idx++) {
+                const item = bundleIntent.items[idx];
+                const itemHardTerms = item.hardTerms || [];
+                const slotDescriptor = itemHardTerms.join(" ");
+                const slotScore = scoreProductForSlot(candidate, slotDescriptor);
+                
+                if (slotScore >= 0.1) {
+                  itemIdx = idx;
+                  break;
                 }
-                handlesPerItem.get(itemIdx)!.push(handle);
-                break; // Only count once per handle
               }
             }
           }
+          
+          if (itemIdx !== null) {
+            if (!handlesPerItem.has(itemIdx)) {
+              handlesPerItem.set(itemIdx, []);
+            }
+            handlesPerItem.get(itemIdx)!.push(handle);
+          }
         });
         
-        // Refill by item type, respecting slotPlan
-        const refillHandles: string[] = [];
-        for (let itemIdx = 0; itemIdx < bundleIntent.items.length && refillHandles.length < refillNeeded; itemIdx++) {
-          const item = bundleIntent.items[itemIdx];
+        // REQUIREMENT 3: Refill per-item from itemGatedPools (not global remaining_candidates)
+        const refillHandlesByItem = new Map<number, string[]>();
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
           const currentCount = handlesPerItem.get(itemIdx)?.length || 0;
           const targetSlots = slotPlan.get(itemIdx) || 0;
           const neededForThisItem = Math.max(0, targetSlots - currentCount);
           
           if (neededForThisItem > 0) {
+            // Get item pool from itemGatedPools (built earlier in bundle flow)
+            const itemPoolData = itemGatedPools.find(pool => pool.itemIndex === itemIdx);
+            const itemPool = itemPoolData?.candidates || [];
+            
+            if (itemPool.length === 0) {
+              // Fallback: build itemPool from allCandidatesEnriched if itemGatedPools not available
+              const item = bundleIntent.items[itemIdx];
+              const itemHardTerms = item.hardTerms || [];
+              const fallbackPool: EnrichedCandidate[] = [];
+              for (const c of allCandidatesEnriched) {
+                const haystack = [
+                  c.title || "",
+                  c.productType || "",
+                  (c.tags || []).join(" "),
+                  c.vendor || "",
+                  c.searchText || "",
+                ].join(" ");
+                const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (hasItemMatch) {
+                  fallbackPool.push(c);
+                }
+              }
+              itemPool.push(...fallbackPool);
+            }
+            
             // Get item-specific constraints for gating
+            const item = bundleIntent.items[itemIdx];
             const itemConstraints = item.constraints;
             const itemOptionConstraints = itemConstraints?.optionConstraints;
             const itemHardTerms = item.hardTerms || [];
             
-            // Build merged per-item constraints (global + item-specific)
+            // Build merged per-item constraints (item-specific only in bundle mode)
             const itemGenericConstraints: Array<{ key: string; value: string }> = [];
             
             // Add item-specific constraints
@@ -9250,42 +9340,23 @@ async function processSessionInBackground({
               itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
             }
             
-            // Add global hardFacets (if not overridden by item-specific)
-            if (hardFacets.size && !itemOptionConstraints?.size) {
-              itemGenericConstraints.push({ key: "size", value: hardFacets.size });
-            }
-            if (hardFacets.color && !itemOptionConstraints?.color) {
-              itemGenericConstraints.push({ key: "color", value: hardFacets.color });
-            }
-            if (hardFacets.material && !itemOptionConstraints?.material) {
-              itemGenericConstraints.push({ key: "material", value: hardFacets.material });
-            }
-            
-            // Find candidates that match this item type and constraints (constraint-aware per item)
-            // Ensure refill candidates come from correct itemPool AND pass constraints
-            // Build itemPool from allCandidatesEnriched filtered by anchor terms (bundleItemPools may not be in scope here)
-            const itemPool: EnrichedCandidate[] = [];
-            for (const c of allCandidatesEnriched) {
-              const haystack = [
-                c.title || "",
-                c.productType || "",
-                (c.tags || []).join(" "),
-                c.vendor || "",
-                c.searchText || "",
-              ].join(" ");
-              const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-              if (hasItemMatch) {
-                itemPool.push(c);
+            // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
+            if (!bundleIntent.isBundle) {
+              if (hardFacets.size && !itemOptionConstraints?.size) {
+                itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+              }
+              if (hardFacets.color && !itemOptionConstraints?.color) {
+                itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+              }
+              if (hardFacets.material && !itemOptionConstraints?.material) {
+                itemGenericConstraints.push({ key: "material", value: hardFacets.material });
               }
             }
+            
+            // Filter candidates from itemPool by constraints and availability
             const itemCandidates: EnrichedCandidate[] = [];
             for (const c of itemPool) {
-              if (usedHandlesSet.has(c.handle) || refillHandles.includes(c.handle)) continue;
-              
-              // Apply token-based slot matching (anchor terms)
-              const slotDescriptor = itemHardTerms.join(" ");
-              const slotScore = scoreProductForSlot(c, slotDescriptor);
-              if (slotScore < 0.1) continue;
+              if (usedHandlesSet.has(c.handle) || refillHandlesByItem.get(itemIdx)?.includes(c.handle)) continue;
               
               // Check constraints using satisfiesConstraintsStructuredOrTags (constraint-aware)
               if (itemGenericConstraints.length > 0) {
@@ -9304,10 +9375,9 @@ async function processSessionInBackground({
               itemCandidates.push(c);
             }
             
-            // Sort candidates
+            // Sort candidates by slot score (descending), then price (ascending)
             const sortedItemCandidates = itemCandidates
               .sort((a, b) => {
-                // Sort by slot score (descending), then price (ascending)
                 const slotDescriptor = itemHardTerms.join(" ");
                 const scoreA = scoreProductForSlot(a, slotDescriptor);
                 const scoreB = scoreProductForSlot(b, slotDescriptor);
@@ -9320,29 +9390,154 @@ async function processSessionInBackground({
               })
               .slice(0, neededForThisItem);
             
-            refillHandles.push(...itemCandidates.map(c => c.handle));
+            const refillHandlesForItem = sortedItemCandidates.map(c => c.handle);
+            refillHandlesByItem.set(itemIdx, refillHandlesForItem);
+            
+            // Update aiItemIndexMap for refilled handles
+            for (const handle of refillHandlesForItem) {
+              if (aiItemIndexMap) {
+                aiItemIndexMap.set(handle, itemIdx);
+              }
+            }
+            
+            console.log(`[BundleRefill] itemIndex=${itemIdx} added=${refillHandlesForItem.length} reason=needed_${neededForThisItem}_slots`);
           }
         }
         
-        // Add refilled handles to diverseHandles
-        if (refillHandles.length > 0) {
-          diverseHandles = [...diverseHandles, ...refillHandles].slice(0, finalResultCount);
-          // Diversity refill is NOT a fallback - it's just filling gaps from AI result
-          // Only mark as fallback if we truly fell back from AI (AI failed or trustFallback=true)
-          // Don't set usedRefillFromRemaining here - it's just diversity refill, not a true fallback
-          const aiCoreUsed = finalSource === "ai" && !trustFallback;
-          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${refillHandles.length} source=remaining_candidates aiCoreUsed=${aiCoreUsed}`);
-          if (aiCoreUsed) {
-            console.log(`[ResultSource] final=ai aiCoreUsed=true diversityRefill=true refillCount=${refillHandles.length}`);
+        // REQUIREMENT 4: Assemble final handles by interleaving per-item lists (preserve per-item balance)
+        // DO NOT just slice a flat list - that can remove the only shirts
+        const allRefillHandles: string[] = [];
+        for (const handles of refillHandlesByItem.values()) {
+          allRefillHandles.push(...handles);
+        }
+        
+        // Interleave diverseHandles and refillHandles to preserve per-item balance
+        // First, group diverseHandles by itemIdx
+        const diverseHandlesByItem = new Map<number, string[]>();
+        for (const handle of diverseHandles) {
+          let itemIdx: number | null = null;
+            if (aiItemIndexMap && 'has' in aiItemIndexMap) {
+              const map = aiItemIndexMap as Map<string, number>;
+              if (map.has(handle)) {
+                itemIdx = map.get(handle)!;
+              }
+          } else {
+            // Fallback: infer from candidate
+            const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+            if (candidate) {
+              for (let idx = 0; idx < bundleIntent.items.length; idx++) {
+                const item = bundleIntent.items[idx];
+                const itemHardTerms = item.hardTerms || [];
+                const slotDescriptor = itemHardTerms.join(" ");
+                const slotScore = scoreProductForSlot(candidate, slotDescriptor);
+                if (slotScore >= 0.1) {
+                  itemIdx = idx;
+                  break;
+                }
+              }
+            }
           }
-        } else {
-          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${beforeRefill} added=0 reason=no_valid_candidates`);
+          
+          if (itemIdx !== null) {
+            if (!diverseHandlesByItem.has(itemIdx)) {
+              diverseHandlesByItem.set(itemIdx, []);
+            }
+            diverseHandlesByItem.get(itemIdx)!.push(handle);
+          }
+        }
+        
+        // Build final handles by interleaving per-item (round-robin style, respecting slotPlan)
+        const finalHandlesByItem = new Map<number, string[]>();
+        for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+          const diverse = diverseHandlesByItem.get(itemIdx) || [];
+          const refill = refillHandlesByItem.get(itemIdx) || [];
+          finalHandlesByItem.set(itemIdx, [...diverse, ...refill]);
+        }
+        
+        // Interleave handles per-item to preserve balance (ensure at least 1 per type if available)
+        const interleavedHandles: string[] = [];
+        const maxPerItem = Math.max(...Array.from(finalHandlesByItem.values()).map(h => h.length));
+        
+        for (let round = 0; round < maxPerItem && interleavedHandles.length < finalResultCount; round++) {
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length && interleavedHandles.length < finalResultCount; itemIdx++) {
+            const handles = finalHandlesByItem.get(itemIdx) || [];
+            if (round < handles.length) {
+              interleavedHandles.push(handles[round]);
+            }
+          }
+        }
+        
+        // If still under target, add remaining handles in order
+        if (interleavedHandles.length < finalResultCount) {
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length && interleavedHandles.length < finalResultCount; itemIdx++) {
+            const handles = finalHandlesByItem.get(itemIdx) || [];
+            for (const handle of handles) {
+              if (!interleavedHandles.includes(handle) && interleavedHandles.length < finalResultCount) {
+                interleavedHandles.push(handle);
+              }
+            }
+          }
+        }
+        
+        diverseHandles = interleavedHandles.slice(0, finalResultCount);
+        
+        // Log per-item counts after refill
+        const perItemCountsAfterRefill = Array.from(finalHandlesByItem.entries()).map(([idx, handles]) => {
+          return `item${idx}=${handles.length}`;
+        }).join(" ");
+        console.log(`[BundleRefill] per_item_after_refill ${perItemCountsAfterRefill}`);
+        
+        const aiCoreUsed = finalSource === "ai" && !trustFallback;
+        console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${allRefillHandles.length} source=itemGatedPools aiCoreUsed=${aiCoreUsed}`);
+        if (aiCoreUsed) {
+          console.log(`[ResultSource] final=ai aiCoreUsed=true diversityRefill=true refillCount=${allRefillHandles.length}`);
         }
       }
       
       // Update finalHandles with diverse result (potentially refilled)
       finalHandles = diverseHandles;
       finalHandlesGuaranteed = diverseHandles;
+      
+      // REQUIREMENT 5: Log final per-item counts after all processing
+      if (isBundleMode && bundleIntent.isBundle && bundleIntent.items.length >= 2) {
+        const finalHandlesByItemForLog = new Map<number, string[]>();
+        for (const handle of finalHandles) {
+          let itemIdx: number | null = null;
+            if (aiItemIndexMap && 'has' in aiItemIndexMap) {
+              const map = aiItemIndexMap as Map<string, number>;
+              if (map.has(handle)) {
+                itemIdx = map.get(handle)!;
+              }
+          } else {
+            // Fallback: infer from candidate
+            const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+            if (candidate) {
+              for (let idx = 0; idx < bundleIntent.items.length; idx++) {
+                const item = bundleIntent.items[idx];
+                const itemHardTerms = item.hardTerms || [];
+                const slotDescriptor = itemHardTerms.join(" ");
+                const slotScore = scoreProductForSlot(candidate, slotDescriptor);
+                if (slotScore >= 0.1) {
+                  itemIdx = idx;
+                  break;
+                }
+              }
+            }
+          }
+          
+          if (itemIdx !== null) {
+            if (!finalHandlesByItemForLog.has(itemIdx)) {
+              finalHandlesByItemForLog.set(itemIdx, []);
+            }
+            finalHandlesByItemForLog.get(itemIdx)!.push(handle);
+          }
+        }
+        
+        const perItemCountsFinal = Array.from(finalHandlesByItemForLog.entries()).map(([idx, handles]) => {
+          return `item${idx}=${handles.length}`;
+        }).join(" ");
+        console.log(`[BundleFinal] per_item_final ${perItemCountsFinal} total=${finalHandles.length}`);
+      }
 
       // Final reasoning string (prioritize AI reasoning, make notes customer-friendly)
       // Check if reasoningParts contains AI-generated reasoning (human-like, professional)
