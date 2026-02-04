@@ -8283,315 +8283,239 @@ async function processSessionInBackground({
           console.warn(`[Bundle Validation] (a) handle_existence FAILED: 0 handles exist - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
           validatedHandles = [];
         } else {
-          // (b) Constraint validation: Check availability and facets per item
-          const constraintValid: string[] = [];
-          const validationDebugLogs: Array<{
-            handle: string;
-            inferredCanonicalType: string;
-            matchedItemIdx: number | null;
-            requestedItemType: string | null;
-            facetChecks: {
-              size?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-              color?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-              material?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-            };
-            availabilityCheck: { required: boolean; candidateAvailable: boolean; passed: boolean };
-            finalResult: "passed" | "failed" | "skipped";
-            failureReason?: string;
-          }> = [];
-          
+          // (b) Per-item constraint validation: Validate each handle against its item's merged constraints using satisfiesConstraintsStructuredOrTags()
+          // Group handles by itemIndex first (using same mapping as grouping)
+          const handlesByItemIndex = new Map<number, string[]>();
           for (const handle of handleExistenceValid) {
             const candidate = candidateMap.get(handle);
-            if (!candidate) {
-              validationDebugLogs.push({
-                handle,
-                inferredCanonicalType: "unknown",
-                matchedItemIdx: null,
-                requestedItemType: null,
-                facetChecks: {},
-                availabilityCheck: { required: false, candidateAvailable: false, passed: false },
-                finalResult: "skipped",
-                failureReason: "candidate not found in map"
-              });
-              continue;
-            }
+            if (!candidate) continue;
             
-            // Infer canonical type using consistent function
-            const inferredCanonicalType = inferCanonicalType(candidate);
-            
-            // Find which bundle item this handle matches using robust matcher
-            let matchedItemIdx: number | null = null;
-            let requestedItemType: string | null = null;
+            // Find which bundle item this handle matches
             for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
               const bundleItem = bundleIntent.items[itemIdx];
               if (matchesBundleItem(candidate, bundleItem)) {
-                matchedItemIdx = itemIdx;
-                requestedItemType = bundleItem.hardTerms[0] || (bundleItem as any).canonicalType || `item${itemIdx}`;
-                break;
+                if (!handlesByItemIndex.has(itemIdx)) {
+                  handlesByItemIndex.set(itemIdx, []);
+                }
+                handlesByItemIndex.get(itemIdx)!.push(handle);
+                break; // Handle can only match one item type
               }
-            }
-            
-            if (matchedItemIdx === null) {
-              validationDebugLogs.push({
-                handle,
-                inferredCanonicalType,
-                matchedItemIdx: null,
-                requestedItemType: null,
-                facetChecks: {},
-                availabilityCheck: { required: false, candidateAvailable: candidate.available || false, passed: false },
-                finalResult: "failed",
-                failureReason: "does not match any bundle item type"
-              });
-              continue; // Doesn't match any item type
-            }
-            
-            // Check constraints for this item
-            const bundleItem = bundleIntent.items[matchedItemIdx];
-            const itemConstraints = bundleItem.constraints;
-            const itemOptionConstraints = itemConstraints?.optionConstraints;
-            const itemFacets = {
-              size: itemOptionConstraints?.size ?? null,
-              color: itemOptionConstraints?.color ?? null,
-              material: itemOptionConstraints?.material ?? null,
-            };
-            
-            // Build debug info for facet checks
-            const facetChecks: {
-              size?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-              color?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-              material?: { required: string | null; candidateHas: boolean; passed: boolean; reason?: string };
-            } = {};
-            
-            // Check availability (if inStockOnly is enabled)
-            const availabilityCheck = {
-              required: experience.inStockOnly || false,
-              candidateAvailable: candidate.available || false,
-              passed: !experience.inStockOnly || candidate.available || false
-            };
-            
-            if (experience.inStockOnly && !candidate.available) {
-              validationDebugLogs.push({
-                handle,
-                inferredCanonicalType,
-                matchedItemIdx,
-                requestedItemType,
-                facetChecks,
-                availabilityCheck,
-                finalResult: "failed",
-                failureReason: "availability check failed (inStockOnly=true, candidate.available=false)"
-              });
-              continue; // Skip unavailable items
-            }
-            
-            // Check facets using satisfiesConstraintsStructuredOrTags (consistent with validation)
-            // Build constraints from itemFacets
-            const itemFacetConstraints: Array<{ key: string; value: string }> = [];
-            if (itemFacets.size) itemFacetConstraints.push({ key: "size", value: itemFacets.size });
-            if (itemFacets.color) itemFacetConstraints.push({ key: "color", value: itemFacets.color });
-            if (itemFacets.material) itemFacetConstraints.push({ key: "material", value: itemFacets.material });
-            
-            let passesFacets = true;
-            let facetFailureReason: string | undefined;
-            
-            if (itemFacetConstraints.length > 0) {
-              const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemFacetConstraints, facetVocabulary);
-              if (!constraintResult.ok) {
-                passesFacets = false;
-                if (constraintResult.conflict) {
-                  facetFailureReason = `${constraintResult.conflict.facet} mismatch: required=${constraintResult.conflict.expected}, candidate has=${constraintResult.conflict.actual} (source=${constraintResult.conflict.source})`;
-                  
-                  // Build facetChecks for logging (backward compatibility)
-                  if (constraintResult.conflict.facet === "size") {
-                    facetChecks.size = {
-                      required: itemFacets.size || null,
-                      candidateHas: candidate.sizes.length > 0,
-                      passed: false,
-                      reason: facetFailureReason
-                    };
-                  } else if (constraintResult.conflict.facet === "color") {
-                    facetChecks.color = {
-                      required: itemFacets.color || null,
-                      candidateHas: candidate.colors.length > 0,
-                      passed: false,
-                      reason: facetFailureReason
-                    };
-                  } else if (constraintResult.conflict.facet === "material") {
-                    facetChecks.material = {
-                      required: itemFacets.material || null,
-                      candidateHas: candidate.materials.length > 0,
-                      passed: false,
-                      reason: facetFailureReason
-                    };
-                  }
-                } else {
-                  facetFailureReason = "facet check failed (no structured or tag match)";
-                }
-              } else {
-                // Passed - build facetChecks for logging
-                if (itemFacets.size) {
-                  facetChecks.size = {
-                    required: itemFacets.size,
-                    candidateHas: candidate.sizes.length > 0 || true, // May be in tags
-                    passed: true,
-                    reason: undefined
-                  };
-                }
-                if (itemFacets.color) {
-                  facetChecks.color = {
-                    required: itemFacets.color,
-                    candidateHas: candidate.colors.length > 0 || true, // May be in tags
-                    passed: true,
-                    reason: undefined
-                  };
-                }
-                if (itemFacets.material) {
-                  facetChecks.material = {
-                    required: itemFacets.material,
-                    candidateHas: candidate.materials.length > 0 || true, // May be in tags
-                    passed: true,
-                    reason: undefined
-                  };
-                }
-              }
-            } else {
-              // No constraints - pass
-              passesFacets = true;
-            }
-            
-            if (passesFacets) {
-              constraintValid.push(handle);
-              validationDebugLogs.push({
-                handle,
-                inferredCanonicalType,
-                matchedItemIdx,
-                requestedItemType,
-                facetChecks,
-                availabilityCheck,
-                finalResult: "passed"
-              });
-            } else {
-              validationDebugLogs.push({
-                handle,
-                inferredCanonicalType,
-                matchedItemIdx,
-                requestedItemType,
-                facetChecks,
-                availabilityCheck,
-                finalResult: "failed",
-                failureReason: facetFailureReason || "facet check failed"
-              });
             }
           }
           
-          // Log per-handle debug info
-          console.log(`[Bundle Validation] (b) per_handle_debug:`, JSON.stringify(validationDebugLogs, null, 2));
-          console.log(`[Bundle Validation] (b) constraint_validation: ${constraintValid.length} out of ${handleExistenceValid.length} handles pass constraints`);
+          // Validate per-item and remove invalid handles (conflicts)
+          const validatedHandlesByItem = new Map<number, string[]>();
+          const removedHandlesByItem = new Map<number, string[]>();
+          let allCandidatesMissingFacets = true; // Track if ALL candidates are missing facets (for suspicious check)
+          let hasAnyConstraints = false; // Track if ANY item has constraints
+          
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const bundleItem = bundleIntent.items[itemIdx];
+            const itemHandles = handlesByItemIndex.get(itemIdx) || [];
+            
+            // Get merged per-item constraints (global + item-specific)
+            const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+            const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+            
+            // Add item-specific constraints
+            if (itemOptionConstraints?.size) {
+              itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+            }
+            if (itemOptionConstraints?.color) {
+              itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+            }
+            if (itemOptionConstraints?.material) {
+              itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+            }
+            
+            // Add global hardFacets (if not overridden by item-specific)
+            if (hardFacets.size && !itemOptionConstraints?.size) {
+              itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+            }
+            if (hardFacets.color && !itemOptionConstraints?.color) {
+              itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+            }
+            if (hardFacets.material && !itemOptionConstraints?.material) {
+              itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+            }
+            
+            if (itemGenericConstraints.length > 0) {
+              hasAnyConstraints = true;
+            }
+            
+            const validHandlesForItem: string[] = [];
+            const removedHandlesForItem: string[] = [];
+            
+            // Check if any candidate has facets (structured or tags) - for suspicious detection
+            let hasAnyFacets = false;
+            for (const handle of itemHandles) {
+              const candidate = candidateMap.get(handle);
+              if (!candidate) continue;
+              
+              // Check availability first
+              if (experience.inStockOnly && !candidate.available) {
+                removedHandlesForItem.push(handle);
+                continue;
+              }
+              
+              // Check if candidate has any facets (structured or tags)
+              const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
+                candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
+              const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
+              const hasTagFacets = tags.some((tag: string) => 
+                typeof tag === "string" && (
+                  tag.startsWith("cf-color-") ||
+                  tag.startsWith("cf-size-") ||
+                  tag.startsWith("cf-material-")
+                )
+              );
+              
+              if (hasStructuredFacets || hasTagFacets) {
+                hasAnyFacets = true;
+              }
+              
+              // Validate constraints using satisfiesConstraintsStructuredOrTags
+              if (itemGenericConstraints.length > 0) {
+                const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemGenericConstraints, facetVocabulary);
+                if (!constraintResult.ok) {
+                  // Invalid - remove this handle (conflict detected)
+                  removedHandlesForItem.push(handle);
+                  continue;
+                }
+              }
+              
+              // Valid - keep this handle
+              validHandlesForItem.push(handle);
+            }
+            
+            // Update allCandidatesMissingFacets (only false if at least one item has facets)
+            if (hasAnyFacets) {
+              allCandidatesMissingFacets = false;
+            }
+            
+            validatedHandlesByItem.set(itemIdx, validHandlesForItem);
+            removedHandlesByItem.set(itemIdx, removedHandlesForItem);
+            
+            // Log per-item validation results
+            console.log(`[BundleValidation] kept=${validHandlesForItem.length} removed=${removedHandlesForItem.length} itemIndex=${itemIdx}`);
+          }
+          
+          // Combine validated handles from all items
+          const constraintValid: string[] = [];
+          for (const handles of validatedHandlesByItem.values()) {
+            constraintValid.push(...handles);
+          }
+          
+          // Determine if validation is "suspicious" (truly impossible)
+          // Only suspicious if: (1) no constraints exist, OR (2) all candidates missing facets (both structured and tags)
+          const isSuspicious = !hasAnyConstraints || (hasAnyConstraints && allCandidatesMissingFacets);
           
           if (constraintValid.length === 0) {
-            // CRITICAL FIX: If source=ai and validation would return 0 handles, do NOT mark NO_MATCH
-            // Instead: keep the AI handles (after availability/dedupe checks), log validation_suspicious=true, and proceed
-            if (finalSource === "ai" && handleExistenceValid.length > 0) {
-              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT source=ai - keeping AI handles (validation_suspicious=true)`);
-              // Keep AI handles that exist and are available (if inStockOnly is enabled)
+            if (isSuspicious && finalSource === "ai" && handleExistenceValid.length > 0) {
+              // Truly suspicious - keep AI handles (but only if no constraints OR all missing facets)
+              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT validation_suspicious=true (no_constraints=${!hasAnyConstraints} all_missing_facets=${allCandidatesMissingFacets}) - keeping AI handles`);
               const aiHandlesKept = handleExistenceValid.filter(handle => {
                 const candidate = candidateMap.get(handle);
                 if (!candidate) return false;
-                // Only check availability (if inStockOnly is enabled)
                 if (experience.inStockOnly && !candidate.available) return false;
                 return true;
               });
               
               if (aiHandlesKept.length > 0) {
                 validatedHandles = aiHandlesKept;
-                console.log(`[Bundle Validation] (b) constraint_validation: kept ${aiHandlesKept.length} AI handles despite validation failure (validation_suspicious=true)`);
+                console.log(`[Bundle Validation] (b) constraint_validation: kept ${aiHandlesKept.length} AI handles (validation_suspicious=true)`);
               } else {
-                // No available AI handles - fallback to existence-valid
-                validatedHandles = handleExistenceValid;
-                usedValidationFallback = true;
-                console.log(`[Bundle Validation] (b) constraint_validation: no available AI handles, using existence-valid fallback (${handleExistenceValid.length} handles)`);
-              }
-            } else {
-              // Not AI source or no handles exist - use fallback logic
-              console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
-              // Fallback to existenceValid (handles that exist + are available) and set resultSource to "fallback"
-              const existenceValidFallback = handleExistenceValid.filter(handle => {
-                const candidate = candidateMap.get(handle);
-                if (!candidate) return false;
-                // Only check availability (if inStockOnly is enabled)
-                if (experience.inStockOnly && !candidate.available) return false;
-                return true;
-              });
-              
-              if (existenceValidFallback.length > 0) {
-                // Use existence-valid handles as fallback
-                validatedHandles = existenceValidFallback;
-                // Mark that we used validation fallback (resultSource will be set to "fallback" later, not "ai")
-                usedValidationFallback = true;
-                console.log(`[Bundle Validation] (b) constraint_validation: using existence-valid fallback (${existenceValidFallback.length} handles)`);
-              } else {
-                // No fallback available - return NO_MATCH
                 validatedHandles = [];
               }
+            } else {
+              // Not suspicious - validation correctly filtered invalid handles
+              console.warn(`[Bundle Validation] (b) constraint_validation: 0 handles pass constraints - removing invalid handles (NOT suspicious)`);
+              validatedHandles = [];
             }
           } else {
-            // (c) Bundle-type validation: Ensure each requested type has >=1 handle
-            const handlesByItemType = new Map<number, string[]>();
-            for (const handle of constraintValid) {
-              const candidate = candidateMap.get(handle);
-              if (!candidate) continue;
-              
-              // Find which bundle item this handle matches using robust matcher
-              for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-                const bundleItem = bundleIntent.items[itemIdx];
-                if (matchesBundleItem(candidate, bundleItem)) {
-                  if (!handlesByItemType.has(itemIdx)) {
-                    handlesByItemType.set(itemIdx, []);
+            // Some handles passed - use them
+            validatedHandles = constraintValid;
+            
+            // Check if any items need refill (missing handles after validation)
+            const needsRefill = Array.from(validatedHandlesByItem.entries()).some(([idx, handles]) => handles.length === 0);
+            
+            if (needsRefill && finalSource === "ai") {
+              // Refill per-item from constraint-gated itemPools
+              // Build itemPools from sortedCandidates with constraints (bundleItemPools may not be in scope here)
+              const refillItemPools = new Map<number, EnrichedCandidate[]>();
+              for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
+                const bundleItem = bundleItemsWithBudget[itemIdx];
+                const itemHardTerms = bundleItem.hardTerms;
+                const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+                const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+                
+                if (itemOptionConstraints?.size) itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+                if (itemOptionConstraints?.color) itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+                if (itemOptionConstraints?.material) itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+                
+                if (hardFacets.size && !itemOptionConstraints?.size) itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+                if (hardFacets.color && !itemOptionConstraints?.color) itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+                if (hardFacets.material && !itemOptionConstraints?.material) itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+                
+                const itemPool: EnrichedCandidate[] = [];
+                for (const c of sortedCandidates) {
+                  const haystack = [
+                    c.title || "",
+                    c.productType || "",
+                    (c.tags || []).join(" "),
+                    c.vendor || "",
+                    c.searchText || "",
+                  ].join(" ");
+                  
+                  const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                  if (!hasItemMatch) continue;
+                  
+                  if (itemGenericConstraints.length > 0) {
+                    const constraintResult = await satisfiesConstraintsStructuredOrTags(c, itemGenericConstraints, facetVocabulary);
+                    if (!constraintResult.ok) continue;
                   }
-                  handlesByItemType.get(itemIdx)!.push(handle);
-                  break; // Handle can only match one item type
+                  
+                  itemPool.push(c);
+                }
+                
+                refillItemPools.set(itemIdx, itemPool);
+              }
+              
+              // Refill each itemIndex independently from its constraint-gated itemPool
+              const usedRefillHandles = new Set(constraintValid);
+              for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+                const currentValid = validatedHandlesByItem.get(itemIdx) || [];
+                const removed = removedHandlesByItem.get(itemIdx) || [];
+                
+                if (currentValid.length === 0 && removed.length > 0) {
+                  // This item needs refill - get from its itemPool
+                  const itemPool = refillItemPools.get(itemIdx) || [];
+                  const refillCandidates = itemPool
+                    .filter((c: EnrichedCandidate) => !usedRefillHandles.has(c.handle) && (experience.inStockOnly ? c.available : true))
+                    .slice(0, Math.ceil(finalResultCount / bundleIntent.items.length)); // Rough target per item
+                  
+                  if (refillCandidates.length > 0) {
+                    const refillHandles = refillCandidates.map((c: EnrichedCandidate) => c.handle);
+                    constraintValid.push(...refillHandles);
+                    refillHandles.forEach((h: string) => usedRefillHandles.add(h));
+                    validatedHandlesByItem.set(itemIdx, refillHandles);
+                    console.log(`[BundleRefill] itemIndex=${itemIdx} added=${refillHandles.length} reason=validation_removed_all_handles`);
+                  } else {
+                    console.log(`[BundleRefill] itemIndex=${itemIdx} added=0 reason=no_valid_candidates_in_pool`);
+                  }
                 }
               }
-            }
-            
-            // Check if each requested type has at least 1 handle
-            const missingTypes: number[] = [];
-            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
-              const handlesForType = handlesByItemType.get(itemIdx) || [];
-              if (handlesForType.length === 0) {
-                missingTypes.push(itemIdx);
-              }
-            }
-            
-            if (missingTypes.length === bundleIntent.items.length) {
-              // All types missing - but if source=ai and we have handles, keep them
-              if (finalSource === "ai" && constraintValid.length > 0) {
-                console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing BUT source=ai - keeping AI handles (validation_suspicious=true)`);
-                validatedHandles = constraintValid; // Keep constraint-valid handles even if type validation fails
-              } else {
-                // Not AI source or no handles - treat as NO_MATCH
-                console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
-                validatedHandles = [];
-              }
-            } else if (missingTypes.length > 0) {
-              // Partial bundle - keep handles that match existing types
-              console.log(`[Bundle Validation] (c) bundle_type_validation: partial bundle - ${missingTypes.length} types missing, keeping ${constraintValid.length} handles`);
-              validatedHandles = constraintValid; // Keep all constraint-valid handles (partial bundle is OK)
-            } else {
-              // All types present
-              console.log(`[Bundle Validation] (c) bundle_type_validation: all ${bundleIntent.items.length} types present`);
+              
               validatedHandles = constraintValid;
             }
-            
-            // Log per-item counts for bundle-type validation (using inferCanonicalType for consistency)
-            const perItemCounts = Array.from(handlesByItemType.entries()).map(([idx, handles]) => {
-              // Use inferCanonicalType for consistent type inference
-              const firstHandle = handles[0];
-              const firstCandidate = firstHandle ? candidateMap.get(firstHandle) : null;
-              const inferredType = firstCandidate ? inferCanonicalType(firstCandidate) : bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
-              return `${inferredType}=${handles.length}`;
-            }).join(" ");
-            console.log(`[Bundle Validation] (c) per_item_counts: ${perItemCounts}`);
           }
+          
+          // Log final per-item counts
+          const perItemCounts = Array.from(validatedHandlesByItem.entries()).map(([idx, handles]) => {
+            const itemName = bundleIntent.items[idx]?.hardTerms[0] || `item${idx}`;
+            return `${itemName}=${handles.length}`;
+          }).join(" ");
+          console.log(`[Bundle Validation] (b) per_item_counts: ${perItemCounts}`);
         }
       } else {
         // Single-item validation (non-bundle or trustFallback)
@@ -9070,21 +8994,10 @@ async function processSessionInBackground({
       if (finalSource !== "ai") {
       finalHandles = finalHandlesGuaranteed;
       } else {
-        // BUG FIX #1: If source=ai and validation kept handles (validation_suspicious=true), use them
-        // Otherwise, use validated handles or fallback to AI handles if validation cleared everything
-        if (finalHandlesGuaranteed.length > 0) {
-          // Use validated handles if available (validation may have filtered some)
-          finalHandles = finalHandlesGuaranteed;
-        } else if (finalHandles.length > 0) {
-          // Validation cleared everything BUT source=ai and we have AI handles
-          // This means validation_suspicious=true case - keep AI handles
-          console.warn("[Bundle] Validation filtered all handles BUT source=ai - keeping AI handles (validation_suspicious=true)");
-          // finalHandles already contains AI handles, keep them
-        } else {
-          // Validation returned 0 and no AI handles to fallback to - this is NO_MATCH
-          console.warn("[Bundle] Validation filtered all handles - treating as NO_MATCH");
-          finalHandles = []; // Keep empty - will be handled as NO_MATCH later
-        }
+        // Use validated handles (validation now removes invalid handles instead of keeping them)
+        // If validation_suspicious=true, validatedHandles will contain kept AI handles
+        // Otherwise, validatedHandles will contain only valid handles (invalid ones removed)
+        finalHandles = finalHandlesGuaranteed;
       }
       
       // Hard guard: If validation failed AND we don't have AI handles, this is a true NO_MATCH
