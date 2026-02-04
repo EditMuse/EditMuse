@@ -207,12 +207,32 @@ function extractVariantFacetValues(product: any): {
 
 /**
  * Extract generic option values from product (all option names -> values)
+ * Supports BOTH REST and GraphQL shapes:
+ * - REST: options with position + variants with option1/2/3
+ * - GraphQL: options with { name, values } + variants with selectedOptions
  */
 function extractOptionValues(product: any): Record<string, string[]> {
   const options = Array.isArray(product?.options) ? product.options : [];
   const variants = Array.isArray(product?.variants) ? product.variants : [];
 
-  // Map option position -> option name (Shopify REST: position is 1-based)
+  const map: Record<string, Set<string>> = {};
+
+  // GRAPHQL SHAPE: If options have { name, values } directly, use them
+  for (const opt of options) {
+    if (opt?.name && Array.isArray(opt.values)) {
+      const name = normStr(opt.name);
+      if (name) {
+        if (!map[name]) map[name] = new Set<string>();
+        for (const val of opt.values) {
+          if (val != null) {
+            map[name].add(String(val).trim());
+          }
+        }
+      }
+    }
+  }
+
+  // REST SHAPE: Map option position -> option name (position is 1-based)
   const positionToName = new Map<number, string>();
   for (const opt of options) {
     const name = normStr(opt?.name);
@@ -220,15 +240,15 @@ function extractOptionValues(product: any): Record<string, string[]> {
     if (name && pos) positionToName.set(pos, name);
   }
 
-  const map: Record<string, string[]> = {};
-
   function push(name: string, value: string | null) {
     if (!value) return;
-    map[name] ??= [];
-    map[name].push(value);
+    if (!map[name]) map[name] = new Set<string>();
+    map[name].add(value.trim());
   }
 
+  // Process variants: support both REST (option1/2/3) and GraphQL (selectedOptions)
   for (const v of variants) {
+    // REST API: option1/2/3
     const o1 = normStr(v?.option1);
     const o2 = normStr(v?.option2);
     const o3 = normStr(v?.option3);
@@ -241,15 +261,28 @@ function extractOptionValues(product: any): Record<string, string[]> {
 
     for (const [pos, val] of pairs) {
       const name = positionToName.get(pos);
-      if (!name) continue;
-      push(name, val);
+      if (name) {
+        push(name, val);
+      }
+    }
+
+    // GraphQL API: selectedOptions
+    if (Array.isArray(v?.selectedOptions)) {
+      for (const opt of v.selectedOptions) {
+        if (opt?.name && opt?.value) {
+          const name = normStr(opt.name);
+          if (name) {
+            push(name, opt.value);
+          }
+        }
+      }
     }
   }
 
-  // de-dupe (case-insensitive), preserve original casing
+  // Convert Sets to arrays and de-dupe (case-insensitive), preserve original casing
   const out: Record<string, string[]> = {};
-  for (const [k, arr] of Object.entries(map)) {
-    out[k] = uniqLower(arr);
+  for (const [k, valueSet] of Object.entries(map)) {
+    out[k] = uniqLower(Array.from(valueSet));
   }
   return out;
 }
@@ -1011,16 +1044,6 @@ export async function fetchShopifyProductsGraphQL({
       }
     }
     
-    // Extract optionValues from options
-    const optionValues: Record<string, string[]> = {};
-    const options = Array.isArray(node.options) ? node.options : [];
-    for (const opt of options) {
-      if (opt?.name && Array.isArray(opt.values)) {
-        const key = opt.name.toLowerCase();
-        optionValues[key] = opt.values.filter((v: any) => v != null).map((v: any) => String(v));
-      }
-    }
-    
     // Extract variant data (title, selectedOptions, availableForSale)
     const variants: Array<{
       title: string | null;
@@ -1038,22 +1061,18 @@ export async function fetchShopifyProductsGraphQL({
               ? variant.selectedOptions.filter((opt: any) => opt?.name && opt?.value)
               : [],
           });
-          
-          // Also extract option values from variant selectedOptions
-          if (Array.isArray(variant.selectedOptions)) {
-            for (const opt of variant.selectedOptions) {
-              if (opt?.name && opt?.value) {
-                const key = opt.name.toLowerCase();
-                if (!optionValues[key]) optionValues[key] = [];
-                if (!optionValues[key].includes(opt.value)) {
-                  optionValues[key].push(opt.value);
-                }
-              }
-            }
-          }
         }
       }
     }
+    
+    // Extract optionValues using unified function (supports both REST and GraphQL shapes)
+    // Build a product-like object for extractOptionValues
+    const graphqlOptions = Array.isArray(node.options) ? node.options : [];
+    const productForExtraction = {
+      options: graphqlOptions,
+      variants: variants,
+    };
+    const optionValues = extractOptionValues(productForExtraction);
     
     // Extract collections (title and handle)
     const collections: Array<{ title: string; handle: string }> = [];
@@ -1148,7 +1167,7 @@ export async function fetchShopifyProductsGraphQL({
       description: null, // Not fetched in initial query - fetched separately for AI candidates
       status: node.status || null,
       // Add option intelligence
-      options: options, // Full options array with name and values
+      options: graphqlOptions, // Full options array with name and values
       optionValues: optionValues, // Map of option name -> values array
       variants: variants, // Variants array with title, selectedOptions, availableForSale
       collections: collections, // Collections array with title and handle

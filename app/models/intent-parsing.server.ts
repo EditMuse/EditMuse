@@ -121,7 +121,15 @@ function buildIntentSchema() {
             hardTerms: {
               type: "array",
               items: { type: "string" },
-              description: "Product terms for this bundle item (e.g., ['suit'], ['laptop'], ['sofa']). Industry-agnostic - works for any product type."
+              description: "Product terms for this bundle item. MUST include the core product noun/type (e.g., 'suit', 'shirt', 'trouser', 'lipstick', 'sofa'), NOT just adjectives like colors. Colors/sizes/materials MUST go into constraints.optionConstraints."
+            },
+            itemType: {
+              type: "string",
+              description: "The product type/noun for this bundle item (e.g., 'suit', 'shirt', 'lipstick', 'sofa'). This represents the product type, NOT a color or size. If missing, will be derived from hardTerms."
+            },
+            canonicalType: {
+              type: "string",
+              description: "Alternative field name for itemType. The canonical product type for this bundle item."
             },
             quantity: {
               type: "integer",
@@ -201,9 +209,11 @@ Your task is to analyze the user's query and extract:
 3. **Avoid Terms**: Things the user wants to exclude (e.g., "no prints", "avoid plastic", "not red", "without batteries", "no floral", "don't want X")
 4. **Hard Facets**: Specific size, color, or material constraints if mentioned (works for any industry)
    - **CRITICAL**: Explicit sizes/colors/materials MUST be assigned to hardFacets (and per-item optionConstraints in bundle mode), NOT left in hardTerms
+   - **CRITICAL**: For bundleItems, hardTerms MUST include the core product noun/type (e.g., "suit", "shirt", "trouser", "lipstick", "sofa"), NOT just adjectives like colors
+   - **CRITICAL**: Each bundleItem should have itemType or canonicalType field set to the product type (not color/size/material)
    - If user says "in large" after listing multiple items, treat it as a global size unless an item-specific size is clearly stated
-   - Example: "suit, shirt and trousers in large" → hardFacets: {size: "large", color: null, material: null}, bundleItems with size applied globally
-   - Example: "blue shirt in medium, black trousers in large" → per-item optionConstraints: shirt {size: "medium", color: "blue"}, trousers {size: "large", color: "black"}
+   - Example: "suit, shirt and trousers in large" → hardFacets: {size: "large", color: null, material: null}, bundleItems: [{hardTerms: ["suit"], itemType: "suit"}, {hardTerms: ["shirt"], itemType: "shirt"}, {hardTerms: ["trouser"], itemType: "trouser"}] with size applied globally
+   - Example: "blue shirt in medium, black trousers in large" → bundleItems: [{hardTerms: ["shirt"], itemType: "shirt", constraints: {optionConstraints: {size: "medium", color: "blue"}}}, {hardTerms: ["trouser"], itemType: "trouser", constraints: {optionConstraints: {size: "large", color: "black"}}}]
 5. **Bundle Detection**: Whether the user wants MULTIPLE DISTINCT products (e.g., "laptop and mouse", "sofa and table", "suit and shirt") vs a single item
 6. **Preferences**: Style or feature preferences that guide selection (e.g., "plain", "wireless", "organic", "rechargeable", "waterproof", "eco-friendly")
 

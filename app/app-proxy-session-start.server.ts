@@ -3602,7 +3602,12 @@ async function processSessionInBackground({
       const { discoverFacetVocabulary } = await import("~/utils/facets.server");
       const facetVocabulary = discoverFacetVocabulary(enrichedCandidates);
       const discoveredOptionNames = Array.from(facetVocabulary.optionNames);
-      console.log(`[Facets] discovered_options=[${discoveredOptionNames.join(", ")}]`);
+      const optionNameCounts: Record<string, number> = {};
+      for (const optName of discoveredOptionNames) {
+        const valueCount = facetVocabulary.optionNameToValues.get(optName)?.size || 0;
+        optionNameCounts[optName] = valueCount;
+      }
+      console.log(`[Facets] discovered_options=[${discoveredOptionNames.join(", ")}] option_counts=${JSON.stringify(optionNameCounts)}`);
       
       // Store facetVocabulary for use in bundle gating
       const facetVocabularyForBundle = facetVocabulary;
@@ -3751,27 +3756,55 @@ async function processSessionInBackground({
         // CRITICAL: Extract canonical_type (head noun) and facets per-item
         const isValidBundle = intent.isBundle === true && Array.isArray(intent.bundleItems) && intent.bundleItems.length >= 2;
         
-        // Helper to extract canonical_type and facets from hardTerms (industry-agnostic)
-        function extractCanonicalTypeAndFacets(hardTerms: string[], existingFacets?: { size?: string | null; color?: string | null; material?: string | null }): {
+        // Helper to extract canonical_type and facets from hardTerms using discovered facet vocabulary (industry-agnostic)
+        // Import facet utilities (synchronous - already loaded)
+        const { normalizeFacetValue, normalizeOptionName } = await import("~/utils/facets.server");
+        
+        function extractCanonicalTypeAndFacets(
+          hardTerms: string[], 
+          existingFacets?: { size?: string | null; color?: string | null; material?: string | null },
+          facetVocab?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> }
+        ): {
           canonicalType: string;
           facets: { size: string | null; color: string | null; material: string | null };
         } {
-          // Common color terms (industry-agnostic)
+          
+          // Build facet value sets from discovered vocabulary
+          const discoveredColorValues = facetVocab?.optionNameToValues.get("color") || new Set<string>();
+          const discoveredSizeValues = facetVocab?.optionNameToValues.get("size") || new Set<string>();
+          const discoveredMaterialValues = facetVocab?.optionNameToValues.get("material") || new Set<string>();
+          
+          // Also check for common facet option names (shade, scent, finish, capacity, etc.)
+          const colorOptionNames = new Set<string>(["color", "colour", "shade"]);
+          const sizeOptionNames = new Set<string>(["size", "sizing", "capacity", "dimensions"]);
+          const materialOptionNames = new Set<string>(["material", "fabric", "composition", "finish"]);
+          
+          // Check discovered option names for color/size/material
+          for (const optName of facetVocab?.optionNames || []) {
+            const normalized = normalizeOptionName(optName);
+            if (normalized.includes("color") || normalized.includes("shade") || normalized.includes("colour")) {
+              colorOptionNames.add(normalized);
+            }
+            if (normalized.includes("size") || normalized.includes("capacity") || normalized.includes("dimension")) {
+              sizeOptionNames.add(normalized);
+            }
+            if (normalized.includes("material") || normalized.includes("fabric") || normalized.includes("finish")) {
+              materialOptionNames.add(normalized);
+            }
+          }
+          
+          // Common facet value terms (fallback if vocab not available)
           const colorTerms = new Set([
             "red", "blue", "green", "yellow", "orange", "purple", "pink", "brown", "black", "white", "gray", "grey",
             "navy", "beige", "tan", "maroon", "burgundy", "crimson", "scarlet", "azure", "cyan", "teal", "lime",
-            "olive", "khaki", "ivory", "cream", "silver", "gold", "bronze", "copper"
+            "olive", "khaki", "ivory", "cream", "silver", "gold", "bronze", "copper", "ruby", "coral", "mauve"
           ]);
-          
-          // Common size terms (industry-agnostic)
           const sizeTerms = new Set([
             "xs", "s", "m", "l", "xl", "xxl", "xxxl", "small", "medium", "large", "extra", "one", "size"
           ]);
-          
-          // Common material terms (industry-agnostic)
           const materialTerms = new Set([
             "cotton", "wool", "silk", "linen", "polyester", "nylon", "leather", "suede", "denim", "satin",
-            "cashmere", "bamboo", "modal", "rayon", "spandex", "elastane", "acrylic", "viscose"
+            "cashmere", "bamboo", "modal", "rayon", "spandex", "elastane", "acrylic", "viscose", "velvet"
           ]);
           
           const facets: { size: string | null; color: string | null; material: string | null } = {
@@ -3780,17 +3813,25 @@ async function processSessionInBackground({
             material: existingFacets?.material || null
           };
           
-          // Extract facets from hardTerms
+          // Extract facets from hardTerms using discovered vocabulary
           const remainingTerms: string[] = [];
           for (const term of hardTerms) {
-            const normalized = term.toLowerCase().trim();
-            if (colorTerms.has(normalized) && !facets.color) {
+            const normalized = normalizeFacetValue(term);
+            let isFacet = false;
+            
+            // Check against discovered values first
+            if (!facets.color && (discoveredColorValues.has(normalized) || colorTerms.has(normalized))) {
               facets.color = term; // Keep original case
-            } else if (sizeTerms.has(normalized) && !facets.size) {
+              isFacet = true;
+            } else if (!facets.size && (discoveredSizeValues.has(normalized) || sizeTerms.has(normalized))) {
               facets.size = term;
-            } else if (materialTerms.has(normalized) && !facets.material) {
+              isFacet = true;
+            } else if (!facets.material && (discoveredMaterialValues.has(normalized) || materialTerms.has(normalized))) {
               facets.material = term;
-            } else {
+              isFacet = true;
+            }
+            
+            if (!isFacet) {
               remainingTerms.push(term);
             }
           }
@@ -3829,13 +3870,78 @@ async function processSessionInBackground({
             const filteredHardTerms = item.hardTerms.filter((t: string) => typeof t === "string" && t.trim().length > 0);
             if (filteredHardTerms.length === 0) continue;
             
-            // Extract canonical_type and facets
+            // Extract canonical_type and facets using discovered vocabulary
             const existingFacets = item.constraints?.optionConstraints || {};
-            const { canonicalType, facets } = extractCanonicalTypeAndFacets(filteredHardTerms, {
-              size: existingFacets.size || null,
-              color: existingFacets.color || null,
-              material: existingFacets.material || null
-            });
+            
+            // Build facet value sets from discovered vocabulary (for repair logic)
+            const discoveredColorValues = facetVocabularyForBundle.optionNameToValues.get("color") || new Set<string>();
+            const discoveredSizeValues = facetVocabularyForBundle.optionNameToValues.get("size") || new Set<string>();
+            const discoveredMaterialValues = facetVocabularyForBundle.optionNameToValues.get("material") || new Set<string>();
+            
+            // Common facet value terms (fallback if vocab not available)
+            const colorTerms = new Set([
+              "red", "blue", "green", "yellow", "orange", "purple", "pink", "brown", "black", "white", "gray", "grey",
+              "navy", "beige", "tan", "maroon", "burgundy", "crimson", "scarlet", "azure", "cyan", "teal", "lime",
+              "olive", "khaki", "ivory", "cream", "silver", "gold", "bronze", "copper", "ruby", "coral", "mauve"
+            ]);
+            const sizeTerms = new Set([
+              "xs", "s", "m", "l", "xl", "xxl", "xxxl", "small", "medium", "large", "extra", "one", "size"
+            ]);
+            const materialTerms = new Set([
+              "cotton", "wool", "silk", "linen", "polyester", "nylon", "leather", "suede", "denim", "satin",
+              "cashmere", "bamboo", "modal", "rayon", "spandex", "elastane", "acrylic", "viscose", "velvet"
+            ]);
+            
+            const { canonicalType: extractedCanonicalType, facets } = extractCanonicalTypeAndFacets(
+              filteredHardTerms, 
+              {
+                size: existingFacets.size || null,
+                color: existingFacets.color || null,
+                material: existingFacets.material || null
+              },
+              facetVocabularyForBundle
+            );
+            
+            // Server-side repair: prevent canonicalType from being a facet value
+            // Priority: (a) item.itemType/canonicalType from LLM, (b) extracted non-facet term, (c) fallback
+            let canonicalType = (item as any).itemType || (item as any).canonicalType || extractedCanonicalType;
+            
+            // Validate canonicalType is not a facet value
+            const normalizedCanonical = normalizeFacetValue(canonicalType);
+            const isFacetValue = 
+              discoveredColorValues.has(normalizedCanonical) ||
+              discoveredSizeValues.has(normalizedCanonical) ||
+              discoveredMaterialValues.has(normalizedCanonical) ||
+              colorTerms.has(normalizedCanonical) ||
+              sizeTerms.has(normalizedCanonical) ||
+              materialTerms.has(normalizedCanonical);
+            
+            if (isFacetValue || !canonicalType || canonicalType === "unknown") {
+              // Repair: use first non-facet token from hardTerms
+              const nonFacetTerms = filteredHardTerms.filter(term => {
+                const normalized = normalizeFacetValue(term);
+                return !discoveredColorValues.has(normalized) &&
+                       !discoveredSizeValues.has(normalized) &&
+                       !discoveredMaterialValues.has(normalized) &&
+                       !colorTerms.has(normalized) &&
+                       !sizeTerms.has(normalized) &&
+                       !materialTerms.has(normalized);
+              });
+              
+              if (nonFacetTerms.length > 0) {
+                canonicalType = normalizeItemLabel(nonFacetTerms[0]);
+                console.log(`[Bundle Normalization] repaired canonicalType from "${extractedCanonicalType}" to "${canonicalType}" (was facet value)`);
+              } else {
+                // Last resort: extract from userIntent around this item (simple heuristic)
+                // For now, use the longest hardTerm as fallback
+                canonicalType = normalizeItemLabel(filteredHardTerms.reduce((longest, current) => 
+                  current.length > longest.length ? current : longest, filteredHardTerms[0]
+                ));
+                console.log(`[Bundle Normalization] fallback canonicalType="${canonicalType}" (no non-facet terms found)`);
+              }
+            }
+            
+            console.log(`[Bundle Normalization] item canonicalType="${canonicalType}" before_repair="${extractedCanonicalType}"`);
             
             // Merge extracted facets with existing constraints
             const mergedFacets = {
@@ -6536,6 +6642,7 @@ async function processSessionInBackground({
           }
           
           // Type anchor gating for bundle item: filter by non-facet hard terms
+          // Guarantee anchor_terms is NEVER empty
           // Combine item hardTerms with includeTerms to get all item terms
           const itemTerms = [
             ...itemHardTerms,
@@ -6547,7 +6654,28 @@ async function processSessionInBackground({
             color: itemOptionConstraints?.color ?? hardFacets.color,
             material: itemOptionConstraints?.material ?? hardFacets.material,
           };
-          const nonFacetItemTerms = getNonFacetHardTerms(itemTerms, itemFacets);
+          let nonFacetItemTerms = getNonFacetHardTerms(itemTerms, itemFacets);
+          
+          // Safety net: if nonFacetItemTerms is empty, use canonicalType or fallback to hardTerms
+          if (nonFacetItemTerms.length === 0) {
+            const bundleItem = bundleItemsWithBudget[itemIdx];
+            const canonicalType = (bundleItem as any).canonicalType;
+            if (canonicalType && canonicalType !== "unknown") {
+              nonFacetItemTerms = [canonicalType];
+              console.log(`[Bundle Gating] item=${itemIdx} anchor_terms_empty=true - using canonicalType="${canonicalType}" as anchor`);
+            } else if (itemHardTerms.length > 0) {
+              // Fallback to original hardTerms (at least one)
+              nonFacetItemTerms = [itemHardTerms[0]];
+              console.log(`[Bundle Gating] item=${itemIdx} anchor_terms_empty=true - using first hardTerm="${itemHardTerms[0]}" as anchor`);
+            } else {
+              // Last resort: use global hardTerms non-facet tokens
+              const globalNonFacetTerms = getNonFacetHardTerms(hardTerms, hardFacets);
+              if (globalNonFacetTerms.length > 0) {
+                nonFacetItemTerms = [globalNonFacetTerms[0]];
+                console.log(`[Bundle Gating] item=${itemIdx} anchor_terms_empty=true - using global nonFacetTerm="${globalNonFacetTerms[0]}" as anchor`);
+              }
+            }
+          }
           
           let itemGatedAfterAnchor = itemGatedUnfiltered;
           if (nonFacetItemTerms.length > 0) {

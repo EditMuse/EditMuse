@@ -100,6 +100,72 @@ export interface FacetConstraint {
 }
 
 /**
+ * Normalize facet value for matching (industry-agnostic)
+ * Handles common variations and equivalences
+ */
+export function normalizeFacetValue(value: string): string {
+  if (!value || typeof value !== "string") return "";
+  return value.toLowerCase().trim();
+}
+
+/**
+ * Match a facet constraint value against a product value
+ * Uses discovered facet vocabulary and normalization
+ */
+export function matchFacetConstraint(
+  productValue: string,
+  constraintValue: string,
+  optionName: string,
+  discoveredValues?: Set<string>
+): boolean {
+  const normalizedProduct = normalizeFacetValue(productValue);
+  const normalizedConstraint = normalizeFacetValue(constraintValue);
+  
+  // Exact match
+  if (normalizedProduct === normalizedConstraint) return true;
+  
+  // Check if values are in discovered vocabulary (helps with variations)
+  if (discoveredValues) {
+    const productInVocab = discoveredValues.has(normalizedProduct);
+    const constraintInVocab = discoveredValues.has(normalizedConstraint);
+    
+    // If both are in vocab but different, they're distinct values
+    if (productInVocab && constraintInVocab && normalizedProduct !== normalizedConstraint) {
+      return false;
+    }
+  }
+  
+  // Size equivalences (only for size-related options)
+  const normalizedOptionName = normalizeOptionName(optionName);
+  if (normalizedOptionName === "size") {
+    const sizeEquivalences: Record<string, string[]> = {
+      "s": ["small", "s"],
+      "m": ["medium", "m"],
+      "l": ["large", "l"],
+      "xl": ["extra large", "x-large", "xl", "extra-large"],
+      "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
+    };
+    
+    if (sizeEquivalences[normalizedConstraint]) {
+      const aliases = sizeEquivalences[normalizedConstraint];
+      if (aliases.some(alias => normalizedProduct === alias)) return true;
+    }
+    
+    if (sizeEquivalences[normalizedProduct]) {
+      const aliases = sizeEquivalences[normalizedProduct];
+      if (aliases.some(alias => normalizedConstraint === alias)) return true;
+    }
+  }
+  
+  // Partial match (conservative - only if one contains the other)
+  if (normalizedProduct.includes(normalizedConstraint) || normalizedConstraint.includes(normalizedProduct)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
  * Check if a value matches a constraint (with conservative equivalence)
  * Supports a small generic equivalence map only when obvious:
  * l <-> large, xl <-> x-large, etc.
