@@ -124,11 +124,11 @@ function buildIntentSchema() {
               description: "Product terms for this bundle item. MUST include the core product noun/type (e.g., 'suit', 'shirt', 'trouser', 'lipstick', 'sofa'), NOT just adjectives like colors. Colors/sizes/materials MUST go into constraints.optionConstraints."
             },
             itemType: {
-              type: "string",
+              type: ["string", "null"],
               description: "The product type/noun for this bundle item (e.g., 'suit', 'shirt', 'lipstick', 'sofa'). This represents the product type, NOT a color or size. If missing, will be derived from hardTerms."
             },
             canonicalType: {
-              type: "string",
+              type: ["string", "null"],
               description: "Alternative field name for itemType. The canonical product type for this bundle item."
             },
             quantity: {
