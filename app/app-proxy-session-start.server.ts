@@ -8451,6 +8451,12 @@ async function processSessionInBackground({
             }
             validatedHandles = constraintValid;
             
+            // Log per-item counts after validation
+            const perItemCountsAfterValidation = Array.from(validatedHandlesByItem.entries()).map(([idx, handles]) => {
+              return `item${idx}=${handles.length}`;
+            }).join(" ");
+            console.log(`[BundleValidation] per_item_after_validation ${perItemCountsAfterValidation} total=${validatedHandles.length}`);
+            
             // Preserve aiItemIndexMap mapping for these handles
             // (aiItemIndexMap is already in scope from earlier)
           } else {
@@ -8832,7 +8838,14 @@ async function processSessionInBackground({
           finalHandlesGuaranteed = [];
         }
       } else {
-        finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+        // CRITICAL FIX: For AI source, if validatedHandles is empty, keep original finalHandles (AI result)
+        // This prevents losing AI handles when validation incorrectly clears them
+        if (finalSource === "ai" && validatedHandles.length === 0 && finalHandles.length > 0) {
+          console.warn(`[Bundle] validatedHandles is empty but keeping original AI finalHandles: ${finalHandles.length} handles`);
+          finalHandlesGuaranteed = uniq(finalHandles);
+        } else {
+          finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+        }
       }
 
       // Bundle-safe top-up: only from bundle item pools
@@ -9098,8 +9111,15 @@ async function processSessionInBackground({
         // Ensure finalHandlesGuaranteed is initialized from validatedHandles (which comes from finalHandles)
         // This ensures it's always properly initialized before use in single-item mode
         // finalHandlesGuaranteed is already declared at function scope, ensure it's initialized here
+        // CRITICAL: For AI source, prefer validatedHandles, but if empty, keep original finalHandles (AI result)
         if (finalHandlesGuaranteed.length === 0) {
-          finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+          if (finalSource === "ai" && finalHandles.length > 0 && validatedHandles.length === 0) {
+            // AI succeeded but validation cleared everything - keep original AI handles
+            console.warn(`[Bundle] validatedHandles is empty but keeping original AI finalHandles: ${finalHandles.length} handles`);
+            finalHandlesGuaranteed = uniq(finalHandles);
+          } else {
+            finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+          }
         }
         
       // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
@@ -9170,12 +9190,22 @@ async function processSessionInBackground({
 
       // CRITICAL: Only update finalHandles if it wasn't set by AI (preserve AI result)
       if (finalSource !== "ai") {
-      finalHandles = finalHandlesGuaranteed;
-      } else {
-        // Use validated handles (validation now removes invalid handles instead of keeping them)
-        // If validation_suspicious=true, validatedHandles will contain kept AI handles
-        // Otherwise, validatedHandles will contain only valid handles (invalid ones removed)
         finalHandles = finalHandlesGuaranteed;
+      } else {
+        // For AI source: use finalHandlesGuaranteed (which comes from validatedHandles) if it has handles
+        // Otherwise, keep the original finalHandles (AI result) to prevent losing AI handles
+        if (finalHandlesGuaranteed.length > 0) {
+          finalHandles = finalHandlesGuaranteed;
+          console.log(`[Bundle] Using finalHandlesGuaranteed for finalHandles: ${finalHandles.length} handles (from validatedHandles)`);
+        } else if (finalHandles.length > 0) {
+          // Keep original AI handles if validation cleared everything
+          console.warn(`[Bundle] finalHandlesGuaranteed is empty but finalHandles has ${finalHandles.length} AI handles - keeping original AI handles`);
+          // Don't overwrite finalHandles - keep the original AI result
+        } else {
+          // Both are empty - this should not happen if AI succeeded
+          console.error(`[Bundle] CRITICAL: Both finalHandlesGuaranteed and finalHandles are empty despite AI success`);
+          finalHandles = finalHandlesGuaranteed; // Use empty array as last resort
+        }
       }
       
       // REQUIREMENT 2: Remove downstream code that converts 0 validated handles into NO_MATCH for AI source
