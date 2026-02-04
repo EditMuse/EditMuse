@@ -8383,81 +8383,79 @@ async function processSessionInBackground({
               continue; // Skip unavailable items
             }
             
-            // Check facets (size/color/material) if specified
-            // Do NOT fail items when product has no extracted colors/sizes/materials
+            // Check facets using satisfiesConstraintsStructuredOrTags (consistent with validation)
+            // Build constraints from itemFacets
+            const itemFacetConstraints: Array<{ key: string; value: string }> = [];
+            if (itemFacets.size) itemFacetConstraints.push({ key: "size", value: itemFacets.size });
+            if (itemFacets.color) itemFacetConstraints.push({ key: "color", value: itemFacets.color });
+            if (itemFacets.material) itemFacetConstraints.push({ key: "material", value: itemFacets.material });
+            
             let passesFacets = true;
             let facetFailureReason: string | undefined;
             
-            if (itemFacets.size) {
-              const candidateHasSizes = candidate.sizes.length > 0;
-              let sizeMatch = false;
-              if (candidateHasSizes) {
-                sizeMatch = candidate.sizes.some((s: string) => 
-                  normalizeText(s) === normalizeText(itemFacets.size) ||
-                  normalizeText(s).includes(normalizeText(itemFacets.size)) ||
-                  normalizeText(itemFacets.size).includes(normalizeText(s))
-                );
-              }
-              facetChecks.size = {
-                required: itemFacets.size,
-                candidateHas: candidateHasSizes,
-                passed: sizeMatch || !candidateHasSizes, // Pass if no sizes extracted
-                reason: candidateHasSizes && !sizeMatch ? `size mismatch: required=${itemFacets.size}, candidate has=${candidate.sizes.join(",")}` : undefined
-              };
-              if (candidateHasSizes && !sizeMatch) {
+            if (itemFacetConstraints.length > 0) {
+              const constraintResult = await satisfiesConstraintsStructuredOrTags(candidate, itemFacetConstraints, facetVocabulary);
+              if (!constraintResult.ok) {
                 passesFacets = false;
-                facetFailureReason = facetChecks.size.reason;
+                if (constraintResult.conflict) {
+                  facetFailureReason = `${constraintResult.conflict.facet} mismatch: required=${constraintResult.conflict.expected}, candidate has=${constraintResult.conflict.actual} (source=${constraintResult.conflict.source})`;
+                  
+                  // Build facetChecks for logging (backward compatibility)
+                  if (constraintResult.conflict.facet === "size") {
+                    facetChecks.size = {
+                      required: itemFacets.size || null,
+                      candidateHas: candidate.sizes.length > 0,
+                      passed: false,
+                      reason: facetFailureReason
+                    };
+                  } else if (constraintResult.conflict.facet === "color") {
+                    facetChecks.color = {
+                      required: itemFacets.color || null,
+                      candidateHas: candidate.colors.length > 0,
+                      passed: false,
+                      reason: facetFailureReason
+                    };
+                  } else if (constraintResult.conflict.facet === "material") {
+                    facetChecks.material = {
+                      required: itemFacets.material || null,
+                      candidateHas: candidate.materials.length > 0,
+                      passed: false,
+                      reason: facetFailureReason
+                    };
+                  }
+                } else {
+                  facetFailureReason = "facet check failed (no structured or tag match)";
+                }
+              } else {
+                // Passed - build facetChecks for logging
+                if (itemFacets.size) {
+                  facetChecks.size = {
+                    required: itemFacets.size,
+                    candidateHas: candidate.sizes.length > 0 || true, // May be in tags
+                    passed: true,
+                    reason: undefined
+                  };
+                }
+                if (itemFacets.color) {
+                  facetChecks.color = {
+                    required: itemFacets.color,
+                    candidateHas: candidate.colors.length > 0 || true, // May be in tags
+                    passed: true,
+                    reason: undefined
+                  };
+                }
+                if (itemFacets.material) {
+                  facetChecks.material = {
+                    required: itemFacets.material,
+                    candidateHas: candidate.materials.length > 0 || true, // May be in tags
+                    passed: true,
+                    reason: undefined
+                  };
+                }
               }
-            }
-            
-            if (itemFacets.color && candidate.colors.length > 0 && passesFacets) {
-              const colorMatch = candidate.colors.some((col: string) => 
-                normalizeText(col) === normalizeText(itemFacets.color) ||
-                normalizeText(col).includes(normalizeText(itemFacets.color)) ||
-                normalizeText(itemFacets.color).includes(normalizeText(col))
-              );
-              facetChecks.color = {
-                required: itemFacets.color,
-                candidateHas: true,
-                passed: colorMatch,
-                reason: !colorMatch ? `color mismatch: required=${itemFacets.color}, candidate has=${candidate.colors.join(",")}` : undefined
-              };
-              if (!colorMatch) {
-                passesFacets = false;
-                facetFailureReason = facetChecks.color.reason;
-              }
-            } else if (itemFacets.color) {
-              facetChecks.color = {
-                required: itemFacets.color,
-                candidateHas: false,
-                passed: true, // Pass if no colors extracted
-                reason: undefined
-              };
-            }
-            
-            if (itemFacets.material && candidate.materials.length > 0 && passesFacets) {
-              const materialMatch = candidate.materials.some((m: string) => 
-                normalizeText(m) === normalizeText(itemFacets.material) ||
-                normalizeText(m).includes(normalizeText(itemFacets.material)) ||
-                normalizeText(itemFacets.material).includes(normalizeText(m))
-              );
-              facetChecks.material = {
-                required: itemFacets.material,
-                candidateHas: true,
-                passed: materialMatch,
-                reason: !materialMatch ? `material mismatch: required=${itemFacets.material}, candidate has=${candidate.materials.join(",")}` : undefined
-              };
-              if (!materialMatch) {
-                passesFacets = false;
-                facetFailureReason = facetChecks.material.reason;
-              }
-            } else if (itemFacets.material) {
-              facetChecks.material = {
-                required: itemFacets.material,
-                candidateHas: false,
-                passed: true, // Pass if no materials extracted
-                reason: undefined
-              };
+            } else {
+              // No constraints - pass
+              passesFacets = true;
             }
             
             if (passesFacets) {
@@ -8649,10 +8647,12 @@ async function processSessionInBackground({
         return Array.from(new Set(arr));
       }
 
-      function topUpHandlesFromGated(
+      async function topUpHandlesFromGated(
         ranked: string[],
         pool: typeof allCandidates,
-        target: number
+        target: number,
+        constraints?: Array<{ key: string; value: string }>,
+        facetVocabulary?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> }
       ) {
         const have = new Set(ranked);
         const out = ranked.slice();
@@ -8661,6 +8661,18 @@ async function processSessionInBackground({
           if (out.length >= target) break;
           if (!p?.handle) continue;
           if (have.has(p.handle)) continue;
+          
+          // Check constraints if provided (single-item top-up must respect constraints)
+          if (constraints && constraints.length > 0) {
+            const constraintResult = await satisfiesConstraintsStructuredOrTags(p, constraints, facetVocabulary);
+            if (!constraintResult.ok) {
+              if (constraintResult.conflict) {
+                console.log(`[TopUp] skip_conflict facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source} handle=${p.handle}`);
+              }
+              continue; // Skip this candidate due to constraint conflict
+            }
+          }
+          
           have.add(p.handle);
           out.push(p.handle);
         }
@@ -8723,15 +8735,42 @@ async function processSessionInBackground({
 
       // Bundle-safe top-up: only from bundle item pools
       if (isBundleMode && bundleIntent.items.length >= 2) {
-        // Build itemPools STRICTLY: only candidates that match that item's hard term(s) using word-boundary matching
+        // Build itemPools STRICTLY: only candidates that match that item's hard term(s) AND constraints (BEFORE AI)
         const bundleItemPools = new Map<number, EnrichedCandidate[]>();
         for (let itemIdx = 0; itemIdx < bundleItemsWithBudget.length; itemIdx++) {
           const bundleItem = bundleItemsWithBudget[itemIdx];
           const itemHardTerms = bundleItem.hardTerms;
           
-          // Filter sortedCandidates to only those that match this item's hard terms
+          // Get per-item constraints (merged from global + item-specific)
+          const itemOptionConstraints = bundleItem.constraints?.optionConstraints;
+          const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+          
+          // Add item-specific constraints
+          if (itemOptionConstraints?.size) {
+            itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+          }
+          if (itemOptionConstraints?.color) {
+            itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+          }
+          if (itemOptionConstraints?.material) {
+            itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+          }
+          
+          // Add global hardFacets (if not overridden by item-specific)
+          if (hardFacets.size && !itemOptionConstraints?.size) {
+            itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+          }
+          if (hardFacets.color && !itemOptionConstraints?.color) {
+            itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+          }
+          if (hardFacets.material && !itemOptionConstraints?.material) {
+            itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+          }
+          
+          // Filter sortedCandidates to only those that match this item's hard terms AND constraints
           const itemPool: EnrichedCandidate[] = [];
           for (const c of sortedCandidates) {
+            // Check anchor terms (hard terms)
             const haystack = [
               c.title || "",
               c.productType || "",
@@ -8741,13 +8780,21 @@ async function processSessionInBackground({
             ].join(" ");
             
             const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
-            if (hasItemMatch) {
-              itemPool.push(c);
+            if (!hasItemMatch) continue;
+            
+            // Check constraints using satisfiesConstraintsStructuredOrTags (BEFORE adding to pool, BEFORE AI)
+            if (itemGenericConstraints.length > 0) {
+              const constraintResult = await satisfiesConstraintsStructuredOrTags(c, itemGenericConstraints, facetVocabulary);
+              if (!constraintResult.ok) {
+                continue; // Skip this candidate - doesn't satisfy constraints
+              }
             }
+            
+            itemPool.push(c);
           }
           
           bundleItemPools.set(itemIdx, itemPool);
-          console.log("[Bundle] Strict itemPool", itemIdx, `(${itemHardTerms[0]})`, "size:", itemPool.length);
+          console.log("[Bundle] Strict itemPool", itemIdx, `(${itemHardTerms[0]})`, "size:", itemPool.length, "constraints_applied=" + (itemGenericConstraints.length > 0));
         }
         
         // Union of all bundle item pools (bundle-safe source)
@@ -8954,22 +9001,26 @@ async function processSessionInBackground({
         }
         
       // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
+      // Convert hardFacets to constraints for constraint checking
+      const { convertHardFacetsToConstraints } = await import("~/utils/facets.server");
+      const topUpConstraints = convertHardFacetsToConstraints(hardFacets);
+      
       if (!trustFallback) {
         // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
         if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
         }
         // If still short after gated top-up, return fewer results (better than drift)
           console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
       } else {
         // Trust fallback: can use broader pool, but prefer gated first
         if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
         }
         
         // If still short, use broader pool (allCandidatesForTopUp)
           if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount, topUpConstraints, facetVocabularyForBundle);
         }
         
         // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
@@ -9005,7 +9056,7 @@ async function processSessionInBackground({
               optionValues: (p as any).optionValues ?? {},
             } as EnrichedCandidate;
           });
-            finalHandlesGuaranteed = topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
             }
           }
         }
@@ -9154,53 +9205,81 @@ async function processSessionInBackground({
             const itemOptionConstraints = itemConstraints?.optionConstraints;
             const itemHardTerms = item.hardTerms || [];
             
-            // Find candidates that match this item type and constraints
-            const itemCandidates = allCandidatesEnriched
-              .filter(c => {
-                if (usedHandlesSet.has(c.handle) || refillHandles.includes(c.handle)) return false;
-                
-                // Apply item-specific facet constraints
-                if (itemOptionConstraints?.color && c.colors.length > 0) {
-                  const colorMatch = c.colors.some((col: string) => 
-                    normalizeText(col) === normalizeText(itemOptionConstraints.color!) ||
-                    normalizeText(col).includes(normalizeText(itemOptionConstraints.color!)) ||
-                    normalizeText(itemOptionConstraints.color!).includes(normalizeText(col))
-                  );
-                  if (!colorMatch) return false;
+            // Build merged per-item constraints (global + item-specific)
+            const itemGenericConstraints: Array<{ key: string; value: string }> = [];
+            
+            // Add item-specific constraints
+            if (itemOptionConstraints?.size) {
+              itemGenericConstraints.push({ key: "size", value: itemOptionConstraints.size });
+            }
+            if (itemOptionConstraints?.color) {
+              itemGenericConstraints.push({ key: "color", value: itemOptionConstraints.color });
+            }
+            if (itemOptionConstraints?.material) {
+              itemGenericConstraints.push({ key: "material", value: itemOptionConstraints.material });
+            }
+            
+            // Add global hardFacets (if not overridden by item-specific)
+            if (hardFacets.size && !itemOptionConstraints?.size) {
+              itemGenericConstraints.push({ key: "size", value: hardFacets.size });
+            }
+            if (hardFacets.color && !itemOptionConstraints?.color) {
+              itemGenericConstraints.push({ key: "color", value: hardFacets.color });
+            }
+            if (hardFacets.material && !itemOptionConstraints?.material) {
+              itemGenericConstraints.push({ key: "material", value: hardFacets.material });
+            }
+            
+            // Find candidates that match this item type and constraints (constraint-aware per item)
+            // Ensure refill candidates come from correct itemPool AND pass constraints
+            // Build itemPool from allCandidatesEnriched filtered by anchor terms (bundleItemPools may not be in scope here)
+            const itemPool: EnrichedCandidate[] = [];
+            for (const c of allCandidatesEnriched) {
+              const haystack = [
+                c.title || "",
+                c.productType || "",
+                (c.tags || []).join(" "),
+                c.vendor || "",
+                c.searchText || "",
+              ].join(" ");
+              const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+              if (hasItemMatch) {
+                itemPool.push(c);
+              }
+            }
+            const itemCandidates: EnrichedCandidate[] = [];
+            for (const c of itemPool) {
+              if (usedHandlesSet.has(c.handle) || refillHandles.includes(c.handle)) continue;
+              
+              // Apply token-based slot matching (anchor terms)
+              const slotDescriptor = itemHardTerms.join(" ");
+              const slotScore = scoreProductForSlot(c, slotDescriptor);
+              if (slotScore < 0.1) continue;
+              
+              // Check constraints using satisfiesConstraintsStructuredOrTags (constraint-aware)
+              if (itemGenericConstraints.length > 0) {
+                const constraintResult = await satisfiesConstraintsStructuredOrTags(c, itemGenericConstraints, facetVocabulary);
+                if (!constraintResult.ok) {
+                  if (constraintResult.conflict) {
+                    console.log(`[TopUp] bundle_refill skip_conflict itemIndex=${itemIdx} facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source} handle=${c.handle}`);
+                  }
+                  continue; // Skip this candidate - doesn't satisfy constraints
                 }
-                
-                if (itemOptionConstraints?.size && c.sizes.length > 0) {
-                  const sizeMatch = c.sizes.some((s: string) => 
-                    normalizeText(s) === normalizeText(itemOptionConstraints.size!) ||
-                    normalizeText(s).includes(normalizeText(itemOptionConstraints.size!)) ||
-                    normalizeText(itemOptionConstraints.size!).includes(normalizeText(s))
-                  );
-                  if (!sizeMatch) return false;
-                }
-                
-                if (itemOptionConstraints?.material && c.materials.length > 0) {
-                  const materialMatch = c.materials.some((m: string) => 
-                    normalizeText(m) === normalizeText(itemOptionConstraints.material!) ||
-                    normalizeText(m).includes(normalizeText(itemOptionConstraints.material!)) ||
-                    normalizeText(itemOptionConstraints.material!).includes(normalizeText(m))
-                  );
-                  if (!materialMatch) return false;
-                }
-                
-                // Apply token-based slot matching
-                const slotDescriptor = itemHardTerms.join(" ");
-                const slotScore = scoreProductForSlot(c, slotDescriptor);
-                if (slotScore < 0.1) return false;
-                
-                // Check availability
-                if (experience.inStockOnly && !c.available) return false;
-                
-                return true;
-              })
+              }
+              
+              // Check availability
+              if (experience.inStockOnly && !c.available) continue;
+              
+              itemCandidates.push(c);
+            }
+            
+            // Sort candidates
+            const sortedItemCandidates = itemCandidates
               .sort((a, b) => {
                 // Sort by slot score (descending), then price (ascending)
-                const scoreA = scoreProductForSlot(a, itemHardTerms.join(" "));
-                const scoreB = scoreProductForSlot(b, itemHardTerms.join(" "));
+                const slotDescriptor = itemHardTerms.join(" ");
+                const scoreA = scoreProductForSlot(a, slotDescriptor);
+                const scoreB = scoreProductForSlot(b, slotDescriptor);
                 if (Math.abs(scoreA - scoreB) > 0.01) {
                   return scoreB - scoreA;
                 }
