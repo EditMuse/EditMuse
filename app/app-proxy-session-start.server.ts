@@ -8001,9 +8001,15 @@ async function processSessionInBackground({
             }
             
             if (missingTypes.length === bundleIntent.items.length) {
-              // All types missing - treat as NO_MATCH
-              console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
-              validatedHandles = [];
+              // All types missing - but if source=ai and we have handles, keep them
+              if (finalSource === "ai" && constraintValid.length > 0) {
+                console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing BUT source=ai - keeping AI handles (validation_suspicious=true)`);
+                validatedHandles = constraintValid; // Keep constraint-valid handles even if type validation fails
+              } else {
+                // Not AI source or no handles - treat as NO_MATCH
+                console.warn(`[Bundle Validation] (c) bundle_type_validation FAILED: all ${bundleIntent.items.length} types missing - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
+                validatedHandles = [];
+              }
             } else if (missingTypes.length > 0) {
               // Partial bundle - keep handles that match existing types
               console.log(`[Bundle Validation] (c) bundle_type_validation: partial bundle - ${missingTypes.length} types missing, keeping ${constraintValid.length} handles`);
@@ -8429,24 +8435,28 @@ async function processSessionInBackground({
       if (finalSource !== "ai") {
       finalHandles = finalHandlesGuaranteed;
       } else {
-        // BUG FIX #1: Never bypass validation even if source=ai
-        // If validation returns 0, treat as NO_MATCH (already handled in validation logic above)
-        // Use validated handles (validation already handled NO_MATCH case above)
+        // BUG FIX #1: If source=ai and validation kept handles (validation_suspicious=true), use them
+        // Otherwise, use validated handles or fallback to AI handles if validation cleared everything
         if (finalHandlesGuaranteed.length > 0) {
           // Use validated handles if available (validation may have filtered some)
           finalHandles = finalHandlesGuaranteed;
+        } else if (finalHandles.length > 0) {
+          // Validation cleared everything BUT source=ai and we have AI handles
+          // This means validation_suspicious=true case - keep AI handles
+          console.warn("[Bundle] Validation filtered all handles BUT source=ai - keeping AI handles (validation_suspicious=true)");
+          // finalHandles already contains AI handles, keep them
         } else {
-          // Validation returned 0 - this is NO_MATCH (already handled above)
-          // DO NOT use AI handles as fallback - validation failure means no valid matches
-          console.warn("[Bundle] Validation filtered all handles - DO NOT bypass even if source=ai (NO_MATCH)");
+          // Validation returned 0 and no AI handles to fallback to - this is NO_MATCH
+          console.warn("[Bundle] Validation filtered all handles - treating as NO_MATCH");
           finalHandles = []; // Keep empty - will be handled as NO_MATCH later
         }
       }
       
-      // Hard guard: If validation failed, DO NOT restore invalid handles even if AI succeeded
+      // Hard guard: If validation failed AND we don't have AI handles, this is a true NO_MATCH
       if (finalSource === "ai" && finalHandles.length === 0 && finalHandlesGuaranteed.length === 0) {
         // Both AI and validation returned 0 - this is a true NO_MATCH
-        // DO NOT restore from bundleFinalHandles - validation failure is authoritative
+        // But if we have original AI handles, we should have kept them above
+        // This log indicates a problem - validation cleared everything including AI handles
         console.warn("[Bundle] ERROR: AI source but validation returned 0 handles - treating as NO_MATCH (DO NOT restore invalid handles)");
       }
 
