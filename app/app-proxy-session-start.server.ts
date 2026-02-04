@@ -6677,7 +6677,128 @@ async function processSessionInBackground({
             }
           }
           
-          let itemGatedAfterAnchor = itemGatedUnfiltered;
+          // PRODUCTTYPE FILTERING: Infer productType filter for canonicalType (industry-agnostic)
+          let itemGatedWithProductType = itemGatedUnfiltered;
+          const bundleItemForTypeFilter = bundleItemsWithBudget[itemIdx];
+          const itemTypeForFilter = (bundleItemForTypeFilter as any).canonicalType || nonFacetItemTerms[0] || itemHardTerms[0];
+          
+          if (itemTypeForFilter && itemGatedUnfiltered.length > 0) {
+            // Build list of distinct productTypes from current filtered catalog
+            const productTypes = new Set<string>();
+            for (const c of allCandidatesEnriched) {
+              if (c.productType && typeof c.productType === "string" && c.productType.trim()) {
+                productTypes.add(c.productType.trim());
+              }
+            }
+            
+            if (productTypes.size > 0) {
+              // Compute match score for each productType against itemType tokens
+              const itemTypeTokens = itemTypeForFilter.toLowerCase().split(/[\s\-_]+/).filter((t: string) => t.length > 2);
+              const productTypeScores = new Map<string, number>();
+              
+              for (const productType of productTypes) {
+                const productTypeLower = productType.toLowerCase();
+                const productTypeTokens = productTypeLower.split(/[\s\-_]+/).filter(t => t.length > 2);
+                
+                // Compute overlap score
+                let score = 0;
+                for (const itemToken of itemTypeTokens) {
+                  if (productTypeTokens.includes(itemToken)) {
+                    score += 2; // Exact token match
+                  } else if (productTypeLower.includes(itemToken) || itemTypeForFilter.toLowerCase().includes(productTypeTokens[0] || "")) {
+                    score += 1; // Substring match
+                  }
+                }
+                
+                // Normalize by token count
+                if (itemTypeTokens.length > 0) {
+                  score = score / itemTypeTokens.length;
+                }
+                
+                if (score > 0) {
+                  productTypeScores.set(productType, score);
+                }
+              }
+              
+              // Find productTypes that match above threshold (score >= 0.5)
+              const matchedProductTypes = Array.from(productTypeScores.entries())
+                .filter(([_, score]) => score >= 0.5)
+                .sort(([_, a], [__, b]) => b - a)
+                .map(([pt, _]) => pt);
+              
+              if (matchedProductTypes.length > 0) {
+                const beforeProductType = itemGatedUnfiltered.length;
+                itemGatedWithProductType = itemGatedUnfiltered.filter(c => {
+                  const candidateProductType = c.productType ? String(c.productType).trim() : "";
+                  return matchedProductTypes.some(mpt => 
+                    candidateProductType.toLowerCase() === mpt.toLowerCase() ||
+                    candidateProductType.toLowerCase().includes(mpt.toLowerCase()) ||
+                    mpt.toLowerCase().includes(candidateProductType.toLowerCase())
+                  );
+                });
+                
+                // Only apply if it leaves a reasonable pool (>= 8 candidates)
+                if (itemGatedWithProductType.length >= 8) {
+                  console.log(`[Bundle] productType_filter itemIndex=${itemIdx} itemType=${itemTypeForFilter} matchedTypes=[${matchedProductTypes.join(", ")}] applied=true before=${beforeProductType} after=${itemGatedWithProductType.length}`);
+                } else {
+                  // Revert if pool too small
+                  itemGatedWithProductType = itemGatedUnfiltered;
+                  console.log(`[Bundle] productType_filter itemIndex=${itemIdx} itemType=${itemTypeForFilter} matchedTypes=[${matchedProductTypes.join(", ")}] applied=false reason=pool_too_small after=${itemGatedWithProductType.length}`);
+                }
+              }
+            }
+          }
+          
+          // NEGATIVE-TYPE GUARD: Exclude candidates that strongly match OTHER bundle item types
+          let itemGatedAfterNegativeGuard = itemGatedWithProductType;
+          if (bundleIntent.items.length > 1 && itemGatedWithProductType.length > 0) {
+            const otherItemTypes: string[] = [];
+            for (let otherIdx = 0; otherIdx < bundleIntent.items.length; otherIdx++) {
+              if (otherIdx !== itemIdx) {
+                const otherItemForGuard = bundleItemsWithBudget[otherIdx];
+                const otherItemType = (otherItemForGuard as any).canonicalType || otherItemForGuard.hardTerms[0];
+                if (otherItemType && otherItemType !== itemTypeForFilter) {
+                  otherItemTypes.push(otherItemType);
+                }
+              }
+            }
+            
+            if (otherItemTypes.length > 0) {
+              const beforeNegative = itemGatedAfterNegativeGuard.length;
+              const excludedByOtherTypes: string[] = [];
+              
+              itemGatedAfterNegativeGuard = itemGatedAfterNegativeGuard.filter(c => {
+                const candidateText = [
+                  c.title || "",
+                  c.productType || "",
+                  c.handle || "",
+                  (c.tags || []).join(" "),
+                ].join(" ").toLowerCase();
+                
+                // Check if candidate strongly matches any other item type
+                for (const otherType of otherItemTypes) {
+                  const otherTypeTokens = otherType.toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 2);
+                  const matchCount = otherTypeTokens.filter(token => candidateText.includes(token)).length;
+                  
+                  // If most tokens match, exclude
+                  if (otherTypeTokens.length > 0 && matchCount / otherTypeTokens.length >= 0.7) {
+                    excludedByOtherTypes.push(otherType);
+                    return false;
+                  }
+                }
+                
+                return true;
+              });
+              
+              const removed = beforeNegative - itemGatedAfterNegativeGuard.length;
+              if (removed > 0) {
+                const uniqueExcluded = Array.from(new Set(excludedByOtherTypes));
+                console.log(`[Bundle] negative_type_guard itemIndex=${itemIdx} excludedByOtherTypes=[${uniqueExcluded.join(", ")}] removed=${removed}`);
+              }
+            }
+          }
+          
+          let itemGatedAfterAnchor = itemGatedAfterNegativeGuard;
           if (nonFacetItemTerms.length > 0) {
             const beforeAnchor = itemGatedUnfiltered.length;
             
@@ -7736,7 +7857,7 @@ async function processSessionInBackground({
       
       /**
        * Validate final handles against hard constraints (when trustFallback=false)
-       * Industry-agnostic: uses new facet system
+       * Industry-agnostic: uses new facet system with token fallback when structured facets are missing
        */
       async function validateFinalHandles(
         handles: string[],
@@ -7766,8 +7887,110 @@ async function processSessionInBackground({
           // Check constraints using new facet system (industry-agnostic)
           let passesConstraints = true;
           if (facetConstraints.length > 0) {
-            if (!productSatisfiesConstraints(candidate, facetConstraints, true)) {
-              passesConstraints = false;
+            // First attempt: structured matching (variants/options/tags)
+            const structuredMatch = productSatisfiesConstraints(candidate, facetConstraints, true);
+            
+            if (!structuredMatch) {
+              // Check if structured facets exist for this product
+              const hasStructuredFacets = Array.isArray(candidate.variants) && candidate.variants.length > 0 &&
+                candidate.variants.some((v: any) => Array.isArray(v.selectedOptions) && v.selectedOptions.length > 0);
+              
+              // Check for tag-based facets (cf-color-*, cf-size-*, etc)
+              const tags = Array.isArray(candidate.tags) ? candidate.tags : [];
+              const hasTagFacets = tags.some((tag: string) => 
+                typeof tag === "string" && (
+                  tag.startsWith("cf-color-") ||
+                  tag.startsWith("cf-size-") ||
+                  tag.startsWith("cf-material-")
+                )
+              );
+              
+              // Check for conflicting structured values
+              let hasConflictingStructuredValue = false;
+              if (hasStructuredFacets || hasTagFacets) {
+                // Product has structured facets but didn't match - check for conflicts
+                for (const constraint of facetConstraints) {
+                  const normalizedConstraintValue = constraint.value.toLowerCase().trim();
+                  
+                  // Check variants
+                  if (Array.isArray(candidate.variants)) {
+                    for (const variant of candidate.variants) {
+                      if (Array.isArray(variant.selectedOptions)) {
+                        for (const opt of variant.selectedOptions) {
+                          const normalizedName = (opt.name || "").toLowerCase().trim();
+                          const normalizedValue = (opt.value || "").toLowerCase().trim();
+                          
+                          if (normalizedName === constraint.key.toLowerCase() && 
+                              normalizedValue !== normalizedConstraintValue &&
+                              !normalizedValue.includes(normalizedConstraintValue) &&
+                              !normalizedConstraintValue.includes(normalizedValue)) {
+                            hasConflictingStructuredValue = true;
+                            console.log(`[Validation] rejected_due_to_conflicting_structured_facet facet=${constraint.key} expected=${constraint.value} actual=${opt.value}`);
+                            break;
+                          }
+                        }
+                      }
+                      if (hasConflictingStructuredValue) break;
+                    }
+                  }
+                  
+                  // Check tags
+                  if (!hasConflictingStructuredValue && hasTagFacets) {
+                    const tagPrefix = `cf-${constraint.key}-`;
+                    const matchingTags = tags.filter((tag: string) => 
+                      typeof tag === "string" && tag.toLowerCase().startsWith(tagPrefix.toLowerCase())
+                    );
+                    if (matchingTags.length > 0) {
+                      const tagValue = matchingTags[0].replace(new RegExp(`^${tagPrefix}`, "i"), "").toLowerCase().trim();
+                      if (tagValue !== normalizedConstraintValue &&
+                          !tagValue.includes(normalizedConstraintValue) &&
+                          !normalizedConstraintValue.includes(tagValue)) {
+                        hasConflictingStructuredValue = true;
+                        console.log(`[Validation] rejected_due_to_conflicting_structured_facet facet=${constraint.key} expected=${constraint.value} actual=${tagValue} (from tag)`);
+                        break;
+                      }
+                    }
+                  }
+                  if (hasConflictingStructuredValue) break;
+                }
+              }
+              
+              // If no conflicting structured value, try token fallback
+              if (!hasConflictingStructuredValue && (!hasStructuredFacets && !hasTagFacets)) {
+                // No structured facets - use token containment fallback
+                const indexedText = [
+                  candidate.title || "",
+                  candidate.handle || "",
+                  candidate.productType || "",
+                  (candidate.tags || []).join(" "),
+                  candidate.vendor || "",
+                  candidate.searchText || "",
+                ].join(" ").toLowerCase();
+                
+                let tokenFallbackMatch = true;
+                for (const constraint of facetConstraints) {
+                  const constraintValue = constraint.value.toLowerCase().trim();
+                  if (!indexedText.includes(constraintValue)) {
+                    tokenFallbackMatch = false;
+                    break;
+                  }
+                }
+                
+                if (tokenFallbackMatch) {
+                  console.log(`[Validation] facet_missing_structured=true facet=${facetConstraints.map(c => c.key).join(",")} value=${facetConstraints.map(c => c.value).join(",")} using_token_fallback=true`);
+                  passesConstraints = true; // Token fallback passed
+                } else {
+                  passesConstraints = false;
+                }
+              } else if (hasConflictingStructuredValue) {
+                // Explicit conflict - reject
+                passesConstraints = false;
+              } else {
+                // Structured facets exist but didn't match and no token fallback
+                passesConstraints = false;
+              }
+            } else {
+              passesConstraints = true; // Structured match succeeded
             }
           }
           
@@ -8819,9 +9042,14 @@ async function processSessionInBackground({
         // Add refilled handles to diverseHandles
         if (refillHandles.length > 0) {
           diverseHandles = [...diverseHandles, ...refillHandles].slice(0, finalResultCount);
-          // Mark that we refilled from remaining candidates (resultSource will be set to "fallback" later, not "ai")
-          usedRefillFromRemaining = true;
-          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${refillHandles.length} source=remaining_candidates`);
+          // Diversity refill is NOT a fallback - it's just filling gaps from AI result
+          // Only mark as fallback if we truly fell back from AI (AI failed or trustFallback=true)
+          // Don't set usedRefillFromRemaining here - it's just diversity refill, not a true fallback
+          const aiCoreUsed = finalSource === "ai" && !trustFallback;
+          console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${diverseHandles.length} added=${refillHandles.length} source=remaining_candidates aiCoreUsed=${aiCoreUsed}`);
+          if (aiCoreUsed) {
+            console.log(`[ResultSource] final=ai aiCoreUsed=true diversityRefill=true refillCount=${refillHandles.length}`);
+          }
         } else {
           console.log(`[Bundle] post-diversity refill: before=${beforeRefill} after=${beforeRefill} added=0 reason=no_valid_candidates`);
         }
@@ -9507,10 +9735,16 @@ async function processSessionInBackground({
       let resultSource: "ai" | "fallback" | "emergency_fallback_unmatched" = "ai";
       
       // Update resultSource based on validation fallback or refills
-      // If we used validation fallback or refilled from remaining_candidates/BM25, set to "fallback" (not "ai")
-      if (usedValidationFallback || usedRefillFromRemaining || usedRefillFromBM25) {
+      // Diversity refill is NOT a fallback - it's just filling gaps from AI result
+      // Only mark as fallback if we truly fell back from AI (AI failed or trustFallback=true)
+      // usedRefillFromRemaining should only be true for true fallbacks, not diversity refills
+      const aiCoreUsed = finalSource === "ai" && !trustFallback;
+      if (usedValidationFallback || (usedRefillFromRemaining && !aiCoreUsed) || usedRefillFromBM25) {
         resultSource = "fallback";
-        console.log(`[App Proxy] resultSource set to "fallback" (validationFallback=${usedValidationFallback}, refillRemaining=${usedRefillFromRemaining}, refillBM25=${usedRefillFromBM25})`);
+        console.log(`[App Proxy] resultSource set to "fallback" (validationFallback=${usedValidationFallback}, refillRemaining=${usedRefillFromRemaining && !aiCoreUsed}, refillBM25=${usedRefillFromBM25})`);
+      } else if (aiCoreUsed) {
+        resultSource = "ai";
+        console.log(`[ResultSource] final=ai aiCoreUsed=true diversityRefill=${usedRefillFromRemaining} validationFallback=${usedValidationFallback}`);
       }
       
       // FINAL SAFETY CHECK: Only use emergency fallback if absolutely no results (rare occurrence)
