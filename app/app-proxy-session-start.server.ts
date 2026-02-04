@@ -6782,31 +6782,34 @@ async function processSessionInBackground({
             
             // Stage 1: relax least important constraint
             const stage1Result = relaxConstraints(mergedItemConstraints, facetVocabularyForBundle.optionNames, 1);
-            const stage1Gated = allCandidatesEnriched.filter(c => {
+            const stage1Gated: EnrichedCandidate[] = [];
+            for (const c of allCandidatesEnriched) {
               if (stage1Result.relaxed.length > 0) {
-                if (!productSatisfiesConstraints(c, stage1Result.relaxed, true)) {
-                  return false;
+                // Use satisfiesConstraintsStructuredOrTags to check structured OR tags (not just structured)
+                const constraintResult = await satisfiesConstraintsStructuredOrTags(c, stage1Result.relaxed, facetVocabulary);
+                if (!constraintResult.ok) {
+                  continue;
                 }
               }
               
               const slotDescriptor = itemHardTerms.join(" ");
               const slotScore = scoreProductForSlot(c, slotDescriptor);
-              if (slotScore < 0.1) return false;
+              if (slotScore < 0.1) continue;
               
               if (itemConstraints?.includeTerms && itemConstraints.includeTerms.length > 0) {
                 const includeDescriptor = itemConstraints.includeTerms.join(" ");
                 const includeScore = scoreProductForSlot(c, includeDescriptor);
-                if (includeScore < 0.1) return false;
+                if (includeScore < 0.1) continue;
               }
               
               if (itemConstraints?.excludeTerms && itemConstraints.excludeTerms.length > 0) {
                 const excludeDescriptor = itemConstraints.excludeTerms.join(" ");
                 const excludeScore = scoreProductForSlot(c, excludeDescriptor);
-                if (excludeScore >= 0.1) return false;
+                if (excludeScore >= 0.1) continue;
               }
               
-              return true;
-            });
+              stage1Gated.push(c);
+            }
             
             if (stage1Gated.length > 0) {
               itemGatedUnfiltered = stage1Gated;
@@ -8157,11 +8160,11 @@ async function processSessionInBackground({
             ].join(" ");
             
             // Use word-boundary matching for all hard terms (not token matching)
-            // FIX: matchesHardTermWithBoundary takes (searchText, hardTerm) - arguments were reversed
-            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(phrase, haystack));
+            // CORRECT ORDER: matchesHardTermWithBoundary(haystackText, term) - haystack is the text to search in, term is what we're looking for
+            const hasHardTermMatch = hardTerms.some(phrase => matchesHardTermWithBoundary(haystack, phrase));
             
             // Also check boost terms
-            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(term, haystack));
+            const hasBoostTerm = Array.from(boostTerms).some(term => matchesHardTermWithBoundary(haystack, term));
             
             if (!hasHardTermMatch && !hasBoostTerm) {
               passesConstraints = false;
@@ -8606,10 +8609,13 @@ async function processSessionInBackground({
       // Safe fallback: if validation returns 0, use gated pool instead of unsafe token matching
       if (validatedHandles.length === 0 && finalHandles.length > 0 && !trustFallback) {
         // Fallback to first resultCount handles from gated pool (already ranked/gated candidates)
-        const gatedPoolHandles = gatedCandidates
-          .filter(c => c.available !== false)
-          .slice(0, finalResultCount)
-          .map(c => c.handle);
+        // Dedupe handles, filter unavailable, respect resultCount
+        const gatedPoolHandles = Array.from(new Set(
+          gatedCandidates
+            .filter(c => c.available !== false && c.handle)
+            .slice(0, finalResultCount)
+            .map(c => c.handle)
+        ));
         
         if (gatedPoolHandles.length > 0) {
           validatedHandles = gatedPoolHandles;
