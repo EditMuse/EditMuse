@@ -81,7 +81,7 @@ function isTimeoutError(error: any): boolean {
  * Build JSON schema for structured intent output
  */
 function buildIntentSchema() {
-  return {
+  const schema = {
     type: "object",
     properties: {
       isBundle: {
@@ -106,9 +106,18 @@ function buildIntentSchema() {
       hardFacets: {
         type: "object",
         properties: {
-          size: { type: ["string", "null"], description: "Size constraint if specified (e.g., 'Large', 'XL')" },
-          color: { type: ["string", "null"], description: "Color constraint if specified (e.g., 'Blue', 'Red')" },
-          material: { type: ["string", "null"], description: "Material constraint if specified (e.g., 'Cotton', 'Leather')" }
+          size: { 
+            anyOf: [{ type: "string" }, { type: "null" }], 
+            description: "Size constraint if specified (e.g., 'Large', 'XL')" 
+          },
+          color: { 
+            anyOf: [{ type: "string" }, { type: "null" }], 
+            description: "Color constraint if specified (e.g., 'Blue', 'Red')" 
+          },
+          material: { 
+            anyOf: [{ type: "string" }, { type: "null" }], 
+            description: "Material constraint if specified (e.g., 'Cotton', 'Leather')" 
+          }
         },
         required: ["size", "color", "material"],
         additionalProperties: false
@@ -124,7 +133,7 @@ function buildIntentSchema() {
               description: "Product terms for this bundle item. MUST include the core product noun/type (e.g., 'suit', 'shirt', 'trouser', 'lipstick', 'sofa'), NOT just adjectives like colors. Colors/sizes/materials MUST go into constraints.optionConstraints."
             },
             itemType: {
-              type: ["string", "null"],
+              anyOf: [{ type: "string" }, { type: "null" }],
               description: "The product type/noun for this bundle item (e.g., 'suit', 'shirt', 'lipstick', 'sofa'). This represents the product type, NOT a color or size. If missing, will be derived from hardTerms."
             },
             quantity: {
@@ -138,32 +147,46 @@ function buildIntentSchema() {
                 optionConstraints: {
                   type: "object",
                   properties: {
-                    size: { type: ["string", "null"] },
-                    color: { type: ["string", "null"] },
-                    material: { type: ["string", "null"] }
+                    size: { 
+                      anyOf: [{ type: "string" }, { type: "null" }] 
+                    },
+                    color: { 
+                      anyOf: [{ type: "string" }, { type: "null" }] 
+                    },
+                    material: { 
+                      anyOf: [{ type: "string" }, { type: "null" }] 
+                    }
                   },
                   required: ["size", "color", "material"],
                   additionalProperties: false
                 },
-                priceCeiling: { type: ["number", "null"] },
-                includeTerms: { type: "array", items: { type: "string" } },
-                excludeTerms: { type: "array", items: { type: "string" } }
+                priceCeiling: { 
+                  anyOf: [{ type: "number" }, { type: "null" }] 
+                },
+                includeTerms: { 
+                  type: "array", 
+                  items: { type: "string" } 
+                },
+                excludeTerms: { 
+                  type: "array", 
+                  items: { type: "string" } 
+                }
               },
               required: ["optionConstraints", "priceCeiling", "includeTerms", "excludeTerms"],
               additionalProperties: false
             }
           },
-          required: ["hardTerms", "quantity", "constraints"],
+          required: ["hardTerms", "itemType", "quantity", "constraints"],
           additionalProperties: false
         },
         description: "Array of bundle items (only populated if isBundle is true)"
       },
       totalBudget: {
-        type: ["number", "null"],
+        anyOf: [{ type: "number" }, { type: "null" }],
         description: "Total budget for bundle if specified (e.g., 500 for '$500 budget')"
       },
       totalBudgetCurrency: {
-        type: ["string", "null"],
+        anyOf: [{ type: "string" }, { type: "null" }],
         description: "Currency code if detected (e.g., 'USD', 'GBP', 'EUR')"
       },
       preferences: {
@@ -175,6 +198,12 @@ function buildIntentSchema() {
     required: ["isBundle", "hardTerms", "softTerms", "avoidTerms", "hardFacets", "bundleItems", "totalBudget", "totalBudgetCurrency", "preferences"],
     additionalProperties: false
   };
+  
+  // Log schema validation info
+  const bundleItemsRequired = (schema.properties.bundleItems.items as any).required;
+  console.log(`[Intent Schema] name=parsed_intent bundleItems.items.required exists=${!!bundleItemsRequired} required_fields=${JSON.stringify(bundleItemsRequired)}`);
+  
+  return schema;
 }
 
 /**
