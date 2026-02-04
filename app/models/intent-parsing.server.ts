@@ -127,10 +127,6 @@ function buildIntentSchema() {
               type: ["string", "null"],
               description: "The product type/noun for this bundle item (e.g., 'suit', 'shirt', 'lipstick', 'sofa'). This represents the product type, NOT a color or size. If missing, will be derived from hardTerms."
             },
-            canonicalType: {
-              type: ["string", "null"],
-              description: "Alternative field name for itemType. The canonical product type for this bundle item."
-            },
             quantity: {
               type: "integer",
               minimum: 1,
@@ -210,7 +206,7 @@ Your task is to analyze the user's query and extract:
 4. **Hard Facets**: Specific size, color, or material constraints if mentioned (works for any industry)
    - **CRITICAL**: Explicit sizes/colors/materials MUST be assigned to hardFacets (and per-item optionConstraints in bundle mode), NOT left in hardTerms
    - **CRITICAL**: For bundleItems, hardTerms MUST include the core product noun/type (e.g., "suit", "shirt", "trouser", "lipstick", "sofa"), NOT just adjectives like colors
-   - **CRITICAL**: Each bundleItem should have itemType or canonicalType field set to the product type (not color/size/material)
+   - **CRITICAL**: Each bundleItem should have itemType field set to the product type (not color/size/material). If missing, it will be derived from hardTerms.
    - If user says "in large" after listing multiple items, treat it as a global size unless an item-specific size is clearly stated
    - Example: "suit, shirt and trousers in large" → hardFacets: {size: "large", color: null, material: null}, bundleItems: [{hardTerms: ["suit"], itemType: "suit"}, {hardTerms: ["shirt"], itemType: "shirt"}, {hardTerms: ["trouser"], itemType: "trouser"}] with size applied globally
    - Example: "blue shirt in medium, black trousers in large" → bundleItems: [{hardTerms: ["shirt"], itemType: "shirt", constraints: {optionConstraints: {size: "medium", color: "blue"}}}, {hardTerms: ["trouser"], itemType: "trouser", constraints: {optionConstraints: {size: "large", color: "black"}}}]
