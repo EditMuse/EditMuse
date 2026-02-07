@@ -3327,6 +3327,14 @@ async function processSessionInBackground({
   let priceMax: number | null = null;
   let userCurrency: string | null = null; // Track user-specified currency from answers
   
+  // Helper to detect currency symbol in answer string
+  function detectCurrencySymbol(s: string): string | null {
+    if (s.includes("£")) return "GBP";
+    if (s.includes("$")) return "USD";
+    if (s.includes("€")) return "EUR";
+    return null;
+  }
+  
   if (Array.isArray(answers)) {
     // Look for budget/price range answers - check if any answer matches common budget patterns
     for (const answer of answers) {
@@ -3349,7 +3357,8 @@ async function processSessionInBackground({
         const match = answerLower.match(/under[-\s]*\$?(\d+)/);
         if (match) {
           priceMax = parseFloat(match[1]) - 0.01; // Under $50 means < $50, so max is 49.99
-          console.log("[App Proxy] Detected budget: under", match[1], "-> max:", priceMax);
+          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
+          console.log("[App Proxy] Detected budget: under", match[1], "-> max:", priceMax, "userCurrency:", userCurrency || "none");
         }
       } 
       // Handle "500-plus" or "500+" format
@@ -3358,7 +3367,8 @@ async function processSessionInBackground({
         const amount = match ? parseFloat(match[1] || match[2]) : null;
         if (amount) {
           priceMin = amount;
-          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin);
+          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
+          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin, "userCurrency:", userCurrency || "none");
         }
       } 
       // Handle range like "50-100" or "$50 - $100"
@@ -3367,7 +3377,8 @@ async function processSessionInBackground({
         if (match) {
           priceMin = parseFloat(match[1]);
           priceMax = parseFloat(match[2]);
-          console.log("[App Proxy] Detected budget range:", priceMin, "-", priceMax);
+          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
+          console.log("[App Proxy] Detected budget range:", priceMin, "-", priceMax, "userCurrency:", userCurrency || "none");
         }
       }
       // Handle "plus" or "+" with amount before it (e.g., "$500+", "500 and above")
@@ -3376,10 +3387,16 @@ async function processSessionInBackground({
         const amount = match ? parseFloat(match[1] || match[2] || match[3]) : null;
         if (amount) {
           priceMin = amount;
-          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin);
+          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
+          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin, "userCurrency:", userCurrency || "none");
         }
       }
     }
+  }
+  
+  // Log budget detection summary
+  if (priceMin !== null || priceMax !== null) {
+    console.log(`[BudgetDetected] min=${priceMin ?? "null"} max=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"}`);
   }
 
   // Get access token from Session table
@@ -3599,6 +3616,9 @@ async function processSessionInBackground({
         relaxNotes.push("Showing closest matches across the catalogue.");
         filteredProducts = [...baseProducts];
       }
+
+      // Log budget pool filtering summary
+      console.log(`[BudgetPool] base=${baseProducts.length} after_stock_and_budget=${filteredProducts.length} min=${priceMin ?? "null"} max=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"}`);
 
       // Create known option names from catalogue
       const knownOptionNames = Array.from(
@@ -5607,6 +5627,33 @@ async function processSessionInBackground({
         }
       }
       
+      // Budget filter helper: applies priceMin/priceMax constraints to candidates
+      function applyBudgetFilterCandidates<T extends { priceAmount?: any; price?: any }>(
+        candidates: T[],
+        priceMin: number | null,
+        priceMax: number | null
+      ): T[] {
+        const hadBudget = typeof priceMin === "number" || typeof priceMax === "number";
+        if (!hadBudget) return candidates;
+
+        const before = candidates.length;
+        const out = candidates.filter(c => {
+          const raw = c.priceAmount ?? c.price;
+          const price = raw != null ? parseFloat(String(raw)) : NaN;
+          if (!Number.isFinite(price)) return true; // keep unknown prices
+          if (typeof priceMin === "number" && price < priceMin) return false;
+          if (typeof priceMax === "number" && price > priceMax) return false;
+          return true;
+        });
+        const after = out.length;
+        if (before !== after) {
+          console.log(`[BudgetFilter] applied=true before=${before} after=${after} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
+        } else {
+          console.log(`[BudgetFilter] applied=true no_change count=${before} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
+        }
+        return out;
+      }
+
       // Gate 2: Hard terms (STRICT: must match ALL hard terms when count >= 2, OR at least one when count == 1)
       // Use word-boundary matching on normalized text (title/productType/tags/descPlain), not substring
       let trustFallback = false;
@@ -5707,7 +5754,7 @@ async function processSessionInBackground({
         
         if (strictGateCount >= minNeededForRequested) {
           // Stage A: Strict gate is sufficient - keep it
-          gatedCandidates = strictGate;
+          gatedCandidates = applyBudgetFilterCandidates(strictGate, priceMin, priceMax);
           trustFallback = false;
           console.log(`[Gating] Stage A: strict (hard terms + facets) - strictGateCount=${strictGateCount} >= minNeeded=${minNeededForRequested} trustFallback=false`);
         } else if (strictGateCount === 0) {
@@ -5762,7 +5809,8 @@ async function processSessionInBackground({
           
           if (retryStrictGate.length > 0) {
             strictGateCount = retryStrictGate.length;
-            gatedCandidates = retryStrictGate;
+            gatedCandidates = applyBudgetFilterCandidates(retryStrictGate, priceMin, priceMax);
+            strictGateCount = gatedCandidates.length;
             trustFallback = false;
             console.log(`[Gating] Retry with morphology/decompound succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
           } else {
@@ -5802,7 +5850,7 @@ async function processSessionInBackground({
                 return a.candidate.handle.localeCompare(b.candidate.handle);
               });
               
-              gatedCandidates = scoredCandidates.map(s => s.candidate);
+              gatedCandidates = applyBudgetFilterCandidates(scoredCandidates.map(s => s.candidate), priceMin, priceMax);
               strictGateCount = gatedCandidates.length;
               trustFallback = false;
               console.log(`[Gating] BM25 with expanded token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
@@ -5910,7 +5958,8 @@ async function processSessionInBackground({
                     
                     // Update allCandidatesEnriched and rerun strict gate
                     allCandidatesEnriched = mergedEnriched;
-                    gatedCandidates = allCandidatesEnriched; // Reset to all candidates
+                    gatedCandidates = applyBudgetFilterCandidates(allCandidatesEnriched, priceMin, priceMax);
+                    console.log(`[Gating] reset_to_all_candidates budget_enforced=true count=${gatedCandidates.length}`);
                     
                     // Rerun strict gate
                     const retryStrictGate: EnrichedCandidate[] = [];
@@ -5927,7 +5976,8 @@ async function processSessionInBackground({
                     
                     if (retryStrictGate.length > 0) {
                       strictGateCount = retryStrictGate.length;
-                      gatedCandidates = retryStrictGate;
+                      gatedCandidates = applyBudgetFilterCandidates(retryStrictGate, priceMin, priceMax);
+                      strictGateCount = gatedCandidates.length;
                       trustFallback = false;
                       console.log(`[Gating] fallback_search_used=true strictGateCount_before=0 strictGateCount_after=${strictGateCount}`);
                     } else {
@@ -5978,9 +6028,9 @@ async function processSessionInBackground({
           console.log(`[Gating] Stage B: relax facets only - count=${stageB.length} (strictGateCount=${strictGateCount})`);
           
           if (stageB.length >= minNeededForRequested) {
-            gatedCandidates = stageB;
+            gatedCandidates = applyBudgetFilterCandidates(stageB, priceMin, priceMax);
             trustFallback = false;
-            console.log(`[Gating] Stage B: relax facets only (keep all hardTerms) - count=${stageB.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
+            console.log(`[Gating] Stage B: relax facets only (keep all hardTerms) - count=${gatedCandidates.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
               } else {
             // Stage C: Relax hard terms (allow token containment matching)
             // Use token-based matching: check if any normalized hard term token appears in indexed text
@@ -6002,9 +6052,9 @@ async function processSessionInBackground({
             console.log(`[Gating] Stage C: token containment - count=${stageC.length} hardTermTokens=[${Array.from(hardTermTokens).join(", ")}]`);
             
             if (stageC.length >= MIN_CANDIDATES_FOR_AI) {
-              gatedCandidates = stageC;
+              gatedCandidates = applyBudgetFilterCandidates(stageC, priceMin, priceMax);
               trustFallback = false;
-              console.log(`[Gating] Stage C: relax hard terms (token containment, keep all terms) - count=${stageC.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
+              console.log(`[Gating] Stage C: relax hard terms (token containment, keep all terms) - count=${gatedCandidates.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
           } else {
               // Stage D: BM25 over full pool but filtered to items that match at least 1 normalized hard token
               // Use BM25 ranking but only include candidates with at least one token match
@@ -6019,9 +6069,9 @@ async function processSessionInBackground({
               console.log(`[Gating] Stage D: BM25 with token filter - count=${stageD.length}`);
               
               if (stageD.length > 0) {
-                gatedCandidates = stageD;
+                gatedCandidates = applyBudgetFilterCandidates(stageD, priceMin, priceMax);
                 trustFallback = false;
-                console.log(`[Gating] Stage D: BM25 with token filter - count=${stageD.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
+                console.log(`[Gating] Stage D: BM25 with token filter - count=${gatedCandidates.length} anchor_terms=[${hardTerms.join(", ")}] trustFallback=false`);
               } else {
                 // All stages failed - mark for emergency fallback (no billing)
             trustFallback = true;
@@ -6056,6 +6106,8 @@ async function processSessionInBackground({
             return searchText.includes(termLower);
           });
         });
+        // Re-apply budget filter after anchor gating
+        gatedCandidates = applyBudgetFilterCandidates(gatedCandidates, priceMin, priceMax);
         const afterAnchor = gatedCandidates.length;
         console.log(`[Gating] mode=${modeUsed} flow=single anchor_terms=[${nonFacetTerms.join(", ")}] before=${beforeAnchor} after=${afterAnchor} stage=A`);
       } else if (nonFacetTerms.length === 0 && !isBundleFlow) {
@@ -6071,6 +6123,8 @@ async function processSessionInBackground({
           const searchText = extractSearchText(c, indexMetafields);
           return !avoidTerms.some(avoid => searchText.includes(avoid.toLowerCase()));
         });
+        // Re-apply budget filter after avoid terms filtering
+        gatedCandidates = applyBudgetFilterCandidates(gatedCandidates, priceMin, priceMax);
         if (gatedCandidates.length < beforeAvoid) {
           console.log("[App Proxy] [Layer 2] Avoid terms filtered:", gatedCandidates.length, "candidates (from", beforeAvoid, ")");
         }
@@ -6080,6 +6134,9 @@ async function processSessionInBackground({
       // Store strict gate candidates for fallback ranking (if strictGateCount > 0, fallback must use strict gate only)
       const strictGateCandidates = strictGate.length > 0 ? [...strictGate] : undefined;
       console.log("[App Proxy] [Layer 2] Final gated pool:", gatedCandidates.length, "candidates");
+      
+      // Budget sanity check before AI window selection
+      console.log(`[BudgetSanity] gated_before_ai=${gatedCandidates.length} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
       
       // BUG FIX #2: NO_MATCH CHECK - If all gating stages failed and we have no candidates, return NO_MATCH result
       // This must short-circuit BEFORE BM25 ranking and AI ranking
