@@ -1915,26 +1915,11 @@ function inferCanonicalType(candidate: { title?: string | null; productType?: st
   const tokens = tokenize(searchableText);
   const tokenSet = new Set(tokens);
   
-  // Common product type patterns (industry-agnostic, supports singular/plural)
-  const typePatterns: Array<{ pattern: RegExp; canonical: string }> = [
-    { pattern: /\b(suit|suits)\b/i, canonical: "suit" },
-    { pattern: /\b(shirt|shirts)\b/i, canonical: "shirt" },
-    { pattern: /\b(trouser|trousers|pant|pants)\b/i, canonical: "trouser" },
-    { pattern: /\b(jacket|jackets)\b/i, canonical: "jacket" },
-    { pattern: /\b(coat|coats|overcoat|overcoats)\b/i, canonical: "coat" },
-    { pattern: /\b(shoe|shoes|boot|boots|sneaker|sneakers)\b/i, canonical: "shoe" },
-    { pattern: /\b(tie|ties)\b/i, canonical: "tie" },
-    { pattern: /\b(vest|vests)\b/i, canonical: "vest" },
-  ];
+  // Industry-agnostic: Extract canonical type from product metadata
+  // Priority: productType > first significant token from title > first token from tags > "unknown"
+  // No hardcoded patterns - works for any industry
   
-  // Check patterns first (more specific)
-  for (const { pattern, canonical } of typePatterns) {
-    if (pattern.test(searchableText)) {
-      return canonical;
-    }
-  }
-  
-  // Fallback: use productType if available, otherwise use first significant token
+  // First, try productType (most reliable)
   if (candidate.productType) {
     const normalized = normalizeItemLabel(candidate.productType);
     if (normalized && normalized !== "unknown") {
@@ -1942,7 +1927,27 @@ function inferCanonicalType(candidate: { title?: string | null; productType?: st
     }
   }
   
-  // Last resort: use first significant token from title
+  // Second, use first significant token from title (industry-agnostic)
+  // Filter out common non-product words
+  const nonProductWords = new Set([
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had",
+    "new", "old", "used", "vintage", "modern", "classic", "premium", "luxury", "basic",
+    "black", "white", "red", "blue", "green", "yellow", "orange", "purple", "pink", "brown",
+    "small", "medium", "large", "xl", "xxl", "men", "women", "mens", "womens", "unisex"
+  ]);
+  
+  const significantTokens = tokens.filter(t => 
+    t.length >= 3 && 
+    !nonProductWords.has(t) && 
+    !/^\d+$/.test(t)
+  );
+  
+  if (significantTokens.length > 0) {
+    return significantTokens[0];
+  }
+  
+  // Last resort: use first token (even if short)
   if (tokens.length > 0) {
     return tokens[0];
   }
@@ -3828,6 +3833,152 @@ async function processSessionInBackground({
     userCurrency = resolvedCurrency;
   }
   
+  // Issue 2 fix: Parse per-item budgets from conversation messages for bundle mode (industry-agnostic)
+  // Look for patterns like "Suit Less Than $250 and A Shirt Less Than $50"
+  // Industry-agnostic: extracts meaningful terms before budget indicators, not hardcoded product types
+  const perItemBudgets: Array<{ itemType: string; itemTerms: string[]; min: number | null; max: number | null; currency: string | null; source: string }> = [];
+  
+  // Helper to extract meaningful item terms from text (industry-agnostic)
+  // Removes stopwords and extracts nouns/meaningful phrases before budget indicators
+  function extractItemTerms(text: string): string[] {
+    const stopwords = new Set([
+      "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+      "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
+      "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "these", "those",
+      "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+      "what", "which", "who", "whom", "where", "when", "why", "how", "if", "then", "else",
+      "about", "above", "after", "before", "below", "between", "during", "through", "under", "over",
+      "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
+      "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "such",
+      "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
+      "less", "than", "more", "most", "least", "fewer", "greater"
+    ]);
+    
+    // Remove budget-related words
+    const budgetWords = new Set(["for", "less", "than", "under", "over", "above", "below", "plus", "and", "or"]);
+    
+    // Tokenize and filter
+    const tokens = text.toLowerCase()
+      .split(/\s+/)
+      .map(t => t.replace(/[^\w]/g, ""))
+      .filter(t => t.length >= 2 && !stopwords.has(t) && !budgetWords.has(t) && !/^\d+$/.test(t));
+    
+    // Extract meaningful phrases (2-3 word combinations that might be product types)
+    const phrases: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      // Single meaningful token (3+ chars, not a number)
+      if (tokens[i].length >= 3) {
+        phrases.push(tokens[i]);
+      }
+      // Two-word phrase
+      if (i < tokens.length - 1 && tokens[i].length >= 2 && tokens[i + 1].length >= 2) {
+        phrases.push(`${tokens[i]} ${tokens[i + 1]}`);
+      }
+      // Three-word phrase (for compound product types)
+      if (i < tokens.length - 2 && tokens[i].length >= 2 && tokens[i + 1].length >= 2 && tokens[i + 2].length >= 2) {
+        phrases.push(`${tokens[i]} ${tokens[i + 1]} ${tokens[i + 2]}`);
+      }
+    }
+    
+    // Return unique phrases, prioritizing shorter ones first
+    return Array.from(new Set(phrases)).sort((a, b) => a.length - b.length);
+  }
+  
+  if (conversationMessages && conversationMessages.length > 0) {
+    for (const msg of conversationMessages) {
+      if (msg.role === "user" && msg.content) {
+        const content = msg.content.trim();
+        const contentLower = content.toLowerCase();
+        
+        // Look for patterns like "X for less than $Y" or "X less than $Y" or "X under $Y"
+        // Split by common conjunctions: "and", "&", ","
+        const parts = content.split(/\s+(and|&|,)\s+/i);
+        
+        for (const part of parts) {
+          const partTrimmed = part.trim();
+          if (partTrimmed.length === 0) continue;
+          
+          // Try to extract item type and budget from this part
+          // Pattern 1: "itemType [for] less than $amount" or "itemType [for] under $amount"
+          const lessThanMatch = partTrimmed.match(/(.+?)\s+(?:for\s+)?(?:less\s+than|under)\s+\$?(\d+)/i);
+          if (lessThanMatch) {
+            const itemPart = lessThanMatch[1].trim();
+            const amount = parseFloat(lessThanMatch[2]);
+            const currency = detectCurrencySymbol(partTrimmed) || (partTrimmed.includes("$") ? "USD" : null);
+            
+            // Extract item terms using industry-agnostic approach
+            const itemTerms = extractItemTerms(itemPart);
+            
+            if (itemTerms.length > 0 && amount > 0) {
+              // Use the first (shortest) meaningful term as the primary itemType
+              const primaryItemType = itemTerms[0];
+              perItemBudgets.push({
+                itemType: primaryItemType,
+                itemTerms,
+                min: null,
+                max: amount,
+                currency,
+                source: partTrimmed
+              });
+              console.log(`[Budget] per_item_detected itemType=${primaryItemType} max=${amount} itemTerms=[${itemTerms.join(", ")}] source="${partTrimmed.substring(0, 50)}"`);
+            }
+            continue; // Skip other patterns if this matched
+          }
+          
+          // Pattern 2: "itemType [for] $min-$max" or "itemType [for] $min to $max" (range)
+          const rangeMatch = partTrimmed.match(/(.+?)\s+(?:for\s+)?\$?(\d+)[\s\-]+(?:to|and|-)\s+\$?(\d+)/i);
+          if (rangeMatch) {
+            const itemPart = rangeMatch[1].trim();
+            const minAmount = parseFloat(rangeMatch[2]);
+            const maxAmount = parseFloat(rangeMatch[3]);
+            const currency = detectCurrencySymbol(partTrimmed) || (partTrimmed.includes("$") ? "USD" : null);
+            
+            // Extract item terms using industry-agnostic approach
+            const itemTerms = extractItemTerms(itemPart);
+            
+            if (itemTerms.length > 0 && minAmount > 0 && maxAmount > 0 && minAmount <= maxAmount) {
+              const primaryItemType = itemTerms[0];
+              perItemBudgets.push({
+                itemType: primaryItemType,
+                itemTerms,
+                min: minAmount,
+                max: maxAmount,
+                currency,
+                source: partTrimmed
+              });
+              console.log(`[Budget] per_item_detected itemType=${primaryItemType} min=${minAmount} max=${maxAmount} itemTerms=[${itemTerms.join(", ")}] source="${partTrimmed.substring(0, 50)}"`);
+            }
+            continue; // Skip other patterns if this matched
+          }
+          
+          // Pattern 3: "itemType for $amount" pattern (exact price)
+          const exactPriceMatch = partTrimmed.match(/(.+?)\s+for\s+\$?(\d+)/i);
+          if (exactPriceMatch) {
+            const itemPart = exactPriceMatch[1].trim();
+            const amount = parseFloat(exactPriceMatch[2]);
+            const currency = detectCurrencySymbol(partTrimmed) || (partTrimmed.includes("$") ? "USD" : null);
+            
+            // Extract item terms using industry-agnostic approach
+            const itemTerms = extractItemTerms(itemPart);
+            
+            if (itemTerms.length > 0 && amount > 0) {
+              const primaryItemType = itemTerms[0];
+              perItemBudgets.push({
+                itemType: primaryItemType,
+                itemTerms,
+                min: null,
+                max: amount,
+                currency,
+                source: partTrimmed
+              });
+              console.log(`[Budget] per_item_detected itemType=${primaryItemType} max=${amount} itemTerms=[${itemTerms.join(", ")}] source="${partTrimmed.substring(0, 50)}"`);
+            }
+          }
+        }
+      }
+    }
+  }
+  
   // Store detected budgets for per-item assignment in bundle mode (will be used later)
   const detectedBudgetsForBundle = detectedBudgets;
   
@@ -3835,6 +3986,9 @@ async function processSessionInBackground({
   if (priceMin !== null || priceMax !== null) {
     console.log(`[Budget] source=answers priceMin=${priceMin ?? "null"} priceMax=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"} ignore_llm_totalBudget=true`);
   }
+  
+  // Store per-item budgets for bundle mode
+  const perItemBudgetsForBundle = perItemBudgets;
 
   // Get access token from Session table
   const accessToken = await getAccessTokenForShop(shopDomain);
@@ -4055,14 +4209,60 @@ async function processSessionInBackground({
         return true;
       });
       
-      // Merge bundle fetch products BEFORE filtering (Issue 2/3 fix)
-      // This ensures bundle products are available for item pool building
+      // Issue 1 fix: Single-item fallback - if SmartFetch returned insufficient products, do broader fallback BEFORE filtering/enrichment
+      // Only for single-item mode (bundle mode has its own per-item retrieval)
+      if (usingSmartFetch && products.length < finalResultCount * 8 && !likelyBundle && accessToken) {
+        console.log(`[SmartFetch] single_item_fallback triggered product_count=${products.length} min_needed=${finalResultCount * 8} reason=insufficient_before_filtering`);
+        
+        try {
+          // Broader fallback: fetch generic pool (no query constraints)
+          const fallbackProducts = await fetchShopifyProducts({
+            shopDomain,
+            accessToken,
+            limit: PRODUCT_POOL_LIMIT_FIRST,
+            collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+          });
+          
+          // Merge with existing products (avoid duplicates)
+          const existingHandles = new Set(products.map((p: any) => p.handle));
+          const newFallbackProducts = fallbackProducts.filter((p: any) => !existingHandles.has(p.handle));
+          
+          if (newFallbackProducts.length > 0) {
+            products = [...products, ...newFallbackProducts];
+            console.log(`[SmartFetch] single_item_fallback merged=${newFallbackProducts.length} total_products=${products.length} BEFORE_filtering`);
+            
+            // Re-deduplicate after merge
+            const seenAfterFallback = new Set<string>();
+            products = products.filter(p => {
+              if (seenAfterFallback.has(p.handle)) return false;
+              seenAfterFallback.add(p.handle);
+              return true;
+            });
+          }
+        } catch (error) {
+          console.error(`[SmartFetch] single_item_fallback error:`, error);
+        }
+      }
+      
+      // Merge bundle fetch products (if any were fetched before this point)
+      // NOTE: For bundle mode, bundle retrieval happens AFTER intent parsing (which happens after this point),
+      // so bundleFetchProductsForMerge is empty here. Bundle products are used directly via bundleFetchByItemIndex
+      // in bundle item pool building, not merged into the main pool. This is intentional - bundle products
+      // should be filtered per-item, not globally.
       if (bundleFetchProductsForMerge.length > 0) {
         const existingHandles = new Set(products.map((p: any) => p.handle));
         const newBundleProducts = bundleFetchProductsForMerge.filter((p: any) => !existingHandles.has(p.handle));
         products.push(...newBundleProducts);
         console.log(`[BundleRetrieval] merged=${newBundleProducts.length} BEFORE_filtering total_products=${products.length}`);
         bundleFetchProductsForMerge = []; // Clear after merge
+        
+        // Re-deduplicate after bundle merge
+        const seenAfterBundle = new Set<string>();
+        products = products.filter(p => {
+          if (seenAfterBundle.has(p.handle)) return false;
+          seenAfterBundle.add(p.handle);
+          return true;
+        });
       }
 
       // Create baseProducts set (filters that should NEVER relax)
@@ -4133,76 +4333,6 @@ async function processSessionInBackground({
 
       const firstStageFilteredCount = filteredProducts.length;
       const minNeededAfterFilter = finalResultCount * 8;
-
-      // Issue 4 fix: Single-item fallback - if SmartFetch returned insufficient/unavailable products, do broader fallback
-      // Only for single-item mode (bundle mode has its own per-item retrieval)
-      if (usingSmartFetch && firstStageFilteredCount < minNeededAfterFilter && !likelyBundle && accessToken) {
-        console.log(`[SmartFetch] single_item_fallback triggered filtered_count=${firstStageFilteredCount} min_needed=${minNeededAfterFilter} reason=insufficient_after_filtering`);
-        
-        try {
-          // Broader fallback: fetch generic pool (no query constraints)
-          const fallbackProducts = await fetchShopifyProducts({
-            shopDomain,
-            accessToken,
-            limit: PRODUCT_POOL_LIMIT_FIRST,
-            collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-          });
-          
-          // Merge with existing products (avoid duplicates)
-          const existingHandles = new Set(products.map((p: any) => p.handle));
-          const newFallbackProducts = fallbackProducts.filter((p: any) => !existingHandles.has(p.handle));
-          
-          if (newFallbackProducts.length > 0) {
-            products = [...products, ...newFallbackProducts];
-            console.log(`[SmartFetch] single_item_fallback merged=${newFallbackProducts.length} total_products=${products.length}`);
-            
-            // Re-apply filters to merged products
-            let mergedFiltered = products.filter(p => {
-              const status = (p as any).status;
-              return status !== "ARCHIVED" && status !== "DRAFT";
-            });
-            
-            if (excludedTags.length > 0) {
-              mergedFiltered = mergedFiltered.filter(p => {
-                const productTags = p.tags || [];
-                return !excludedTags.some(excludedTag => 
-                  productTags.some((tag: string) => tag.toLowerCase() === excludedTag.toLowerCase())
-                );
-              });
-            }
-            
-            if (experience.inStockOnly) {
-              mergedFiltered = mergedFiltered.filter(p => p.available);
-            }
-            
-            if (hadBudget) {
-              mergedFiltered = mergedFiltered.filter(p => {
-                const productMin = (p as any).priceMinAmount ?? null;
-                const productMax = (p as any).priceMaxAmount ?? null;
-                const singlePrice = p.priceAmount ? parseFloat(String(p.priceAmount)) : (p.price ? parseFloat(String(p.price)) : NaN);
-                
-                if (productMin !== null || productMax !== null) {
-                  const prodMin = productMin ?? productMax ?? singlePrice;
-                  const prodMax = productMax ?? productMin ?? singlePrice;
-                  if (typeof priceMin === "number" && prodMax < priceMin) return false;
-                  if (typeof priceMax === "number" && prodMin > priceMax) return false;
-                  return true;
-                } else if (Number.isFinite(singlePrice)) {
-                  if (typeof priceMin === "number" && singlePrice < priceMin) return false;
-                  if (typeof priceMax === "number" && singlePrice > priceMax) return false;
-                  return true;
-                }
-                return false;
-              });
-            }
-            
-            filteredProducts = mergedFiltered;
-            console.log(`[SmartFetch] single_item_fallback after_re_filtering count=${filteredProducts.length}`);
-          }
-        } catch (error) {
-          console.error(`[SmartFetch] single_item_fallback error:`, error);
-        }
-      }
 
       // STAGE 2: Fetch additional products if needed (only for generic fetch, not smart fetch)
       if (!usingSmartFetch && firstStageFilteredCount < minNeededAfterFilter && mightHaveMorePages && products.length < PRODUCT_POOL_LIMIT_MAX) {
@@ -5232,10 +5362,14 @@ async function processSessionInBackground({
             return true;
           });
           
-          // Store bundle fetch products for merging BEFORE filtering (Issue 2/3 fix)
+          // Store bundle fetch products for merging
+          // NOTE: Bundle retrieval happens AFTER initial filtering/enrichment, so these products
+          // are NOT merged into the main pool. Instead, they're used directly in bundle item pool building
+          // via bundleFetchByItemIndex. This is intentional - bundle products should be filtered per-item,
+          // not globally. They will be enriched on-the-fly when building item pools.
           if (deduplicatedBundleProducts.length > 0) {
             bundleFetchProductsForMerge = deduplicatedBundleProducts;
-            console.log(`[BundleRetrieval] prepared=${deduplicatedBundleProducts.length} will_merge_BEFORE_filtering`);
+            console.log(`[BundleRetrieval] prepared=${deduplicatedBundleProducts.length} will_use_in_item_pools (not merged - filtered per-item)`);
           }
           
           // Store per-item retrieval sets for building item pools (Issue 2/3 fix)
@@ -8060,6 +8194,14 @@ async function processSessionInBackground({
                 } as EnrichedCandidate;
               });
               
+              // Issue 3 fix: Add on-the-fly enriched products to allCandidatesEnriched so they can be validated
+              const existingHandlesInEnriched = new Set(allCandidatesEnriched.map(c => c.handle));
+              const newEnriched = enrichedMissing.filter(c => !existingHandlesInEnriched.has(c.handle));
+              if (newEnriched.length > 0) {
+                allCandidatesEnriched.push(...newEnriched);
+                console.log(`[Bundle] itemIndex=${itemIdx} added_to_allCandidatesEnriched count=${newEnriched.length} total_enriched=${allCandidatesEnriched.length}`);
+              }
+              
               baseCandidatesForItem = [...foundInEnriched, ...enrichedMissing];
               console.log(`[Bundle] itemIndex=${itemIdx} using_per_item_retrieval_set count=${baseCandidatesForItem.length} from_retrieval=${itemRetrievalSet.length} enriched_on_fly=${enrichedMissing.length}`);
             } else {
@@ -8070,8 +8212,7 @@ async function processSessionInBackground({
             baseCandidatesForItem = allCandidatesEnriched;
           }
           
-          // Issue 3 fix: Apply per-item budget with improved matching heuristics
-          // Extract budget for this item from conversation messages or item-specific constraints
+          // Issue 2 fix: Apply per-item budget with improved matching using perItemBudgetsForBundle
           let itemPriceMin: number | null = null;
           let itemPriceMax: number | null = null;
           
@@ -8079,57 +8220,42 @@ async function processSessionInBackground({
           const itemTypeLower = itemTypeForBudget.toLowerCase();
           const itemTermsLower = itemHardTerms.map(t => t.toLowerCase());
           
-          // Improved matching: look for budgets in conversation messages that mention this item type
-          // Pattern 1: "itemType for less than $X" or "itemType under $X"
-          // Pattern 2: Budget appears near item type mention (within 10 words)
-          // Pattern 3: Budget source text includes item type
-          for (const budget of detectedBudgetsForBundle) {
-            const budgetSourceLower = budget.source.toLowerCase();
-            let matches = false;
-            
-            // Check if budget source directly mentions item type
-            if (budgetSourceLower.includes(itemTypeLower) || 
-                itemTermsLower.some(term => budgetSourceLower.includes(term))) {
-              matches = true;
-            } else {
-              // Check conversation messages for proximity patterns
-              // Look for patterns like "itemType for less than $X" or "itemType under $X"
-              for (const msg of conversationMessages) {
-                if (msg.role === "user" && msg.content) {
-                  const msgLower = msg.content.toLowerCase();
-                  // Check if message contains both item type and budget pattern
-                  const hasItemType = msgLower.includes(itemTypeLower) || 
-                                     itemTermsLower.some(term => msgLower.includes(term));
-                  const hasBudgetPattern = msgLower.includes("less than") || 
-                                          msgLower.includes("under") || 
-                                          msgLower.includes("for less") ||
-                                          /\$\d+/.test(msgLower);
-                  
-                  if (hasItemType && hasBudgetPattern) {
-                    // Extract budget from this message using parsePriceCeiling
-                    const priceCeilingResult = parsePriceCeiling(msg.content);
-                    if (priceCeilingResult && budget.max === priceCeilingResult.value) {
-                      matches = true;
-                      break;
-                    }
-                  }
-                }
+          // First, try to match from perItemBudgetsForBundle (parsed from conversation messages)
+          if (perItemBudgetsForBundle && perItemBudgetsForBundle.length > 0) {
+            for (const perItemBudget of perItemBudgetsForBundle) {
+              // Check if this budget's itemType matches this bundle item
+              const budgetItemTypeLower = perItemBudget.itemType.toLowerCase();
+              if (budgetItemTypeLower === itemTypeLower || 
+                  perItemBudget.itemTerms.some(term => itemTermsLower.includes(term.toLowerCase())) ||
+                  itemTermsLower.some(term => perItemBudget.itemTerms.some(bt => bt.toLowerCase() === term))) {
+                if (perItemBudget.min !== null && itemPriceMin === null) itemPriceMin = perItemBudget.min;
+                if (perItemBudget.max !== null && itemPriceMax === null) itemPriceMax = perItemBudget.max;
+                console.log(`[Bundle] itemIndex=${itemIdx} itemType=${itemTypeForBudget} budget_min=${itemPriceMin ?? "null"} budget_max=${itemPriceMax ?? "null"} reason=matched_per_item_budget source="${perItemBudget.source.substring(0, 50)}"`);
+                break; // Use first match
               }
-            }
-            
-            if (matches) {
-              if (budget.min !== null && itemPriceMin === null) itemPriceMin = budget.min;
-              if (budget.max !== null && itemPriceMax === null) itemPriceMax = budget.max;
             }
           }
           
-          // If no item-specific budget found, use global budget as fallback
+          // Fallback: try to match from detectedBudgetsForBundle using text matching
+          if (itemPriceMin === null && itemPriceMax === null) {
+            for (const budget of detectedBudgetsForBundle) {
+              const budgetSourceLower = budget.source.toLowerCase();
+              // Check if budget source mentions this item type
+              if (budgetSourceLower.includes(itemTypeLower) || 
+                  itemTermsLower.some(term => budgetSourceLower.includes(term))) {
+                if (budget.min !== null && itemPriceMin === null) itemPriceMin = budget.min;
+                if (budget.max !== null && itemPriceMax === null) itemPriceMax = budget.max;
+                console.log(`[Bundle] itemIndex=${itemIdx} itemType=${itemTypeForBudget} budget_min=${itemPriceMin ?? "null"} budget_max=${itemPriceMax ?? "null"} reason=matched_detected_budget`);
+                break;
+              }
+            }
+          }
+          
+          // Final fallback: use global budget
           if (itemPriceMin === null && itemPriceMax === null) {
             itemPriceMin = priceMin;
             itemPriceMax = priceMax;
             console.log(`[Bundle] itemIndex=${itemIdx} itemType=${itemTypeForBudget} budget_min=${itemPriceMin ?? "null"} budget_max=${itemPriceMax ?? "null"} reason=using_global_budget`);
-          } else {
-            console.log(`[Bundle] itemIndex=${itemIdx} itemType=${itemTypeForBudget} budget_min=${itemPriceMin ?? "null"} budget_max=${itemPriceMax ?? "null"} reason=matched_item_specific`);
           }
           
           // Gate candidates for this item using item-specific constraints
