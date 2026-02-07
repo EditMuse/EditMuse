@@ -3721,6 +3721,10 @@ async function processSessionInBackground({
   let userCurrency: string | null = null; // Track user-specified currency from answers
   const detectedBudgets: Array<{ min: number | null; max: number | null; currency: string | null; source: string }> = []; // Track all detected budgets
   
+  // Issue 2/3 fix: Initialize per-item budgets array early (before global budget resolution)
+  // This will be populated from conversation messages and answers array
+  const perItemBudgets: Array<{ itemType: string; itemTerms: string[]; min: number | null; max: number | null; currency: string | null; source: string }> = [];
+  
   // Helper to detect currency symbol in answer string
   function detectCurrencySymbol(s: string): string | null {
     if (s.includes("£")) return "GBP";
@@ -3793,13 +3797,26 @@ async function processSessionInBackground({
   
   // Resolve multiple budgets: per-item in bundle mode (will be set later), most restrictive for single-item
   // For single-item mode: use most restrictive (highest min, lowest max)
-  if (detectedBudgets.length > 0) {
-    // Find most restrictive min (highest) and max (lowest)
+  // CRITICAL: Filter out budgets that were already parsed as per-item budgets to avoid overwriting
+  const globalBudgetsOnly = detectedBudgets.filter(budget => {
+    // Check if this budget was already parsed as a per-item budget
+    return !perItemBudgets.some(perItem => {
+      const budgetSourceLower = budget.source.toLowerCase();
+      const perItemSourceLower = perItem.source.toLowerCase();
+      // If sources match or budget source is contained in per-item source, it's already handled
+      return budgetSourceLower === perItemSourceLower || 
+             perItemSourceLower.includes(budgetSourceLower) ||
+             budgetSourceLower.includes(perItemSourceLower);
+    });
+  });
+  
+  if (globalBudgetsOnly.length > 0) {
+    // Find most restrictive min (highest) and max (lowest) from GLOBAL budgets only
     let mostRestrictiveMin: number | null = null;
     let mostRestrictiveMax: number | null = null;
     let resolvedCurrency: string | null = null;
     
-    for (const budget of detectedBudgets) {
+    for (const budget of globalBudgetsOnly) {
       if (budget.min !== null) {
         if (mostRestrictiveMin === null || budget.min > mostRestrictiveMin) {
           mostRestrictiveMin = budget.min;
@@ -3817,26 +3834,34 @@ async function processSessionInBackground({
     
     // Validate: if min > max, use only the constraint that makes sense
     if (mostRestrictiveMin !== null && mostRestrictiveMax !== null && mostRestrictiveMin > mostRestrictiveMax) {
-      // Invalid range - prefer max (ceiling) as it's typically more restrictive for user intent
-      // Example: "100-250" and "less than $50" -> use max=50 only
-      priceMax = mostRestrictiveMax;
-      priceMin = null; // Clear min to avoid invalid range
-      console.log(`[Budget] multiple_constraints_detected min=${mostRestrictiveMin} max=${mostRestrictiveMax} invalid_range=true using_max_only=${priceMax} reason=min_gt_max`);
+      // Issue 2 fix: If per-item budgets exist, don't set global budget (let per-item budgets handle it)
+      if (perItemBudgets.length > 0) {
+        // Invalid range but per-item budgets exist - don't set global budget
+        priceMax = null;
+        priceMin = null;
+        console.log(`[Budget] multiple_constraints_detected min=${mostRestrictiveMin} max=${mostRestrictiveMax} invalid_range=true globalBudgetIgnoredBecausePerItemBudgets=true perItemBudgetsCount=${perItemBudgets.length} reason=per_item_budgets_exist`);
+      } else {
+        // Invalid range - prefer max (ceiling) as it's typically more restrictive for user intent
+        // Example: "100-250" and "less than $50" -> use max=50 only
+        priceMax = mostRestrictiveMax;
+        priceMin = null; // Clear min to avoid invalid range
+        console.log(`[Budget] multiple_constraints_detected min=${mostRestrictiveMin} max=${mostRestrictiveMax} invalid_range=true using_max_only=${priceMax} reason=min_gt_max`);
+      }
     } else {
       priceMin = mostRestrictiveMin;
       priceMax = mostRestrictiveMax;
-      if (detectedBudgets.length > 1) {
-        console.log(`[Budget] multiple_constraints_detected count=${detectedBudgets.length} resolved_min=${priceMin ?? "null"} resolved_max=${priceMax ?? "null"} using=most_restrictive`);
+      if (globalBudgetsOnly.length > 1) {
+        console.log(`[Budget] multiple_constraints_detected count=${globalBudgetsOnly.length} resolved_min=${priceMin ?? "null"} resolved_max=${priceMax ?? "null"} using=most_restrictive (per_item_budgets_excluded=${detectedBudgets.length - globalBudgetsOnly.length})`);
       }
     }
     
     userCurrency = resolvedCurrency;
   }
   
-  // Issue 2 fix: Parse per-item budgets from conversation messages for bundle mode (industry-agnostic)
-  // Look for patterns like "Suit Less Than $250 and A Shirt Less Than $50"
+  // Issue 2/3 fix: Parse per-item budgets from BOTH conversation messages AND answers array (industry-agnostic)
+  // Look for patterns like "Suit Less Than $250 and A Shirt Less Than $50" or "100-250" (range for first item)
   // Industry-agnostic: extracts meaningful terms before budget indicators, not hardcoded product types
-  const perItemBudgets: Array<{ itemType: string; itemTerms: string[]; min: number | null; max: number | null; currency: string | null; source: string }> = [];
+  // Note: perItemBudgets is already declared above (before global budget resolution) - do not redeclare
   
   // Helper to extract meaningful item terms from text (industry-agnostic)
   // Removes stopwords and extracts nouns/meaningful phrases before budget indicators
@@ -3884,6 +3909,7 @@ async function processSessionInBackground({
     return Array.from(new Set(phrases)).sort((a, b) => a.length - b.length);
   }
   
+  // Parse per-item budgets from conversation messages
   if (conversationMessages && conversationMessages.length > 0) {
     for (const msg of conversationMessages) {
       if (msg.role === "user" && msg.content) {
@@ -3979,8 +4005,131 @@ async function processSessionInBackground({
     }
   }
   
+  // Issue 3 fix: Also parse per-item budgets from answers array (for guided quiz/hybrid mode)
+  // This handles cases like ["Suit", "Black", "100-250", "Any", "And Shirt For Less Than $50"]
+  // where "100-250" should be treated as a per-item budget for the suit, not a global budget
+  // Industry-agnostic: Uses quiz question metadata to map budgets to items
+  if (Array.isArray(answers) && answers.length > 0) {
+    // Parse questionsJson to get question metadata (industry-agnostic)
+    let questions: Array<{ type?: string; question?: string; options?: Array<{ value?: string; label?: string }> }> = [];
+    try {
+      if (experience.questionsJson && typeof experience.questionsJson === "string") {
+        questions = JSON.parse(experience.questionsJson);
+      } else if (Array.isArray(experience.questionsJson)) {
+        questions = experience.questionsJson;
+      }
+    } catch (e) {
+      console.warn("[Budget] Failed to parse questionsJson for budget mapping:", e);
+    }
+    
+    // Check if this looks like a bundle query (multiple items mentioned)
+    const answersText = answers.join(" ").toLowerCase();
+    const likelyBundleFromAnswers = /\b(and|&|,)\s+\w+/i.test(answersText) || 
+                                    answers.some((a: any) => typeof a === "string" && /\b(and|&|,)\s+\w+/i.test(String(a)));
+    
+    // If bundle-like, try to parse per-item budgets from answers using question metadata
+    if (likelyBundleFromAnswers) {
+      // Look for range patterns that might be per-item (e.g., "100-250" for first item)
+      for (let i = 0; i < answers.length; i++) {
+        const answerStr = String(answers[i]).trim();
+        
+        // Check if this answer is a range (e.g., "100-250", "100 to 250", "100 and 250") and might be item-specific
+        const rangeMatch = answerStr.match(/^\$?(\d+)[\s\-]+(?:to|and|-)?\s*\$?(\d+)$/i);
+        if (rangeMatch) {
+          const minAmount = parseFloat(rangeMatch[1]);
+          const maxAmount = parseFloat(rangeMatch[2]);
+          
+          // Industry-agnostic: Try to find the item type using question metadata
+          // Look for the question that corresponds to this answer index
+          let itemType: string | null = null;
+          const itemTerms: string[] = [];
+          
+          // Strategy 1: Check if this question is a budget question (has options with price ranges)
+          // If so, look for the previous "What are you looking for" type question
+          const currentQuestion = questions[i];
+          const isBudgetQuestion = currentQuestion && (
+            (currentQuestion.question && /budget|price|cost/i.test(currentQuestion.question)) ||
+            (currentQuestion.options && currentQuestion.options.some((opt: any) => 
+              opt.value && /\d+/.test(String(opt.value))
+            ))
+          );
+          
+          if (isBudgetQuestion) {
+            // Look backwards for product type question (industry-agnostic)
+            for (let j = Math.max(0, i - 3); j < i; j++) {
+              const prevQuestion = questions[j];
+              const prevAnswer = String(answers[j]).trim().toLowerCase();
+              
+              // Skip generic answers and budget answers
+              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
+              
+              // Check if previous question is a product type question (industry-agnostic)
+              const isProductTypeQuestion = prevQuestion && (
+                (prevQuestion.question && /what.*looking|what.*need|what.*want|product|item|type/i.test(prevQuestion.question)) ||
+                (prevQuestion.type === "select" && prevQuestion.options && prevQuestion.options.length > 0)
+              );
+              
+              if (isProductTypeQuestion) {
+                // Extract meaningful terms from the answer to this product type question
+                const terms = extractItemTerms(String(answers[j]));
+                if (terms.length > 0) {
+                  itemType = terms[0];
+                  itemTerms.push(...terms);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Strategy 2: Fallback - look at previous answers for product type (original logic)
+          if (!itemType) {
+            for (let j = Math.max(0, i - 3); j < i; j++) {
+              const prevAnswer = String(answers[j]).trim().toLowerCase();
+              // Skip generic answers
+              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
+              
+              // Extract meaningful terms
+              const terms = extractItemTerms(String(answers[j]));
+              if (terms.length > 0) {
+                itemType = terms[0];
+                itemTerms.push(...terms);
+                break;
+              }
+            }
+          }
+          
+          // If we found an item type, add as per-item budget
+          if (itemType && minAmount > 0 && maxAmount > 0 && minAmount <= maxAmount) {
+            const currency = detectCurrencySymbol(answerStr) || (answerStr.includes("$") ? "USD" : null);
+            perItemBudgets.push({
+              itemType,
+              itemTerms,
+              min: minAmount,
+              max: maxAmount,
+              currency,
+              source: answerStr
+            });
+            console.log(`[Budget] per_item_detected_from_answers itemType=${itemType} min=${minAmount} max=${maxAmount} itemTerms=[${itemTerms.join(", ")}] source="${answerStr}" questionIndex=${i}`);
+          }
+        }
+      }
+    }
+  }
+  
   // Store detected budgets for per-item assignment in bundle mode (will be used later)
-  const detectedBudgetsForBundle = detectedBudgets;
+  // BUT: Filter out budgets that were already parsed as per-item budgets
+  const detectedBudgetsForBundle = detectedBudgets.filter(budget => {
+    // Check if this budget was already parsed as a per-item budget
+    // (by comparing source text)
+    return !perItemBudgets.some(perItem => {
+      const budgetSourceLower = budget.source.toLowerCase();
+      const perItemSourceLower = perItem.source.toLowerCase();
+      // If sources match or budget source is contained in per-item source, it's already handled
+      return budgetSourceLower === perItemSourceLower || 
+             perItemSourceLower.includes(budgetSourceLower) ||
+             budgetSourceLower.includes(perItemSourceLower);
+    });
+  });
   
   // Log budget detection summary - answers are the SINGLE source of truth
   if (priceMin !== null || priceMax !== null) {
@@ -4710,6 +4859,10 @@ async function processSessionInBackground({
         color: null,
         material: null
       };
+      // Issue 1 fix: Track degraded facets so validation can skip them
+      let degradedFacetsForValidation: Array<{ facet: string; value: string; coverage: number }> = [];
+      // Create a map for quick lookup of degraded facets
+      let degradedFacetsMap: Map<string, boolean> = new Map();
       let bundleIntent: {
         isBundle: boolean;
         items: Array<{ 
@@ -6507,7 +6660,17 @@ async function processSessionInBackground({
       }
       
       const variantConstraints = mergeConstraints(fromAnswersForVariant, fromTextForVariant);
-      const variantConstraints2 = mergeConstraints(variantConstraints, derived);
+      let variantConstraints2 = mergeConstraints(variantConstraints, derived);
+      
+      // Issue 1 fix: Set degraded facets to null in variantConstraints
+      if (degradedFacetsMap.size > 0) {
+        if (degradedFacetsMap.has("color")) variantConstraints2.color = null;
+        if (degradedFacetsMap.has("size")) variantConstraints2.size = null;
+        if (degradedFacetsMap.has("material")) variantConstraints2.material = null;
+        const degradedList = Array.from(degradedFacetsMap.keys()).join(",");
+        console.log(`[Degrade] variantConstraints cleared for degraded facets=${degradedList}`);
+      }
+      
       console.log("[App Proxy] Variant constraints:", variantConstraints2);
       
       // Calculate BM25 scores and apply gating
@@ -6634,6 +6797,22 @@ async function processSessionInBackground({
               if (facetName === "material" && candidate.materials && candidate.materials.length > 0) hasFacet = true;
             }
             
+            // Fix: Also check tag-derived facets (cf-color-*, cf-size-*, cf-material-*) for accurate coverage
+            if (!hasFacet && Array.isArray(candidate.tags)) {
+              const normalizedFacetName = facetName.toLowerCase();
+              for (const tag of candidate.tags) {
+                if (typeof tag === "string") {
+                  const tagLower = tag.toLowerCase();
+                  if ((normalizedFacetName === "color" && tagLower.startsWith("cf-color-")) ||
+                      (normalizedFacetName === "size" && tagLower.startsWith("cf-size-")) ||
+                      (normalizedFacetName === "material" && tagLower.startsWith("cf-material-"))) {
+                    hasFacet = true;
+                    break;
+                  }
+                }
+              }
+            }
+            
             if (hasFacet) candidatesWithFacet++;
           }
           
@@ -6653,7 +6832,9 @@ async function processSessionInBackground({
         material: null
       };
       const enforcedConstraints = new Map<string, string>(); // Generic map for any facet type
-      const degradedFacets: Array<{ facet: string; value: string; coverage: number }> = [];
+      // Issue 1 fix: Use outer scope variable for degraded facets (declared earlier)
+      degradedFacetsForValidation = []; // Reset for this gating pass
+      degradedFacetsMap = new Map(); // Reset map
       
       for (const [facetName, constraintValue] of allConstraints.entries()) {
         const coverage = facetCoverage.get(facetName) || 0;
@@ -6661,7 +6842,8 @@ async function processSessionInBackground({
         if (coverage < 0.25) {
           // Low coverage - move to softTerms
           softTerms.push(constraintValue);
-          degradedFacets.push({ facet: facetName, value: constraintValue, coverage });
+          degradedFacetsForValidation.push({ facet: facetName, value: constraintValue, coverage });
+          degradedFacetsMap.set(facetName.toLowerCase(), true);
           console.log(`[Degrade] reason=low_facet_coverage facet=${facetName} selected=${constraintValue} coverage=${coverage.toFixed(3)} moved_to_softTerms=true`);
         } else {
           // High enough coverage - enforce as hard constraint
@@ -6672,6 +6854,12 @@ async function processSessionInBackground({
           if (facetName === "color") enforcedFacets.color = constraintValue;
           if (facetName === "material") enforcedFacets.material = constraintValue;
         }
+      }
+      
+      // Log degraded facets map
+      if (degradedFacetsMap.size > 0) {
+        const degradedList = Array.from(degradedFacetsMap.keys()).join(",");
+        console.log(`[Degrade] degradedFacets=${degradedList}`);
       }
       
       // STEP 3: Apply facet gating with fallback matching for missing structured facets
@@ -6823,8 +7011,8 @@ async function processSessionInBackground({
       const facetGatingReduction = beforeFacetGating - afterFacetGating;
       
       // Log degradation if facets were moved to softTerms
-      if (degradedFacets.length > 0) {
-        for (const degraded of degradedFacets) {
+      if (degradedFacetsForValidation.length > 0) {
+        for (const degraded of degradedFacetsForValidation) {
           console.log(`[Degrade] reason=low_facet_coverage facet=${degraded.facet} selected=${degraded.value} before=${beforeFacetGating} after=${afterFacetGating}`);
         }
       }
@@ -9725,7 +9913,8 @@ async function processSessionInBackground({
         candidates: EnrichedCandidate[],
         hardTerms: string[],
         hardFacets: { size: string | null; color: string | null; material: string | null },
-        trustFallback: boolean
+        trustFallback: boolean,
+        degradedFacets?: Array<{ facet: string; value: string; coverage: number }>
       ): Promise<string[]> {
         if (trustFallback) {
           // Trust fallback: allow all handles
@@ -9736,7 +9925,23 @@ async function processSessionInBackground({
         
         // Convert hardFacets to generic constraints using new facet system
         const { convertHardFacetsToConstraints, productSatisfiesConstraints } = await import("~/utils/facets.server");
-        const facetConstraints = convertHardFacetsToConstraints(hardFacets);
+        let facetConstraints = convertHardFacetsToConstraints(hardFacets);
+        
+        // Issue 1 fix: Exclude degraded facets from validation (they were moved to softTerms)
+        if (degradedFacets && degradedFacets.length > 0) {
+          const degradedFacetNames = new Set(degradedFacets.map(d => d.facet.toLowerCase()));
+          const beforeCount = facetConstraints.length;
+          facetConstraints = facetConstraints.filter(c => {
+            const facetNameLower = c.key.toLowerCase();
+            const isDegraded = degradedFacetNames.has(facetNameLower);
+            if (isDegraded) {
+              console.log(`[Validation] skipping_degraded_facet facet=${c.key} value=${c.value} coverage=${degradedFacets.find(d => d.facet.toLowerCase() === facetNameLower)?.coverage.toFixed(3)}`);
+            }
+            return !isDegraded;
+          });
+          const degradedList = Array.from(degradedFacetNames).join(",");
+          console.log(`[Validation] degradedFacets applied=${degradedList} before=${beforeCount} after=${facetConstraints.length}`);
+        }
         
         for (const handle of handles) {
           const candidate = candidates.find(c => c.handle === handle);
@@ -10085,14 +10290,16 @@ async function processSessionInBackground({
               
               // Add global hardFacets (if not overridden by item-specific) - ONLY in non-bundle mode
               // In bundle mode, do NOT merge global hardFacets to prevent over-constraint
+              // Issue 1 fix: Exclude degraded facets from validation
+              const degradedFacetNames = new Set(degradedFacetsForValidation.map(d => d.facet.toLowerCase()));
               if (!bundleIntent.isBundle) {
-                if (hardFacets.size && !itemOptionConstraints?.size) {
+                if (hardFacets.size && !itemOptionConstraints?.size && !degradedFacetNames.has("size")) {
                   itemGenericConstraints.push({ key: "size", value: hardFacets.size });
                 }
-                if (hardFacets.color && !itemOptionConstraints?.color) {
+                if (hardFacets.color && !itemOptionConstraints?.color && !degradedFacetNames.has("color")) {
                   itemGenericConstraints.push({ key: "color", value: hardFacets.color });
                 }
-                if (hardFacets.material && !itemOptionConstraints?.material) {
+                if (hardFacets.material && !itemOptionConstraints?.material && !degradedFacetNames.has("material")) {
                   itemGenericConstraints.push({ key: "material", value: hardFacets.material });
                 }
               }
@@ -10299,7 +10506,7 @@ async function processSessionInBackground({
         }
       } else {
         // Single-item validation (non-bundle or trustFallback)
-        validatedHandles = await validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback);
+        validatedHandles = await validateFinalHandles(finalHandles, gatedCandidates, hardTerms, hardFacets, trustFallback, degradedFacetsForValidation);
         
         // Safety test log: confirm validation fix
         console.log(`[Validation] final_validated_count=${validatedHandles.length} from_ai_count=${finalHandles.length}`);
@@ -10375,12 +10582,21 @@ async function processSessionInBackground({
           
           // Check constraints if provided (single-item top-up must respect constraints)
           if (constraints && constraints.length > 0) {
-            const constraintResult = await satisfiesConstraintsStructuredOrTags(p, constraints, facetVocabulary);
-            if (!constraintResult.ok) {
-              if (constraintResult.conflict) {
-                console.log(`[TopUp] skip_conflict facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source} handle=${p.handle}`);
+            // Issue 1 fix: Filter out constraints for degraded facets
+            const filteredConstraints = constraints.filter(c => {
+              const facetNameLower = c.key.toLowerCase();
+              const isDegraded = degradedFacetsMap.has(facetNameLower);
+              return !isDegraded;
+            });
+            
+            if (filteredConstraints.length > 0) {
+              const constraintResult = await satisfiesConstraintsStructuredOrTags(p, filteredConstraints, facetVocabulary);
+              if (!constraintResult.ok) {
+                if (constraintResult.conflict) {
+                  console.log(`[TopUp] skip_conflict facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source} handle=${p.handle}`);
+                }
+                continue; // Skip this candidate due to constraint conflict
               }
-              continue; // Skip this candidate due to constraint conflict
             }
           }
           
