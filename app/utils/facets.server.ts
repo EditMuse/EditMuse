@@ -413,10 +413,19 @@ export function convertOptionConstraintsToConstraints(
   optionConstraints: { size?: string | null; color?: string | null; material?: string | null },
   scope?: "global" | "item"
 ): FacetConstraint[] {
+  // Clean malformed values (remove JSON artifacts, trailing punctuation)
+  const cleanValue = (value: string | null | undefined): string | null => {
+    if (!value || typeof value !== "string") return null;
+    // Remove trailing JSON artifacts like `}},]` or `}}` or `,`
+    let cleaned = value.trim();
+    cleaned = cleaned.replace(/[}},]+$/, "").replace(/[,;]+$/, "").trim();
+    return cleaned.length > 0 ? cleaned : null;
+  };
+  
   return convertHardFacetsToConstraints({
-    size: optionConstraints.size ?? null,
-    color: optionConstraints.color ?? null,
-    material: optionConstraints.material ?? null,
+    size: cleanValue(optionConstraints.size) ?? null,
+    color: cleanValue(optionConstraints.color) ?? null,
+    material: cleanValue(optionConstraints.material) ?? null,
   }, scope);
 }
 

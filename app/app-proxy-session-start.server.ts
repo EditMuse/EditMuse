@@ -438,9 +438,11 @@ function extractSearchText(candidate: any, indexMetafields?: Array<{ namespace: 
 function productMatchesHardFacets(
   product: any,
   hardFacets: { size: string | null; color: string | null; material: string | null },
-  knownOptionNames: string[]
+  knownOptionNames: string[],
+  requireAvailable: boolean = false // Don't require availability by default - let caller decide
 ): boolean {
-  // Check variant availability (must have at least one available variant)
+  // Check variant availability only if required (caller can control this)
+  if (requireAvailable) {
   const hasAvailableVariant = product.available === true || 
     (product.variants && Array.isArray(product.variants) && product.variants.some((v: any) => 
       v.available === true || v.availableForSale === true
@@ -448,6 +450,7 @@ function productMatchesHardFacets(
   
   if (!hasAvailableVariant) {
     return false;
+    }
   }
   
   // Normalize option names (case-insensitive)
@@ -939,6 +942,7 @@ function extractSmartFetchSignals(
   const rawPreview = allText.substring(0, 200);
   
   // Tokenize and extract meaningful keywords (min 3 chars, not stopwords, not numbers-only)
+  // Industry-agnostic stopwords including constraint/filler tokens
   const stopwords = new Set([
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
     "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
@@ -949,20 +953,44 @@ function extractSmartFetchSignals(
     "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
     "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "some", "such",
     "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
-    "want", "looking", "for", "need", "prefer", "like"
+    "want", "looking", "for", "need", "prefer", "like",
+    // Constraint/filler tokens that should be removed from SmartFetch keywords
+    "add", "also", "less", "than", "below", "over", "between", "then"
   ]);
+  
+  // Track dropped tokens for logging
+  const droppedTokens: string[] = [];
   
   const words = allText.toLowerCase().split(/\s+/).filter(w => {
     const cleaned = w.replace(/[^\w]/g, "");
-    // Exclude numbers-only tokens and stopwords
-    if (/^\d+$/.test(cleaned)) return false; // Numbers-only
-    return cleaned.length >= 3 && !stopwords.has(cleaned);
+    // Exclude numbers-only tokens, stopwords, and price/currency tokens
+    if (/^\d+$/.test(cleaned)) {
+      droppedTokens.push(cleaned);
+      return false; // Numbers-only
+    }
+    if (stopwords.has(cleaned)) {
+      droppedTokens.push(cleaned);
+      return false; // Stopword
+    }
+    // Check for currency symbols or price patterns
+    if (/[\$£€¥]/.test(w) || isBudgetString(w)) {
+      droppedTokens.push(cleaned);
+      return false; // Price/currency token
+    }
+    return cleaned.length >= 3;
   });
   
   for (const word of words) {
     const cleaned = word.replace(/[^\w]/g, "").toLowerCase();
-    // Skip numbers-only tokens
-    if (/^\d+$/.test(cleaned)) continue;
+    // Skip numbers-only tokens, stopwords, and price tokens
+    if (/^\d+$/.test(cleaned)) {
+      droppedTokens.push(cleaned);
+      continue;
+    }
+    if (stopwords.has(cleaned)) {
+      droppedTokens.push(cleaned);
+      continue;
+    }
     if (cleaned.length >= 3 && !seen.has(cleaned)) {
       seen.add(cleaned);
       keywords.push(cleaned);
@@ -990,7 +1018,9 @@ function extractSmartFetchSignals(
   
   const hasMeaningfulSignals = keywords.length > 0 || selections.length > 0;
   
-  // Log sanitization results
+  // Log sanitization results with dropped tokens
+  const uniqueDropped = Array.from(new Set(droppedTokens)).slice(0, 20);
+  console.log(`[SmartFetchTokens] intent=[${keywords.slice(0, 10).join(",")}${keywords.length > 10 ? "..." : ""}] dropped=[${uniqueDropped.join(",")}${uniqueDropped.length >= 20 ? "..." : ""}]`);
   console.log(`[SmartFetch] signals_sanitized keywords=[${keywords.slice(0, 10).join(",")}${keywords.length > 10 ? "..." : ""}] selections=[${selections.slice(0, 5).join(",")}${selections.length > 5 ? "..." : ""}] droppedPriceAnswers=[${droppedPriceAnswers.join(",")}]`);
   
   return {
@@ -3799,12 +3829,42 @@ async function processSessionInBackground({
       const SMART_FETCH_CAP = 500;
       const SMART_FETCH_DESIRED_MIN = finalResultCount * 8;
       
+      // Variable to store bundle fetch products (will be populated after intent parsing)
+      let bundleFetchProductsForMerge: any[] = [];
+      
+      // Quick bundle pre-detection from userIntent (before full intent parsing)
+      // Industry-agnostic: detect multi-item patterns like "X and Y", "X, Y", "X with Y"
+      let likelyBundle = false;
+      const userIntentText = conversationMessages
+        .filter(m => m.role === "user" && m.content)
+        .map(m => (m.content || "").trim())
+        .join(" ") || (Array.isArray(answers) ? answers.join(" ") : String(answers || ""));
+      
+      if (userIntentText) {
+        const lowerText = userIntentText.toLowerCase();
+        // Detect bundle patterns: "X and Y", "X, Y", "X with Y", "X plus Y", "X & Y"
+        const bundlePatterns = [
+          /\b\w+\s+and\s+\w+/i, // "suit and shirt"
+          /\b\w+,\s*\w+/i, // "suit, shirt"
+          /\b\w+\s+with\s+\w+/i, // "suit with shirt"
+          /\b\w+\s+plus\s+\w+/i, // "suit plus shirt"
+          /\b\w+\s*&\s*\w+/i, // "suit & shirt"
+        ];
+        likelyBundle = bundlePatterns.some(pattern => pattern.test(lowerText));
+      }
+      
       // Extract fetch signals from answers and conversation
       const fetchSignals = extractSmartFetchSignals(answers, conversationMessages, modeUsed);
       
       if (fetchSignals.hasMeaningfulSignals) {
-        console.log(`[SmartFetch] enabled=true mode=${modeUsed} reason=has_meaningful_signals`);
+        console.log(`[SmartFetch] enabled=true mode=${modeUsed} reason=has_meaningful_signals likelyBundle=${likelyBundle}`);
         console.log(`[SmartFetch] signals keywords=${fetchSignals.keywords.length} selections=${fetchSignals.selections.length} rawPreview=${fetchSignals.rawPreview.substring(0, 100)}`);
+        
+        // For bundle mode: fetch per itemType (will be determined more precisely after intent parsing)
+        // For now, use generic fetch but we'll enhance this after intent parsing
+        if (likelyBundle) {
+          console.log(`[SmartFetch] bundle_mode=true - will fetch per itemType after intent parsing`);
+        }
         
         // Step A: Build targeted query
         let query = buildShopifySearchQuery(fetchSignals);
@@ -3898,21 +3958,21 @@ async function processSessionInBackground({
         products = smartFetchProducts;
         console.log("[App Proxy] Using smart fetch products:", products.length);
       } else {
-        console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
-        
+      console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
+      
         // STAGE 1: First fetch (200 products) - existing generic fetch
         products = await fetchShopifyProducts({
-          shopDomain,
-          accessToken,
-          limit: PRODUCT_POOL_LIMIT_FIRST,
-          collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-        });
+        shopDomain,
+        accessToken,
+        limit: PRODUCT_POOL_LIMIT_FIRST,
+        collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+      });
       }
 
       const firstFetchCount = products.length;
       const mightHaveMorePages = usingSmartFetch ? false : (firstFetchCount === PRODUCT_POOL_LIMIT_FIRST);
       if (!usingSmartFetch) {
-        console.log("[App Proxy] First fetch:", firstFetchCount, "products", mightHaveMorePages ? "(might have more pages)" : "");
+      console.log("[App Proxy] First fetch:", firstFetchCount, "products", mightHaveMorePages ? "(might have more pages)" : "");
       }
 
       // Apply initial filters
@@ -3941,6 +4001,15 @@ async function processSessionInBackground({
         seen.add(p.handle);
         return true;
       });
+      
+      // Merge bundle fetch products if available (from bundle retrieval after intent parsing)
+      if (bundleFetchProductsForMerge.length > 0) {
+        const existingHandles = new Set(products.map((p: any) => p.handle));
+        const newBundleProducts = bundleFetchProductsForMerge.filter((p: any) => !existingHandles.has(p.handle));
+        products.push(...newBundleProducts);
+        console.log(`[BundleRetrieval] merged=${newBundleProducts.length} total_products=${products.length}`);
+        bundleFetchProductsForMerge = []; // Clear after merge
+      }
 
       // Create baseProducts set (filters that should NEVER relax)
       let baseProducts = products; // after status + excludedTags (+ dedupe) are applied
@@ -4709,11 +4778,20 @@ async function processSessionInBackground({
             
             console.log(`[Bundle Normalization] item canonicalType="${canonicalType}" before_repair="${extractedCanonicalType}"`);
             
-            // Merge extracted facets with existing constraints
+            // Helper to clean malformed facet values (remove JSON artifacts, trailing punctuation)
+            const cleanFacetValue = (value: string | null | undefined): string | null => {
+              if (!value || typeof value !== "string") return null;
+              // Remove trailing JSON artifacts like `}},]` or `}}` or `,`
+              let cleaned = value.trim();
+              cleaned = cleaned.replace(/[}},]+$/, "").replace(/[,;]+$/, "").trim();
+              return cleaned.length > 0 ? cleaned : null;
+            };
+            
+            // Merge extracted facets with existing constraints (clean values to remove JSON artifacts)
             const mergedFacets = {
-              size: facets.size || existingFacets.size || null,
-              color: facets.color || existingFacets.color || null,
-              material: facets.material || existingFacets.material || null
+              size: cleanFacetValue(facets.size || existingFacets.size) || null,
+              color: cleanFacetValue(facets.color || existingFacets.color) || null,
+              material: cleanFacetValue(facets.material || existingFacets.material) || null
             };
             
             // Build constraints with per-item facets
@@ -4908,6 +4986,141 @@ async function processSessionInBackground({
           preferencesCount: intent.preferences?.length || 0,
           explicitSelectionsWin: true // Log that explicit user selections take precedence
         });
+        
+        // Bundle retrieval: fetch per itemType if bundle mode
+        if (bundleIntent.isBundle && bundleIntent.items.length >= 2 && accessToken) {
+          console.log(`[BundleRetrieval] enabled=true itemCount=${bundleIntent.items.length}`);
+          
+          const bundleFetchProducts: any[] = [];
+          const bundleFetchByItemType = new Map<string, any[]>(); // itemType -> products[]
+          
+          // Helper to detect budget strings (same as in extractSmartFetchSignals)
+          const isBudgetStringLocal = (text: string): boolean => {
+            const trimmed = text.trim();
+            const lower = trimmed.toLowerCase();
+            if (/[\$£€¥]/.test(trimmed)) return true;
+            if (/under/i.test(lower) && /\d/.test(trimmed)) return true;
+            if (/over/i.test(lower) && /\d/.test(trimmed)) return true;
+            if (/and above/i.test(lower) && /\d/.test(trimmed)) return true;
+            if (/plus/i.test(lower) && /\d/.test(trimmed)) return true;
+            if (/[\+\-]/.test(trimmed) && /\d/.test(trimmed)) return true;
+            if (/\d+[\s\-]+to[\s\-]+\d+/i.test(trimmed)) return true;
+            if (/\d+[\s\-]+\d+/.test(trimmed)) return true;
+            if (/^\$?\d+[\s\-]*(plus|\+|-|to|and above|under)/i.test(trimmed)) return true;
+            return false;
+          };
+          
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const item = bundleIntent.items[itemIdx];
+            const itemType = (item as any).canonicalType || item.hardTerms[0] || `item${itemIdx}`;
+            const itemHardTerms = item.hardTerms || [];
+            
+            // Extract meaningful attributes (not stopwords, not price tokens)
+            const meaningfulTerms = itemHardTerms.filter(term => {
+              const lower = term.toLowerCase().trim();
+              const stopwords = new Set(["and", "or", "add", "also", "with", "for", "less", "than", "under", "below", "over", "between", "to"]);
+              if (stopwords.has(lower)) return false;
+              if (/[\$£€¥]/.test(term) || isBudgetStringLocal(term)) return false; // Price tokens
+              return term.length >= 3;
+            });
+            
+            if (meaningfulTerms.length === 0) {
+              console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} skipped=no_meaningful_terms`);
+              continue;
+            }
+            
+            // Build query for this itemType
+            const itemSignals = {
+              keywords: meaningfulTerms,
+              selections: meaningfulTerms.length > 1 ? [meaningfulTerms.join(" ")] : [],
+              hasMeaningfulSignals: true
+            };
+            
+            const itemQuery = buildShopifySearchQuery(itemSignals);
+            
+            if (itemQuery) {
+              try {
+                console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} query="${itemQuery.substring(0, 150)}${itemQuery.length > 150 ? "..." : ""}"`);
+                
+                const itemFetch = await fetchProductsByQueryPaginated(
+                  shopDomain,
+                  accessToken,
+                  itemQuery,
+                  Math.ceil(SMART_FETCH_DESIRED_MIN / bundleIntent.items.length),
+                  100
+                );
+                
+                // Tag products with itemType for later filtering
+                const taggedProducts = itemFetch.products.map((p: any) => ({
+                  ...p,
+                  _bundleItemType: itemType,
+                  _bundleItemIndex: itemIdx
+                }));
+                
+                bundleFetchByItemType.set(itemType, taggedProducts);
+                bundleFetchProducts.push(...taggedProducts);
+                
+                console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} fetched=${taggedProducts.length}`);
+                
+                // If this itemType has 0 candidates, do broad fallback fetch (no facets/constraints)
+                if (taggedProducts.length === 0) {
+                  console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} fallback=broad_fetch`);
+                  
+                  // Broad fallback: just the itemType term, no constraints
+                  const fallbackQuery = buildShopifySearchQuery({
+                    keywords: [itemType],
+                    selections: [],
+                    hasMeaningfulSignals: true
+                  });
+                  
+                  if (fallbackQuery) {
+                    const fallbackFetch = await fetchProductsByQueryPaginated(
+                      shopDomain,
+                      accessToken,
+                      fallbackQuery,
+                      50,
+                      50
+                    );
+                    
+                    const fallbackTagged = fallbackFetch.products.map((p: any) => ({
+                      ...p,
+                      _bundleItemType: itemType,
+                      _bundleItemIndex: itemIdx
+                    }));
+                    
+                    bundleFetchByItemType.set(itemType, fallbackTagged);
+                    bundleFetchProducts.push(...fallbackTagged);
+                    
+                    console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} fallback_fetched=${fallbackTagged.length}`);
+                  }
+                }
+              } catch (error) {
+                console.error(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} error:`, error);
+              }
+            }
+          }
+          
+          // Deduplicate by handle across all bundle fetches
+          const seenHandles = new Set<string>();
+          const deduplicatedBundleProducts = bundleFetchProducts.filter((p: any) => {
+            if (seenHandles.has(p.handle)) return false;
+            seenHandles.add(p.handle);
+            return true;
+          });
+          
+          // Store bundle fetch products for later merging (after initial product fetch)
+          // We'll merge them into the products array after initial filters are applied
+          if (deduplicatedBundleProducts.length > 0) {
+            bundleFetchProductsForMerge = deduplicatedBundleProducts;
+            console.log(`[BundleRetrieval] prepared=${deduplicatedBundleProducts.length} will_merge_after_initial_fetch`);
+          }
+          
+          // Log per-itemType counts
+          const perItemCounts = Array.from(bundleFetchByItemType.entries()).map(([type, prods]) => 
+            `${type}=${prods.length}`
+          ).join(" ");
+          console.log(`[BundleRetrieval] per_itemType_counts ${perItemCounts}`);
+        }
       } else {
         // Fallback to pattern-based parsing
         console.log("[Intent Parsing] ⚠️  LLM parsing failed, using pattern-based fallback:", llmIntentResult.error || "unknown error");
@@ -6036,14 +6249,33 @@ async function processSessionInBackground({
       const beforeFacetGating = allCandidatesEnriched.length;
       const totalCandidates = allCandidatesEnriched.length;
       
-      // Build a map of all constraints (from hardFacets + variantConstraints2.allowValues)
+      // Helper to clean malformed facet values (remove JSON artifacts, trailing punctuation)
+      const cleanFacetValue = (value: string | null | undefined): string | null => {
+        if (!value || typeof value !== "string") return null;
+        // Remove trailing JSON artifacts like `}},]` or `}}` or `,`
+        let cleaned = value.trim();
+        // Remove trailing punctuation and JSON-like artifacts
+        cleaned = cleaned.replace(/[}},]+$/, "").replace(/[,;]+$/, "").trim();
+        return cleaned.length > 0 ? cleaned : null;
+      };
+      
+      // Build a map of all constraints (from hardFacets + variantConstraints2.allowValues + bundle per-item constraints)
       // This makes it industry-agnostic - works for any facet type (size, color, material, scent, finish, capacity, etc.)
       const allConstraints = new Map<string, string>(); // facetName -> constraintValue
       
       // Add constraints from hardFacets (backwards compatibility for size/color/material)
-      if (hardFacets.size) allConstraints.set("size", hardFacets.size);
-      if (hardFacets.color) allConstraints.set("color", hardFacets.color);
-      if (hardFacets.material) allConstraints.set("material", hardFacets.material);
+      if (hardFacets.size) {
+        const cleaned = cleanFacetValue(hardFacets.size);
+        if (cleaned) allConstraints.set("size", cleaned);
+      }
+      if (hardFacets.color) {
+        const cleaned = cleanFacetValue(hardFacets.color);
+        if (cleaned) allConstraints.set("color", cleaned);
+      }
+      if (hardFacets.material) {
+        const cleaned = cleanFacetValue(hardFacets.material);
+        if (cleaned) allConstraints.set("material", cleaned);
+      }
       
       // Add constraints from variantConstraints2.allowValues (generic, works for any facet)
       if (variantConstraints2.allowValues) {
@@ -6051,8 +6283,36 @@ async function processSessionInBackground({
           // For allowValues, we use the first value as the primary constraint (OR logic handled in gating)
           if (Array.isArray(allowedValues) && allowedValues.length > 0) {
             const normalizedFacetName = normalizeOptionName(facetName);
-            if (!allConstraints.has(normalizedFacetName)) {
-              allConstraints.set(normalizedFacetName, allowedValues[0]);
+            const cleaned = cleanFacetValue(allowedValues[0]);
+            if (cleaned && !allConstraints.has(normalizedFacetName)) {
+              allConstraints.set(normalizedFacetName, cleaned);
+            }
+          }
+        }
+      }
+      
+      // Add constraints from bundle per-item facets (for bundle mode coverage calculation)
+      if (bundleIntent.isBundle && bundleIntent.items.length > 0) {
+        for (const item of bundleIntent.items) {
+          const itemOptionConstraints = item.constraints?.optionConstraints;
+          if (itemOptionConstraints) {
+            if (itemOptionConstraints.size) {
+              const cleaned = cleanFacetValue(itemOptionConstraints.size);
+              if (cleaned && !allConstraints.has("size")) {
+                allConstraints.set("size", cleaned); // Use first item's size for coverage
+              }
+            }
+            if (itemOptionConstraints.color) {
+              const cleaned = cleanFacetValue(itemOptionConstraints.color);
+              if (cleaned && !allConstraints.has("color")) {
+                allConstraints.set("color", cleaned); // Use first item's color for coverage
+              }
+            }
+            if (itemOptionConstraints.material) {
+              const cleaned = cleanFacetValue(itemOptionConstraints.material);
+              if (cleaned && !allConstraints.has("material")) {
+                allConstraints.set("material", cleaned); // Use first item's material for coverage
+              }
             }
           }
         }
@@ -6269,13 +6529,22 @@ async function processSessionInBackground({
           }
         }
         
-        // Check availability (required for all candidates)
-        const hasAvailableVariant = c.available === true || 
-          (c.variants && Array.isArray(c.variants) && c.variants.some((v: any) => 
-            v.available === true || v.availableForSale === true
-          ));
-        if (!hasAvailableVariant) {
-          return false; // Reject due to availability
+        // Check availability (only if experience.inStockOnly is true)
+        // Don't filter by availability here if coverage is high - let it pass through for fallback matching
+        if (experience.inStockOnly) {
+          const hasAvailableVariant = c.available === true || 
+            (c.variants && Array.isArray(c.variants) && c.variants.some((v: any) => 
+              v.available === true || v.availableForSale === true
+            ));
+          if (!hasAvailableVariant) {
+            // Log detailed rejection reason for debugging
+            const availableStatus = c.available;
+            const variantCount = Array.isArray(c.variants) ? c.variants.length : 0;
+            const variantAvailableCount = Array.isArray(c.variants) ? 
+              c.variants.filter((v: any) => v.available === true || v.availableForSale === true).length : 0;
+            console.log(`[Availability] rejected handle=${c.handle} productAvailable=${availableStatus} variantCount=${variantCount} variantAvailableCount=${variantAvailableCount} reason=inStockOnly_required`);
+            return false; // Reject due to availability requirement
+          }
         }
         
         return true;
@@ -6294,7 +6563,7 @@ async function processSessionInBackground({
       if (enforcedFacets.size || enforcedFacets.color || enforcedFacets.material) {
         console.log(`[App Proxy] [Layer 2] After facet gating: ${afterFacetGating} candidates (reduced by ${facetGatingReduction} from ${beforeFacetGating})`);
       } else {
-        console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+      console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
       }
       
       // Denylist for common false positives (word that contains the term but isn't the term)
