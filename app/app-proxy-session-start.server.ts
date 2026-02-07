@@ -856,26 +856,89 @@ function extractSmartFetchSignals(
     }
   }
   
-  // Extract from answers (quiz/hybrid modes)
+  // Helper to detect if an answer is a budget/price string (should be excluded from keywords)
+  const isBudgetString = (text: string): boolean => {
+    const trimmed = text.trim();
+    const lower = trimmed.toLowerCase();
+    
+    // Check for currency symbols
+    if (/[\$£€¥]/.test(trimmed)) return true;
+    
+    // Check for budget patterns
+    if (/under/i.test(lower) && /\d/.test(trimmed)) return true;
+    if (/over/i.test(lower) && /\d/.test(trimmed)) return true;
+    if (/and above/i.test(lower) && /\d/.test(trimmed)) return true;
+    if (/plus/i.test(lower) && /\d/.test(trimmed)) return true;
+    if (/[\+\-]/.test(trimmed) && /\d/.test(trimmed)) return true;
+    
+    // Check for numeric ranges (e.g., "100-250", "50 to 100")
+    if (/\d+[\s\-]+to[\s\-]+\d+/i.test(trimmed)) return true;
+    if (/\d+[\s\-]+\d+/.test(trimmed)) return true; // Simple range like "100-250"
+    
+    // Check for price-like patterns with numbers
+    if (/^\$?\d+[\s\-]*(plus|\+|-|to|and above|under)/i.test(trimmed)) return true;
+    
+    return false;
+  };
+  
+  // Extract from answers (quiz/hybrid modes) - filter out budget strings
   const answerTexts: string[] = [];
+  const droppedPriceAnswers: string[] = [];
   if (Array.isArray(answers)) {
     for (const answer of answers) {
       if (answer === null || answer === undefined) continue;
       const answerStr = String(answer).trim();
       if (answerStr.length > 0 && !shouldIgnore(answerStr)) {
         // Skip budget patterns (they're constraints, not keywords)
-        if (!/^\$?\d+[\s\-]*(plus|\+|-|to|and above|under)/i.test(answerStr)) {
-          answerTexts.push(answerStr);
+        if (isBudgetString(answerStr)) {
+          droppedPriceAnswers.push(answerStr);
+          continue;
         }
+        answerTexts.push(answerStr);
       }
     }
   }
   
-  // Combine all text sources
-  const allText = [...userMessages, ...answerTexts].join(" ");
+  // Also filter budget strings from conversation messages
+  const filteredUserMessages: string[] = [];
+  for (const msg of userMessages) {
+    // Check if message contains budget strings - if so, try to extract non-budget parts
+    const words = msg.split(/\s+/);
+    const nonBudgetWords: string[] = [];
+    let inBudgetContext = false;
+    
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      const nextWord = i < words.length - 1 ? words[i + 1] : "";
+      const combined = `${word} ${nextWord}`.trim();
+      
+      // Check if this word/combination is budget-related
+      if (isBudgetString(word) || isBudgetString(combined)) {
+        inBudgetContext = true;
+        // Skip this word and potentially next word
+        if (isBudgetString(combined)) i++; // Skip next word too
+        continue;
+      }
+      
+      // If we're not in a budget context, keep the word
+      if (!inBudgetContext) {
+        nonBudgetWords.push(word);
+      }
+    }
+    
+    if (nonBudgetWords.length > 0) {
+      const cleaned = nonBudgetWords.join(" ").trim();
+      if (cleaned.length > 0) {
+        filteredUserMessages.push(cleaned);
+      }
+    }
+  }
+  
+  // Combine all text sources (use filtered messages)
+  const allText = [...filteredUserMessages, ...answerTexts].join(" ");
   const rawPreview = allText.substring(0, 200);
   
-  // Tokenize and extract meaningful keywords (min 3 chars, not stopwords)
+  // Tokenize and extract meaningful keywords (min 3 chars, not stopwords, not numbers-only)
   const stopwords = new Set([
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
     "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
@@ -891,11 +954,15 @@ function extractSmartFetchSignals(
   
   const words = allText.toLowerCase().split(/\s+/).filter(w => {
     const cleaned = w.replace(/[^\w]/g, "");
+    // Exclude numbers-only tokens and stopwords
+    if (/^\d+$/.test(cleaned)) return false; // Numbers-only
     return cleaned.length >= 3 && !stopwords.has(cleaned);
   });
   
   for (const word of words) {
     const cleaned = word.replace(/[^\w]/g, "").toLowerCase();
+    // Skip numbers-only tokens
+    if (/^\d+$/.test(cleaned)) continue;
     if (cleaned.length >= 3 && !seen.has(cleaned)) {
       seen.add(cleaned);
       keywords.push(cleaned);
@@ -906,6 +973,8 @@ function extractSmartFetchSignals(
   const phrases: string[] = [];
   for (let i = 0; i < words.length - 1; i++) {
     const phrase = `${words[i]} ${words[i + 1]}`.replace(/[^\w\s]/g, "");
+    // Skip phrases that are just numbers
+    if (/^\d+\s+\d+$/.test(phrase)) continue;
     if (phrase.length >= 6 && !seen.has(phrase)) {
       seen.add(phrase);
       phrases.push(phrase);
@@ -920,6 +989,9 @@ function extractSmartFetchSignals(
   }
   
   const hasMeaningfulSignals = keywords.length > 0 || selections.length > 0;
+  
+  // Log sanitization results
+  console.log(`[SmartFetch] signals_sanitized keywords=[${keywords.slice(0, 10).join(",")}${keywords.length > 10 ? "..." : ""}] selections=[${selections.slice(0, 5).join(",")}${selections.length > 5 ? "..." : ""}] droppedPriceAnswers=[${droppedPriceAnswers.join(",")}]`);
   
   return {
     keywords: keywords.slice(0, 20), // Cap to avoid query bloat
@@ -943,14 +1015,20 @@ function buildShopifySearchQuery(
   
   const clauses: string[] = [];
   
+  // Filter out numbers-only tokens (should not be in keywords, but double-check)
+  const safeKeywords = signals.keywords.filter(k => !/^\d+$/.test(k));
+  const safeSelections = signals.selections.filter(s => !/^\d+/.test(s));
+  
   // Build selection clauses (stronger signals - product types/categories)
-  if (signals.selections.length > 0) {
+  if (safeSelections.length > 0) {
     const selectionClauses: string[] = [];
-    for (const selection of signals.selections) {
-      // Escape special characters for Shopify query syntax
+    for (const selection of safeSelections) {
+      // Escape special characters and quote multi-word tokens
       const escaped = selection.replace(/[\\"]/g, "\\$&");
+      // Quote multi-word selections
+      const quoted = selection.includes(" ") ? `"${escaped}"` : escaped;
       selectionClauses.push(
-        `(product_type:*${escaped}* OR tag:*${escaped}* OR title:*${escaped}*)`
+        `(title:${quoted} OR product_type:${quoted} OR tag:${quoted} OR vendor:${quoted})`
       );
     }
     if (selectionClauses.length > 0) {
@@ -959,12 +1037,15 @@ function buildShopifySearchQuery(
   }
   
   // Build keyword clauses (weaker signals - general keywords)
-  if (signals.keywords.length > 0) {
+  if (safeKeywords.length > 0) {
     const keywordClauses: string[] = [];
-    for (const keyword of signals.keywords) {
+    for (const keyword of safeKeywords) {
+      // Skip numbers-only
+      if (/^\d+$/.test(keyword)) continue;
       const escaped = keyword.replace(/[\\"]/g, "\\$&");
+      // Use simple field matching (no wildcards for single words)
       keywordClauses.push(
-        `(title:*${escaped}* OR tag:*${escaped}* OR product_type:*${escaped}* OR vendor:*${escaped}*)`
+        `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
       );
     }
     if (keywordClauses.length > 0) {
@@ -978,7 +1059,7 @@ function buildShopifySearchQuery(
   
   // Combine: if we have selections, use AND logic; otherwise use OR for keywords
   let query: string;
-  if (signals.selections.length > 0 && signals.keywords.length > 0) {
+  if (safeSelections.length > 0 && safeKeywords.length > 0) {
     // Selections AND keywords (more targeted)
     query = `${clauses[0]} AND ${clauses[1]}`;
   } else {
@@ -997,6 +1078,12 @@ function buildShopifySearchQuery(
     if (cutPoint > maxQueryLength * 0.7) {
       query = query.substring(0, cutPoint);
     }
+  }
+  
+  // Final safety check: if query is empty or only contains numbers, return null
+  const queryWithoutParens = query.replace(/[()]/g, "").trim();
+  if (queryWithoutParens.length === 0 || /^\d+$/.test(queryWithoutParens)) {
+    return null;
   }
   
   return query;
@@ -3664,9 +3751,9 @@ async function processSessionInBackground({
     }
   }
   
-  // Log budget detection summary
+  // Log budget detection summary - answers are the SINGLE source of truth
   if (priceMin !== null || priceMax !== null) {
-    console.log(`[BudgetDetected] min=${priceMin ?? "null"} max=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"}`);
+    console.log(`[Budget] source=answers priceMin=${priceMin ?? "null"} priceMax=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"} ignore_llm_totalBudget=true`);
   }
 
   // Get access token from Session table
@@ -3868,8 +3955,14 @@ async function processSessionInBackground({
       }
 
       // Apply budget (derived from answers) - using price range overlap
+      // CRITICAL: priceMin/priceMax from answers is the SINGLE source of truth
+      // Do NOT use LLM totalBudget or priceCeiling for filtering
       const hadBudget = typeof priceMin === "number" || typeof priceMax === "number";
       if (hadBudget) {
+        const beforeBudget = filteredProducts.length;
+        let removedBelow = 0;
+        let removedAbove = 0;
+        
         filteredProducts = filteredProducts.filter(p => {
           // Get price range from product (prefer explicit min/max, fallback to single price)
           const productMin = (p as any).priceMinAmount ?? null;
@@ -3882,17 +3975,37 @@ async function processSessionInBackground({
             const prodMax = productMax ?? productMin ?? singlePrice;
             
             // Range overlap: productMax >= budgetMin AND productMin <= budgetMax
-            if (typeof priceMin === "number" && prodMax < priceMin) return false;
-            if (typeof priceMax === "number" && prodMin > priceMax) return false;
+            // Only apply floor filter when priceMin is present
+            if (typeof priceMin === "number" && prodMax < priceMin) {
+              removedBelow++;
+              return false;
+            }
+            // Only apply ceiling filter when priceMax is present
+            if (typeof priceMax === "number" && prodMin > priceMax) {
+              removedAbove++;
+              return false;
+            }
             return true;
           }
           
           // Fallback to single price logic for backwards compatibility
           if (!Number.isFinite(singlePrice)) return true; // don't drop unknown prices
-          if (typeof priceMin === "number" && singlePrice < priceMin) return false;
-          if (typeof priceMax === "number" && singlePrice > priceMax) return false;
+          // Only apply floor filter when priceMin is present
+          if (typeof priceMin === "number" && singlePrice < priceMin) {
+            removedBelow++;
+            return false;
+          }
+          // Only apply ceiling filter when priceMax is present
+          if (typeof priceMax === "number" && singlePrice > priceMax) {
+            removedAbove++;
+            return false;
+          }
           return true;
         });
+        
+        const afterBudget = filteredProducts.length;
+        console.log(`[BudgetFilter] applied=true before=${beforeBudget} after=${afterBudget} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
+        console.log(`[BudgetConstraint] applied=true floor=${priceMin ?? "null"} ceiling=${priceMax ?? "null"} removedBelow=${removedBelow} removedAbove=${removedAbove}`);
       }
 
       const firstStageFilteredCount = filteredProducts.length;
@@ -6066,6 +6179,8 @@ async function processSessionInBackground({
       }
       
       // Budget filter helper: applies priceMin/priceMax constraints to candidates using range overlap
+      // CRITICAL: priceMin/priceMax from answers is the SINGLE source of truth
+      // Do NOT use LLM totalBudget or priceCeiling for filtering
       function applyBudgetFilterCandidates<T extends { priceAmount?: any; price?: any; priceMinAmount?: number | null; priceMaxAmount?: number | null }>(
         candidates: T[],
         priceMin: number | null,
@@ -6075,6 +6190,9 @@ async function processSessionInBackground({
         if (!hadBudget) return candidates;
 
         const before = candidates.length;
+        let removedBelow = 0;
+        let removedAbove = 0;
+        
         const out = candidates.filter(c => {
           // Get price range from candidate (prefer explicit min/max, fallback to single price)
           const candidateMin = (c as any).priceMinAmount ?? null;
@@ -6092,20 +6210,38 @@ async function processSessionInBackground({
             }
             
             // Range overlap: candidateMax >= budgetMin AND candidateMin <= budgetMax
-            if (typeof priceMin === "number" && candMax < priceMin) return false;
-            if (typeof priceMax === "number" && candMin > priceMax) return false;
+            // Only apply floor filter when priceMin is present
+            if (typeof priceMin === "number" && candMax < priceMin) {
+              removedBelow++;
+              return false;
+            }
+            // Only apply ceiling filter when priceMax is present
+            if (typeof priceMax === "number" && candMin > priceMax) {
+              removedAbove++;
+              return false;
+            }
             return true;
           }
           
           // Fallback to single price logic for backwards compatibility
           if (!Number.isFinite(singlePrice)) return true; // keep unknown prices
-          if (typeof priceMin === "number" && singlePrice < priceMin) return false;
-          if (typeof priceMax === "number" && singlePrice > priceMax) return false;
+          // Only apply floor filter when priceMin is present
+          if (typeof priceMin === "number" && singlePrice < priceMin) {
+            removedBelow++;
+            return false;
+          }
+          // Only apply ceiling filter when priceMax is present
+          if (typeof priceMax === "number" && singlePrice > priceMax) {
+            removedAbove++;
+            return false;
+          }
           return true;
         });
+        
         const after = out.length;
         if (before !== after) {
           console.log(`[BudgetFilter] applied=true before=${before} after=${after} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
+          console.log(`[BudgetConstraint] applied=true floor=${priceMin ?? "null"} ceiling=${priceMax ?? "null"} removedBelow=${removedBelow} removedAbove=${removedAbove}`);
         } else {
           console.log(`[BudgetFilter] applied=true no_change count=${before} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
         }
