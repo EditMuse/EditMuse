@@ -262,9 +262,9 @@ function extractOptionValues(product: any): Record<string, string[]> {
     for (const [pos, val] of pairs) {
       const name = positionToName.get(pos);
       if (name) {
-        push(name, val);
-      }
+      push(name, val);
     }
+  }
 
     // GraphQL API: selectedOptions
     if (Array.isArray(v?.selectedOptions)) {
@@ -888,7 +888,7 @@ export async function fetchShopifyProductsGraphQL({
         const pageInfo = productsData.pageInfo;
         hasNextPage = pageInfo?.hasNextPage || false;
         cursor = pageInfo?.endCursor || null;
-      } else {
+  } else {
         hasNextPage = false;
       }
     }
@@ -1147,7 +1147,7 @@ export async function fetchShopifyProductsGraphQL({
     
     // Parse color tags (cf-color-*)
     for (const tag of tags) {
-      if (typeof tag === "string" && tag.startsWith("cf-color-")) {
+        if (typeof tag === "string" && tag.startsWith("cf-color-")) {
         const color = tag.replace("cf-color-", "").trim().toLowerCase();
         if (color && !colorsFromTags.includes(color)) {
           colorsFromTags.push(color);
