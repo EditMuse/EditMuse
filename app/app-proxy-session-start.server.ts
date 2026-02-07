@@ -4332,7 +4332,7 @@ async function processSessionInBackground({
       let allCandidatesEnriched: EnrichedCandidate[] = enrichedCandidates;
       
       // Discover facet vocabulary from candidate pool (industry-agnostic)
-      const { discoverFacetVocabulary } = await import("~/utils/facets.server");
+      const { discoverFacetVocabulary, normalizeOptionName } = await import("~/utils/facets.server");
       const facetVocabulary = discoverFacetVocabulary(enrichedCandidates);
       const discoveredOptionNames = Array.from(facetVocabulary.optionNames);
       const optionNameCounts: Record<string, number> = {};
@@ -6031,70 +6031,251 @@ async function processSessionInBackground({
       // Calculate BM25 scores and apply gating
       console.log("[App Proxy] [Layer 2] Applying hard gating");
       
-      // Gate 1: Hard facets (size/color/material must match) - with OR allow-list support
+      // Gate 1: Hard facets (industry-agnostic: any facet type) - with OR allow-list support
+      // STEP 1: Compute facet coverage before gating (for ALL facets, not just size/color/material)
       const beforeFacetGating = allCandidatesEnriched.length;
-      let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
-        // Use productMatchesHardFacets helper for consistent facet checking
-        const matchesFacets = productMatchesHardFacets(c, hardFacets, knownOptionNames);
-        if (!matchesFacets) return false;
+      const totalCandidates = allCandidatesEnriched.length;
+      
+      // Build a map of all constraints (from hardFacets + variantConstraints2.allowValues)
+      // This makes it industry-agnostic - works for any facet type (size, color, material, scent, finish, capacity, etc.)
+      const allConstraints = new Map<string, string>(); // facetName -> constraintValue
+      
+      // Add constraints from hardFacets (backwards compatibility for size/color/material)
+      if (hardFacets.size) allConstraints.set("size", hardFacets.size);
+      if (hardFacets.color) allConstraints.set("color", hardFacets.color);
+      if (hardFacets.material) allConstraints.set("material", hardFacets.material);
+      
+      // Add constraints from variantConstraints2.allowValues (generic, works for any facet)
+      if (variantConstraints2.allowValues) {
+        for (const [facetName, allowedValues] of Object.entries(variantConstraints2.allowValues)) {
+          // For allowValues, we use the first value as the primary constraint (OR logic handled in gating)
+          if (Array.isArray(allowedValues) && allowedValues.length > 0) {
+            const normalizedFacetName = normalizeOptionName(facetName);
+            if (!allConstraints.has(normalizedFacetName)) {
+              allConstraints.set(normalizedFacetName, allowedValues[0]);
+            }
+          }
+        }
+      }
+      
+      // Compute coverage for each constraint using facetVocabulary (industry-agnostic)
+      const facetCoverage = new Map<string, number>(); // facetName -> coverage (0.0 to 1.0)
+      const facetCoverageLog: Record<string, number> = {};
+      
+      if (totalCandidates > 0) {
+        for (const [facetName, constraintValue] of allConstraints.entries()) {
+          // Count candidates that have this facet in structured data (variants/options)
+          let candidatesWithFacet = 0;
+          
+          for (const candidate of allCandidatesEnriched) {
+            // Check if candidate has this facet in variants/options
+            let hasFacet = false;
+            
+            // Check variants' selectedOptions
+            if (Array.isArray(candidate.variants)) {
+              for (const variant of candidate.variants) {
+                if (Array.isArray(variant.selectedOptions)) {
+                  for (const option of variant.selectedOptions) {
+                    const normalizedOptionName = normalizeOptionName(option.name || "");
+                    if (normalizedOptionName === facetName) {
+                      hasFacet = true;
+                      break;
+                    }
+                  }
+                  if (hasFacet) break;
+                }
+              }
+            }
+            
+            // Also check optionValues (REST API format)
+            if (!hasFacet && candidate.optionValues && typeof candidate.optionValues === "object") {
+              for (const optName of Object.keys(candidate.optionValues)) {
+                const normalizedOptName = normalizeOptionName(optName);
+                if (normalizedOptName === facetName) {
+                  hasFacet = true;
+                  break;
+                }
+              }
+            }
+            
+            // Legacy support: check c.colors, c.sizes, c.materials for backwards compatibility
+            if (!hasFacet) {
+              if (facetName === "color" && candidate.colors && candidate.colors.length > 0) hasFacet = true;
+              if (facetName === "size" && candidate.sizes && candidate.sizes.length > 0) hasFacet = true;
+              if (facetName === "material" && candidate.materials && candidate.materials.length > 0) hasFacet = true;
+            }
+            
+            if (hasFacet) candidatesWithFacet++;
+          }
+          
+          const coverage = candidatesWithFacet / totalCandidates;
+          facetCoverage.set(facetName, coverage);
+          facetCoverageLog[facetName] = coverage;
+        }
+      }
+      
+      console.log(`[FacetCoverage] ${JSON.stringify(facetCoverageLog)} totals=${totalCandidates}`);
+      
+      // STEP 2: Confidence rule - if coverage < 0.25, move facet to softTerms instead of enforcing
+      // This works for ANY facet type (size, color, material, scent, finish, capacity, etc.)
+      const enforcedFacets: { size: string | null; color: string | null; material: string | null } = {
+        size: null,
+        color: null,
+        material: null
+      };
+      const enforcedConstraints = new Map<string, string>(); // Generic map for any facet type
+      const degradedFacets: Array<{ facet: string; value: string; coverage: number }> = [];
+      
+      for (const [facetName, constraintValue] of allConstraints.entries()) {
+        const coverage = facetCoverage.get(facetName) || 0;
         
+        if (coverage < 0.25) {
+          // Low coverage - move to softTerms
+          softTerms.push(constraintValue);
+          degradedFacets.push({ facet: facetName, value: constraintValue, coverage });
+          console.log(`[Degrade] reason=low_facet_coverage facet=${facetName} selected=${constraintValue} coverage=${coverage.toFixed(3)} moved_to_softTerms=true`);
+        } else {
+          // High enough coverage - enforce as hard constraint
+          enforcedConstraints.set(facetName, constraintValue);
+          
+          // Also set in enforcedFacets for backwards compatibility (size/color/material)
+          if (facetName === "size") enforcedFacets.size = constraintValue;
+          if (facetName === "color") enforcedFacets.color = constraintValue;
+          if (facetName === "material") enforcedFacets.material = constraintValue;
+        }
+      }
+      
+      // STEP 3: Apply facet gating with fallback matching for missing structured facets
+      let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
+        // Helper to check if a facet value matches (structured OR indexedText fallback)
+        const checkFacetMatch = (facetValue: string | null, structuredValues: string[], indexedText: string): boolean => {
+          if (!facetValue) return true; // No constraint
+          
+          // First try structured matching
+          if (structuredValues.length > 0) {
+            const hasStructuredMatch = structuredValues.some((val: string) => {
+              const normalizedVal = normalizeText(val);
+              const normalizedFacet = normalizeText(facetValue);
+              return normalizedVal === normalizedFacet ||
+                     normalizedVal.includes(normalizedFacet) ||
+                     normalizedFacet.includes(normalizedVal);
+            });
+            if (hasStructuredMatch) return true;
+          }
+          
+          // Fallback: check indexedText if structured facet is missing
+          const facetLower = normalizeText(facetValue);
+          if (indexedText.includes(facetLower)) {
+            return true; // Found in indexedText
+          }
+          
+          return false;
+        };
+        
+        // Helper to extract structured values for a facet from candidate (industry-agnostic)
+        const getStructuredValuesForFacet = (candidate: EnrichedCandidate, facetName: string): string[] => {
+          const values: string[] = [];
+          
+          // Check variants' selectedOptions
+          if (Array.isArray(candidate.variants)) {
+            for (const variant of candidate.variants) {
+              if (Array.isArray(variant.selectedOptions)) {
+                for (const option of variant.selectedOptions) {
+                  const normalizedOptionName = normalizeOptionName(option.name || "");
+                  if (normalizedOptionName === facetName && option.value) {
+                    values.push(option.value);
+                  }
+                }
+              }
+            }
+          }
+          
+          // Also check optionValues (REST API format)
+          if (candidate.optionValues && typeof candidate.optionValues === "object") {
+            for (const [optName, optValues] of Object.entries(candidate.optionValues)) {
+              const normalizedOptName = normalizeOptionName(optName);
+              if (normalizedOptName === facetName && Array.isArray(optValues)) {
+                values.push(...optValues.filter(v => typeof v === "string"));
+              }
+            }
+          }
+          
+          // Legacy support: check c.colors, c.sizes, c.materials for backwards compatibility
+          if (facetName === "color" && candidate.colors) values.push(...candidate.colors);
+          if (facetName === "size" && candidate.sizes) values.push(...candidate.sizes);
+          if (facetName === "material" && candidate.materials) values.push(...candidate.materials);
+          
+          return values;
+        };
+        
+        const indexedText = unifiedNormalize(c.searchText || extractSearchText(c, indexMetafields));
+        
+        // Check ALL enforced constraints (industry-agnostic: works for any facet type)
+        for (const [facetName, constraintValue] of enforcedConstraints.entries()) {
+          const structuredValues = getStructuredValuesForFacet(c, facetName);
+          if (!checkFacetMatch(constraintValue, structuredValues, indexedText)) {
+            return false;
+          }
+        }
+        
+        // Legacy: Also check enforcedFacets for backwards compatibility (size/color/material)
+        if (enforcedFacets.size) {
+          if (!checkFacetMatch(enforcedFacets.size, c.sizes || [], indexedText)) {
+            return false;
+          }
+        }
+        
+        if (enforcedFacets.color) {
+          if (!checkFacetMatch(enforcedFacets.color, c.colors || [], indexedText)) {
+            return false;
+          }
+        }
+        
+        if (enforcedFacets.material) {
+          if (!checkFacetMatch(enforcedFacets.material, c.materials || [], indexedText)) {
+            return false;
+          }
+        }
+        
+        // Check allowValues (OR logic) with fallback - industry-agnostic: works for any facet type
         const allowValues = variantConstraints2.allowValues;
         
-        // Size constraint: check allowValues first (OR logic - match any), then single value
-        if (allowValues?.size && allowValues.size.length > 0 && c.sizes.length > 0) {
-          const sizeMatch = c.sizes.some((s: string) => 
-            allowValues.size.some(allowedSize => 
-              normalizeText(s) === normalizeText(allowedSize) ||
-              normalizeText(s).includes(normalizeText(allowedSize)) ||
-              normalizeText(allowedSize).includes(normalizeText(s))
-            )
-          );
-          if (!sizeMatch) return false;
-        } else if (hardFacets.size && c.sizes.length > 0) {
-          const sizeMatch = c.sizes.some((s: string) => 
-            normalizeText(s) === normalizeText(hardFacets.size) ||
-            normalizeText(s).includes(normalizeText(hardFacets.size)) ||
-            normalizeText(hardFacets.size).includes(normalizeText(s))
-          );
-          if (!sizeMatch) return false;
+        if (allowValues) {
+          for (const [facetName, allowedValues] of Object.entries(allowValues)) {
+            if (!Array.isArray(allowedValues) || allowedValues.length === 0) continue;
+            
+            const normalizedFacetName = normalizeOptionName(facetName);
+            
+            // Skip if this facet is already enforced (don't double-check)
+            if (enforcedConstraints.has(normalizedFacetName)) continue;
+            
+            // Get structured values for this facet
+            const structuredValues = getStructuredValuesForFacet(c, normalizedFacetName);
+            
+            // Check if any allowed value matches (structured OR indexedText)
+            const hasMatch = structuredValues.some((val: string) => 
+              allowedValues.some(allowedValue => {
+                const normalizedVal = normalizeText(val);
+                const normalizedAllowed = normalizeText(allowedValue);
+                return normalizedVal === normalizedAllowed ||
+                       normalizedVal.includes(normalizedAllowed) ||
+                       normalizedAllowed.includes(normalizedVal);
+              })
+            ) || allowedValues.some(allowedValue => 
+              indexedText.includes(normalizeText(allowedValue))
+            );
+            
+            if (!hasMatch) return false;
+          }
         }
         
-        // Color constraint: check allowValues first (OR logic - match any), then single value
-        if (allowValues?.color && allowValues.color.length > 0 && c.colors.length > 0) {
-          const colorMatch = c.colors.some((col: string) => 
-            allowValues.color.some(allowedColor => 
-              normalizeText(col) === normalizeText(allowedColor) ||
-              normalizeText(col).includes(normalizeText(allowedColor)) ||
-              normalizeText(allowedColor).includes(normalizeText(col))
-            )
-          );
-          if (!colorMatch) return false;
-        } else if (hardFacets.color && c.colors.length > 0) {
-          const colorMatch = c.colors.some((col: string) => 
-            normalizeText(col) === normalizeText(hardFacets.color) ||
-            normalizeText(col).includes(normalizeText(hardFacets.color)) ||
-            normalizeText(hardFacets.color).includes(normalizeText(col))
-          );
-          if (!colorMatch) return false;
-        }
-        
-        // Material constraint: check allowValues first (OR logic - match any), then single value
-        if (allowValues?.material && allowValues.material.length > 0 && c.materials.length > 0) {
-          const materialMatch = c.materials.some((m: string) => 
-            allowValues.material.some(allowedMaterial => 
-              normalizeText(m) === normalizeText(allowedMaterial) ||
-              normalizeText(m).includes(normalizeText(allowedMaterial)) ||
-              normalizeText(allowedMaterial).includes(normalizeText(m))
-            )
-          );
-          if (!materialMatch) return false;
-        } else if (hardFacets.material && c.materials.length > 0) {
-          const materialMatch = c.materials.some((m: string) => 
-            normalizeText(m) === normalizeText(hardFacets.material) ||
-            normalizeText(m).includes(normalizeText(hardFacets.material)) ||
-            normalizeText(hardFacets.material).includes(normalizeText(m))
-          );
-          if (!materialMatch) return false;
+        // Check availability (required for all candidates)
+        const hasAvailableVariant = c.available === true || 
+          (c.variants && Array.isArray(c.variants) && c.variants.some((v: any) => 
+            v.available === true || v.availableForSale === true
+          ));
+        if (!hasAvailableVariant) {
+          return false; // Reject due to availability
         }
         
         return true;
@@ -6102,10 +6283,18 @@ async function processSessionInBackground({
       
       const afterFacetGating = gatedCandidates.length;
       const facetGatingReduction = beforeFacetGating - afterFacetGating;
-      if (hardFacets.size || hardFacets.color || hardFacets.material) {
+      
+      // Log degradation if facets were moved to softTerms
+      if (degradedFacets.length > 0) {
+        for (const degraded of degradedFacets) {
+          console.log(`[Degrade] reason=low_facet_coverage facet=${degraded.facet} selected=${degraded.value} before=${beforeFacetGating} after=${afterFacetGating}`);
+        }
+      }
+      
+      if (enforcedFacets.size || enforcedFacets.color || enforcedFacets.material) {
         console.log(`[App Proxy] [Layer 2] After facet gating: ${afterFacetGating} candidates (reduced by ${facetGatingReduction} from ${beforeFacetGating})`);
       } else {
-      console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
+        console.log("[App Proxy] [Layer 2] After facet gating:", gatedCandidates.length, "candidates");
       }
       
       // Denylist for common false positives (word that contains the term but isn't the term)
@@ -6767,8 +6956,13 @@ async function processSessionInBackground({
       
       // BUG FIX #2: NO_MATCH CHECK - If all gating stages failed and we have no candidates, return NO_MATCH result
       // This must short-circuit BEFORE BM25 ranking and AI ranking
-      if ((gatedCandidates.length === 0 && hardTerms.length > 0) || noMatchDetected) {
-        console.log(`[Gating] no_match=true - returning NO_MATCH result (all gating stages failed) - SHORT-CIRCUITING pipeline`);
+      // CRITICAL: Only return NO_MATCH if there were zero candidates BEFORE facet gating OR after all fallbacks
+      // If candidates existed but were removed due to low-confidence facets, continue with partial results
+      const shouldReturnNoMatch = (gatedCandidates.length === 0 && hardTerms.length > 0 && beforeFacetGating === 0) || 
+                                   (noMatchDetected && beforeFacetGating === 0);
+      
+      if (shouldReturnNoMatch) {
+        console.log(`[Gating] no_match=true - returning NO_MATCH result (zero candidates before facet gating) - SHORT-CIRCUITING pipeline`);
         
         // Generate suggested synonyms from searchSynonymsJson
         let suggestedSynonyms: string[] = [];
@@ -6812,6 +7006,10 @@ async function processSessionInBackground({
         
         console.log("[App Proxy] NO_MATCH result saved - session marked COMPLETE with 0 products (SKIPPED: BM25 ranking, AI ranking, billing)");
         return; // Exit early - DO NOT continue to BM25 ranking, DO NOT call AI ranking, DO NOT bill
+      } else if (gatedCandidates.length === 0 && beforeFacetGating > 0) {
+        // Candidates existed before facet gating but were removed - this is due to low coverage facets
+        // Continue with partial results (will use fallback logic later)
+        console.log(`[Gating] candidates_removed_by_facets before=${beforeFacetGating} after=${gatedCandidates.length} - continuing with fallback logic`);
       }
       
       // BUNDLE/HARD-TERM PATH: Continue processing (only if we have candidates)
