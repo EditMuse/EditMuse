@@ -806,6 +806,276 @@ function parseConstraintsFromText(text: string): VariantConstraints {
  * Parse user intent into hard terms, soft terms, avoid terms, and facets
  * Industry-agnostic intent parsing
  */
+/**
+ * Extract smart fetch signals from answers, conversation messages, and parsed intent
+ * Returns keywords, selections, and constraints for building Shopify search queries
+ */
+function extractSmartFetchSignals(
+  answers: any[],
+  conversationMessages: Array<{ role: string; content: string }>,
+  modeUsed: string
+): {
+  keywords: string[];
+  selections: string[];
+  hasMeaningfulSignals: boolean;
+  rawPreview: string;
+} {
+  const keywords: string[] = [];
+  const selections: string[] = [];
+  const seen = new Set<string>();
+  
+  // Generic placeholders to ignore
+  const ignorePatterns = [
+    /^any$/i,
+    /^all$/i,
+    /^all products$/i,
+    /^any colour$/i,
+    /^any color$/i,
+    /^any size$/i,
+    /^any material$/i,
+    /^none$/i,
+    /^n\/a$/i,
+    /^na$/i,
+  ];
+  
+  const shouldIgnore = (text: string): boolean => {
+    const trimmed = text.trim().toLowerCase();
+    return ignorePatterns.some(pattern => pattern.test(trimmed));
+  };
+  
+  // Extract from conversation messages (chat/hybrid modes)
+  const userMessages: string[] = [];
+  if (conversationMessages && conversationMessages.length > 0) {
+    for (const msg of conversationMessages) {
+      if (msg.role === "user" && msg.content && typeof msg.content === "string") {
+        const content = msg.content.trim();
+        if (content.length > 0 && !shouldIgnore(content)) {
+          userMessages.push(content);
+        }
+      }
+    }
+  }
+  
+  // Extract from answers (quiz/hybrid modes)
+  const answerTexts: string[] = [];
+  if (Array.isArray(answers)) {
+    for (const answer of answers) {
+      if (answer === null || answer === undefined) continue;
+      const answerStr = String(answer).trim();
+      if (answerStr.length > 0 && !shouldIgnore(answerStr)) {
+        // Skip budget patterns (they're constraints, not keywords)
+        if (!/^\$?\d+[\s\-]*(plus|\+|-|to|and above|under)/i.test(answerStr)) {
+          answerTexts.push(answerStr);
+        }
+      }
+    }
+  }
+  
+  // Combine all text sources
+  const allText = [...userMessages, ...answerTexts].join(" ");
+  const rawPreview = allText.substring(0, 200);
+  
+  // Tokenize and extract meaningful keywords (min 3 chars, not stopwords)
+  const stopwords = new Set([
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "these", "those",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "what", "which", "who", "whom", "where", "when", "why", "how", "if", "then", "else",
+    "about", "above", "after", "before", "below", "between", "during", "through", "under", "over",
+    "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
+    "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "some", "such",
+    "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
+    "want", "looking", "for", "need", "prefer", "like"
+  ]);
+  
+  const words = allText.toLowerCase().split(/\s+/).filter(w => {
+    const cleaned = w.replace(/[^\w]/g, "");
+    return cleaned.length >= 3 && !stopwords.has(cleaned);
+  });
+  
+  for (const word of words) {
+    const cleaned = word.replace(/[^\w]/g, "").toLowerCase();
+    if (cleaned.length >= 3 && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      keywords.push(cleaned);
+    }
+  }
+  
+  // Extract 2-word phrases (potential product types/selections)
+  const phrases: string[] = [];
+  for (let i = 0; i < words.length - 1; i++) {
+    const phrase = `${words[i]} ${words[i + 1]}`.replace(/[^\w\s]/g, "");
+    if (phrase.length >= 6 && !seen.has(phrase)) {
+      seen.add(phrase);
+      phrases.push(phrase);
+    }
+  }
+  
+  // Treat longer phrases as potential selections (product types)
+  for (const phrase of phrases) {
+    if (phrase.length >= 6) {
+      selections.push(phrase);
+    }
+  }
+  
+  const hasMeaningfulSignals = keywords.length > 0 || selections.length > 0;
+  
+  return {
+    keywords: keywords.slice(0, 20), // Cap to avoid query bloat
+    selections: selections.slice(0, 10), // Cap selections
+    hasMeaningfulSignals,
+    rawPreview,
+  };
+}
+
+/**
+ * Build a Shopify Admin GraphQL products search query string from fetch signals
+ * Industry-agnostic: uses generic keyword matching over title/tag/product_type/vendor
+ */
+function buildShopifySearchQuery(
+  signals: { keywords: string[]; selections: string[]; hasMeaningfulSignals: boolean },
+  maxQueryLength: number = 500
+): string | null {
+  if (!signals.hasMeaningfulSignals) {
+    return null;
+  }
+  
+  const clauses: string[] = [];
+  
+  // Build selection clauses (stronger signals - product types/categories)
+  if (signals.selections.length > 0) {
+    const selectionClauses: string[] = [];
+    for (const selection of signals.selections) {
+      // Escape special characters for Shopify query syntax
+      const escaped = selection.replace(/[\\"]/g, "\\$&");
+      selectionClauses.push(
+        `(product_type:*${escaped}* OR tag:*${escaped}* OR title:*${escaped}*)`
+      );
+    }
+    if (selectionClauses.length > 0) {
+      clauses.push(`(${selectionClauses.join(" OR ")})`);
+    }
+  }
+  
+  // Build keyword clauses (weaker signals - general keywords)
+  if (signals.keywords.length > 0) {
+    const keywordClauses: string[] = [];
+    for (const keyword of signals.keywords) {
+      const escaped = keyword.replace(/[\\"]/g, "\\$&");
+      keywordClauses.push(
+        `(title:*${escaped}* OR tag:*${escaped}* OR product_type:*${escaped}* OR vendor:*${escaped}*)`
+      );
+    }
+    if (keywordClauses.length > 0) {
+      clauses.push(`(${keywordClauses.join(" OR ")})`);
+    }
+  }
+  
+  if (clauses.length === 0) {
+    return null;
+  }
+  
+  // Combine: if we have selections, use AND logic; otherwise use OR for keywords
+  let query: string;
+  if (signals.selections.length > 0 && signals.keywords.length > 0) {
+    // Selections AND keywords (more targeted)
+    query = `${clauses[0]} AND ${clauses[1]}`;
+  } else {
+    // Just selections OR just keywords (OR logic within each)
+    query = clauses.join(" OR ");
+  }
+  
+  // Truncate if too long
+  if (query.length > maxQueryLength) {
+    query = query.substring(0, maxQueryLength);
+    // Try to end at a logical point (before a closing paren or AND/OR)
+    const lastAnd = query.lastIndexOf(" AND ");
+    const lastOr = query.lastIndexOf(" OR ");
+    const lastParen = query.lastIndexOf(")");
+    const cutPoint = Math.max(lastAnd, lastOr, lastParen);
+    if (cutPoint > maxQueryLength * 0.7) {
+      query = query.substring(0, cutPoint);
+    }
+  }
+  
+  return query;
+}
+
+/**
+ * Fetch products using Shopify search query with pagination
+ * Returns products array and whether more pages are available
+ */
+async function fetchProductsByQueryPaginated(
+  shopDomain: string,
+  accessToken: string,
+  query: string,
+  targetCount: number,
+  pageSize: number = 200
+): Promise<{
+  products: Array<any>;
+  hasMorePages: boolean;
+  totalFetched: number;
+}> {
+  // fetchShopifyProductsBySearchQuery is already imported at the top
+  
+  const allProducts: any[] = [];
+  let cursor: string | null = null;
+  let hasMorePages = true;
+  let totalFetched = 0;
+  
+  while (hasMorePages && allProducts.length < targetCount) {
+    const remaining = targetCount - allProducts.length;
+    const currentPageSize = Math.min(pageSize, remaining);
+    
+    try {
+      // Note: fetchShopifyProductsBySearchQuery doesn't support cursor pagination yet
+      // For now, we'll fetch in batches by adjusting the query or using offset
+      // This is a simplified version - in production, you'd want cursor-based pagination
+      const batch = await fetchShopifyProductsBySearchQuery({
+        shopDomain,
+        accessToken,
+        query,
+        targetCount: currentPageSize,
+      });
+      
+              // Deduplicate by handle
+              const seenHandles = new Set(allProducts.map((p: any) => p.handle));
+              const newProducts = batch.filter((p: any) => !seenHandles.has(p.handle));
+      
+      if (newProducts.length === 0) {
+        hasMorePages = false;
+        break;
+      }
+      
+      allProducts.push(...newProducts);
+      totalFetched += batch.length;
+      
+      // If we got fewer than requested, assume no more pages
+      if (batch.length < currentPageSize) {
+        hasMorePages = false;
+      } else if (allProducts.length >= targetCount) {
+        hasMorePages = false;
+      }
+      
+      // Safety: cap total fetches
+      if (totalFetched >= targetCount * 2) {
+        hasMorePages = false;
+      }
+    } catch (error) {
+      console.error(`[SmartFetch] Error fetching page:`, error);
+      hasMorePages = false;
+      break;
+    }
+  }
+  
+  return {
+    products: allProducts.slice(0, targetCount),
+    hasMorePages: allProducts.length >= targetCount && hasMorePages,
+    totalFetched: allProducts.length,
+  };
+}
+
 function parseIntentGeneric(
   userText: string,
   answersJson: string,
@@ -3433,19 +3703,130 @@ async function processSessionInBackground({
   try {
     if (accessToken) {
       const shopifyFetchStart = performance.now();
-      console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
       
-      // STAGE 1: First fetch (200 products)
-      let products = await fetchShopifyProducts({
-        shopDomain,
-        accessToken,
-        limit: PRODUCT_POOL_LIMIT_FIRST,
-        collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-      });
+      // ============================================
+      // INTENT-FIRST SMART FETCH
+      // ============================================
+      let smartFetchProducts: any[] = [];
+      let usingSmartFetch = false;
+      const SMART_FETCH_CAP = 500;
+      const SMART_FETCH_DESIRED_MIN = finalResultCount * 8;
+      
+      // Extract fetch signals from answers and conversation
+      const fetchSignals = extractSmartFetchSignals(answers, conversationMessages, modeUsed);
+      
+      if (fetchSignals.hasMeaningfulSignals) {
+        console.log(`[SmartFetch] enabled=true mode=${modeUsed} reason=has_meaningful_signals`);
+        console.log(`[SmartFetch] signals keywords=${fetchSignals.keywords.length} selections=${fetchSignals.selections.length} rawPreview=${fetchSignals.rawPreview.substring(0, 100)}`);
+        
+        // Step A: Build targeted query
+        let query = buildShopifySearchQuery(fetchSignals);
+        
+        if (query) {
+          console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
+          
+          try {
+            // Step A: Targeted fetch
+            const stepA = await fetchProductsByQueryPaginated(
+              shopDomain,
+              accessToken,
+              query,
+              SMART_FETCH_DESIRED_MIN,
+              200
+            );
+            
+            smartFetchProducts = stepA.products;
+            console.log(`[SmartFetch] query_step=A fetched=${stepA.products.length} totalFetched=${stepA.totalFetched} hadMorePages=${stepA.hasMorePages}`);
+            
+            // Step B: Widen if insufficient (remove AND constraints, keep OR keywords)
+            if (smartFetchProducts.length < SMART_FETCH_DESIRED_MIN && stepA.hasMorePages) {
+              const widen1Query = buildShopifySearchQuery({
+                keywords: fetchSignals.keywords,
+                selections: [], // Drop selections for widening
+                hasMeaningfulSignals: fetchSignals.keywords.length > 0,
+              }, 400);
+              
+              if (widen1Query && widen1Query !== query) {
+                console.log(`[SmartFetch] widen_step=1 query="${widen1Query.substring(0, 200)}${widen1Query.length > 200 ? "..." : ""}"`);
+                
+                const stepB = await fetchProductsByQueryPaginated(
+                  shopDomain,
+                  accessToken,
+                  widen1Query,
+                  SMART_FETCH_DESIRED_MIN - smartFetchProducts.length,
+                  200
+                );
+                
+                // Deduplicate
+                const seenHandles = new Set(smartFetchProducts.map((p: any) => p.handle));
+                const newProducts = stepB.products.filter((p: any) => !seenHandles.has(p.handle));
+                smartFetchProducts.push(...newProducts);
+                
+                console.log(`[SmartFetch] widen_step=1 fetchedTotal=${smartFetchProducts.length}`);
+              }
+            }
+            
+            // Step C: Paginate more if still insufficient
+            if (smartFetchProducts.length < SMART_FETCH_DESIRED_MIN && smartFetchProducts.length < SMART_FETCH_CAP) {
+              console.log(`[SmartFetch] widen_step=2 paginate=true`);
+              
+              const stepC = await fetchProductsByQueryPaginated(
+                shopDomain,
+                accessToken,
+                query,
+                SMART_FETCH_CAP - smartFetchProducts.length,
+                200
+              );
+              
+              // Deduplicate
+              const seenHandles = new Set(smartFetchProducts.map((p: any) => p.handle));
+              const newProducts = stepC.products.filter((p: any) => !seenHandles.has(p.handle));
+              smartFetchProducts.push(...newProducts);
+              
+              console.log(`[SmartFetch] widen_step=2 fetchedTotal=${smartFetchProducts.length}`);
+            }
+            
+            if (smartFetchProducts.length > 0) {
+              usingSmartFetch = true;
+              console.log(`[SmartFetch] final candidates=${smartFetchProducts.length} usingSmartFetch=true`);
+            } else {
+              console.log(`[SmartFetch] fallback_to_pool=true reason=insufficient_candidates`);
+            }
+          } catch (error) {
+            console.error(`[SmartFetch] Error during smart fetch:`, error);
+            console.log(`[SmartFetch] fallback_to_pool=true reason=query_error`);
+            smartFetchProducts = [];
+          }
+        } else {
+          console.log(`[SmartFetch] fallback_to_pool=true reason=no_keywords`);
+        }
+      } else {
+        console.log(`[SmartFetch] fallback_to_pool=true reason=no_meaningful_signals`);
+      }
+      
+      // Use smart fetch products if available, otherwise fall back to generic fetch
+      let products: any[] = [];
+      
+      if (usingSmartFetch && smartFetchProducts.length > 0) {
+        products = smartFetchProducts;
+        console.log("[App Proxy] Using smart fetch products:", products.length);
+      } else {
+        console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
+        
+        // STAGE 1: First fetch (200 products) - existing generic fetch
+        products = await fetchShopifyProducts({
+          shopDomain,
+          accessToken,
+          limit: PRODUCT_POOL_LIMIT_FIRST,
+          collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+        });
+      }
 
       const firstFetchCount = products.length;
-      const mightHaveMorePages = firstFetchCount === PRODUCT_POOL_LIMIT_FIRST;
-      console.log("[App Proxy] First fetch:", firstFetchCount, "products", mightHaveMorePages ? "(might have more pages)" : "");
+      const mightHaveMorePages = usingSmartFetch ? false : (firstFetchCount === PRODUCT_POOL_LIMIT_FIRST);
+      if (!usingSmartFetch) {
+        console.log("[App Proxy] First fetch:", firstFetchCount, "products", mightHaveMorePages ? "(might have more pages)" : "");
+      }
 
       // Apply initial filters
       // Filter out ARCHIVED and DRAFT products
@@ -3461,7 +3842,7 @@ async function processSessionInBackground({
         products = products.filter(p => {
           const productTags = p.tags || [];
           return !excludedTags.some(excludedTag => 
-            productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
+            productTags.some((tag: string) => tag.toLowerCase() === excludedTag.toLowerCase())
           );
         });
       }
@@ -3486,14 +3867,30 @@ async function processSessionInBackground({
         filteredProducts = filteredProducts.filter(p => p.available);
       }
 
-      // Apply budget (derived from answers)
+      // Apply budget (derived from answers) - using price range overlap
       const hadBudget = typeof priceMin === "number" || typeof priceMax === "number";
       if (hadBudget) {
         filteredProducts = filteredProducts.filter(p => {
-          const price = p.priceAmount ? parseFloat(String(p.priceAmount)) : (p.price ? parseFloat(String(p.price)) : NaN);
-          if (!Number.isFinite(price)) return true; // don't drop unknown prices
-          if (typeof priceMin === "number" && price < priceMin) return false;
-          if (typeof priceMax === "number" && price > priceMax) return false;
+          // Get price range from product (prefer explicit min/max, fallback to single price)
+          const productMin = (p as any).priceMinAmount ?? null;
+          const productMax = (p as any).priceMaxAmount ?? null;
+          const singlePrice = p.priceAmount ? parseFloat(String(p.priceAmount)) : (p.price ? parseFloat(String(p.price)) : NaN);
+          
+          // If we have explicit min/max, use range overlap logic
+          if (productMin !== null || productMax !== null) {
+            const prodMin = productMin ?? productMax ?? singlePrice;
+            const prodMax = productMax ?? productMin ?? singlePrice;
+            
+            // Range overlap: productMax >= budgetMin AND productMin <= budgetMax
+            if (typeof priceMin === "number" && prodMax < priceMin) return false;
+            if (typeof priceMax === "number" && prodMin > priceMax) return false;
+            return true;
+          }
+          
+          // Fallback to single price logic for backwards compatibility
+          if (!Number.isFinite(singlePrice)) return true; // don't drop unknown prices
+          if (typeof priceMin === "number" && singlePrice < priceMin) return false;
+          if (typeof priceMax === "number" && singlePrice > priceMax) return false;
           return true;
         });
       }
@@ -3501,8 +3898,8 @@ async function processSessionInBackground({
       const firstStageFilteredCount = filteredProducts.length;
       const minNeededAfterFilter = finalResultCount * 8;
 
-      // STAGE 2: Fetch additional products if needed
-      if (firstStageFilteredCount < minNeededAfterFilter && mightHaveMorePages && products.length < PRODUCT_POOL_LIMIT_MAX) {
+      // STAGE 2: Fetch additional products if needed (only for generic fetch, not smart fetch)
+      if (!usingSmartFetch && firstStageFilteredCount < minNeededAfterFilter && mightHaveMorePages && products.length < PRODUCT_POOL_LIMIT_MAX) {
         console.log("[App Proxy] Filtered candidates", firstStageFilteredCount, "<", minNeededAfterFilter, "- fetching up to", PRODUCT_POOL_LIMIT_MAX, "total products");
         
         // Fetch up to max limit (will fetch from beginning, but we'll deduplicate)
@@ -3533,7 +3930,7 @@ async function processSessionInBackground({
           products = products.filter(p => {
             const productTags = p.tags || [];
             return !excludedTags.some(excludedTag => 
-              productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
+              productTags.some((tag: string) => tag.toLowerCase() === excludedTag.toLowerCase())
             );
           });
         }
@@ -3619,6 +4016,44 @@ async function processSessionInBackground({
 
       // Log budget pool filtering summary
       console.log(`[BudgetPool] base=${baseProducts.length} after_stock_and_budget=${filteredProducts.length} min=${priceMin ?? "null"} max=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"}`);
+
+      // Budget diagnostic: Log suitish products in full pool (when budget is active)
+      if (hadBudget && (priceMin !== null || priceMax !== null)) {
+        const isSuitish = (p: any) => {
+          const text = [
+            p.title || "",
+            p.handle || "",
+            (p as any).productType || "",
+            (Array.isArray(p.tags) ? p.tags.join(" ") : ""),
+          ].join(" ").toLowerCase();
+          return text.includes("suit");
+        };
+        
+        const suitishProducts = baseProducts.filter(isSuitish);
+        const suitishOverMin = suitishProducts.filter(p => {
+          const productMax = (p as any).priceMaxAmount ?? (p as any).priceMinAmount ?? (p.priceAmount ? parseFloat(String(p.priceAmount)) : null);
+          return productMax !== null && (priceMin === null || productMax >= priceMin);
+        });
+        
+        const suitishSample = suitishProducts
+          .map(p => ({
+            handle: p.handle,
+            title: p.title,
+            productType: (p as any).productType || null,
+            available: p.available,
+            priceMinAmount: (p as any).priceMinAmount ?? null,
+            priceMaxAmount: (p as any).priceMaxAmount ?? null,
+            priceAmount: p.priceAmount || p.price || null,
+          }))
+          .sort((a, b) => {
+            const aMax = a.priceMaxAmount ?? a.priceMinAmount ?? (a.priceAmount ? parseFloat(String(a.priceAmount)) : 0);
+            const bMax = b.priceMaxAmount ?? b.priceMinAmount ?? (b.priceAmount ? parseFloat(String(b.priceAmount)) : 0);
+            return bMax - aMax;
+          })
+          .slice(0, 15);
+        
+        console.log(`[BudgetDebug] suitish_in_pool total=${suitishProducts.length} overMin=${suitishOverMin.length} min=${priceMin ?? "null"} sample=${JSON.stringify(suitishSample)}`);
+      }
 
       // Create known option names from catalogue
       const knownOptionNames = Array.from(
@@ -3754,6 +4189,9 @@ async function processSessionInBackground({
         tags: p.tags || [],
         vendor: (p as any).vendor || null,
         price: p.priceAmount || p.price || null,
+        priceMinAmount: (p as any).priceMinAmount ?? null,
+        priceMaxAmount: (p as any).priceMaxAmount ?? null,
+        priceCurrency: (p as any).priceCurrency ?? (p as any).currencyCode ?? null,
         description: null as string | null, // Not fetched in initial query
           descPlain: "", // Will be populated later for AI candidates
           desc1000: "", // Will be populated later for AI candidates
@@ -4077,9 +4515,9 @@ async function processSessionInBackground({
             const { canonicalType: extractedCanonicalType, facets } = extractCanonicalTypeAndFacets(
               filteredHardTerms, 
               {
-                size: existingFacets.size || null,
-                color: existingFacets.color || null,
-                material: existingFacets.material || null
+              size: existingFacets.size || null,
+              color: existingFacets.color || null,
+              material: existingFacets.material || null
               },
               facetVocabularyForBundle
             );
@@ -5627,8 +6065,8 @@ async function processSessionInBackground({
         }
       }
       
-      // Budget filter helper: applies priceMin/priceMax constraints to candidates
-      function applyBudgetFilterCandidates<T extends { priceAmount?: any; price?: any }>(
+      // Budget filter helper: applies priceMin/priceMax constraints to candidates using range overlap
+      function applyBudgetFilterCandidates<T extends { priceAmount?: any; price?: any; priceMinAmount?: number | null; priceMaxAmount?: number | null }>(
         candidates: T[],
         priceMin: number | null,
         priceMax: number | null
@@ -5638,11 +6076,31 @@ async function processSessionInBackground({
 
         const before = candidates.length;
         const out = candidates.filter(c => {
-          const raw = c.priceAmount ?? c.price;
-          const price = raw != null ? parseFloat(String(raw)) : NaN;
-          if (!Number.isFinite(price)) return true; // keep unknown prices
-          if (typeof priceMin === "number" && price < priceMin) return false;
-          if (typeof priceMax === "number" && price > priceMax) return false;
+          // Get price range from candidate (prefer explicit min/max, fallback to single price)
+          const candidateMin = (c as any).priceMinAmount ?? null;
+          const candidateMax = (c as any).priceMaxAmount ?? null;
+          const singlePrice = c.priceAmount != null ? parseFloat(String(c.priceAmount)) : (c.price != null ? parseFloat(String(c.price)) : NaN);
+          
+          // If we have explicit min/max, use range overlap logic
+          if (candidateMin !== null || candidateMax !== null) {
+            const candMin = candidateMin ?? candidateMax ?? (Number.isFinite(singlePrice) ? singlePrice : null);
+            const candMax = candidateMax ?? candidateMin ?? (Number.isFinite(singlePrice) ? singlePrice : null);
+            
+            if (candMin === null || candMax === null) {
+              // Missing price data - keep it (don't drop unknown)
+              return true;
+            }
+            
+            // Range overlap: candidateMax >= budgetMin AND candidateMin <= budgetMax
+            if (typeof priceMin === "number" && candMax < priceMin) return false;
+            if (typeof priceMax === "number" && candMin > priceMax) return false;
+            return true;
+          }
+          
+          // Fallback to single price logic for backwards compatibility
+          if (!Number.isFinite(singlePrice)) return true; // keep unknown prices
+          if (typeof priceMin === "number" && singlePrice < priceMin) return false;
+          if (typeof priceMax === "number" && singlePrice > priceMax) return false;
           return true;
         });
         const after = out.length;
@@ -5653,7 +6111,7 @@ async function processSessionInBackground({
         }
         return out;
       }
-
+      
       // Gate 2: Hard terms (STRICT: must match ALL hard terms when count >= 2, OR at least one when count == 1)
       // Use word-boundary matching on normalized text (title/productType/tags/descPlain), not substring
       let trustFallback = false;
@@ -5737,6 +6195,21 @@ async function processSessionInBackground({
         
         console.log("[App Proxy] [Layer 2] Strict gate (hard terms + facets):", strictGate.length, "candidates");
         
+        // Budget diagnostic: Log strictGate items before budget filter (when budget is active)
+        if (hadBudget && (priceMin !== null || priceMax !== null) && strictGate.length > 0) {
+          const strictGateSample = strictGate
+            .slice(0, 15)
+            .map(c => ({
+              handle: c.handle,
+              title: c.title,
+              available: c.available,
+              priceMinAmount: (c as any).priceMinAmount ?? null,
+              priceMaxAmount: (c as any).priceMaxAmount ?? null,
+              priceAmount: (c as any).priceAmount || (c as any).price || null,
+            }));
+          console.log(`[BudgetDebug] strictGate_before_budget count=${strictGate.length} min=${priceMin ?? "null"} sample=${JSON.stringify(strictGateSample)}`);
+        }
+        
         // STAGED FALLBACK LOGIC
         // Stage A: strict (hard terms + facets) - only broaden if not enough for requestedCount
         const buffer = 6; // Small buffer to ensure we have enough for AI ranking
@@ -5754,7 +6227,25 @@ async function processSessionInBackground({
         
         if (strictGateCount >= minNeededForRequested) {
           // Stage A: Strict gate is sufficient - keep it
+          const beforeBudget = strictGate.length;
           gatedCandidates = applyBudgetFilterCandidates(strictGate, priceMin, priceMax);
+          const afterBudget = gatedCandidates.length;
+          
+          // Budget diagnostic: Log strictGate after budget filter
+          if (hadBudget && (priceMin !== null || priceMax !== null) && afterBudget > 0) {
+            const afterBudgetSample = gatedCandidates
+              .slice(0, 15)
+              .map(c => ({
+                handle: c.handle,
+                title: c.title,
+                available: c.available,
+                priceMinAmount: (c as any).priceMinAmount ?? null,
+                priceMaxAmount: (c as any).priceMaxAmount ?? null,
+                priceAmount: (c as any).priceAmount || (c as any).price || null,
+              }));
+            console.log(`[BudgetDebug] strictGate_after_budget before=${beforeBudget} after=${afterBudget} min=${priceMin ?? "null"} sample=${JSON.stringify(afterBudgetSample)}`);
+          }
+          
           trustFallback = false;
           console.log(`[Gating] Stage A: strict (hard terms + facets) - strictGateCount=${strictGateCount} >= minNeeded=${minNeededForRequested} trustFallback=false`);
         } else if (strictGateCount === 0) {
@@ -5899,7 +6390,7 @@ async function processSessionInBackground({
                         if (excludedTags.length > 0) {
                           const productTags = product.tags || [];
                           if (excludedTags.some(excludedTag => 
-                            productTags.some(tag => tag.toLowerCase() === excludedTag.toLowerCase())
+                            productTags.some((tag: string) => tag.toLowerCase() === excludedTag.toLowerCase())
                           )) continue;
                         }
                         if (experience.inStockOnly && !product.available) continue;
@@ -6806,9 +7297,9 @@ async function processSessionInBackground({
               }
             }
             itemGatedUnfiltered.push(c);
-          }
-          
-          // Apply token-based slot matching for this item (industry-agnostic)
+            }
+            
+            // Apply token-based slot matching for this item (industry-agnostic)
           itemGatedUnfiltered = itemGatedUnfiltered.filter(c => {
             // Build slot descriptor from item hardTerms
             const slotDescriptor = itemHardTerms.join(" ");
@@ -8485,9 +8976,9 @@ async function processSessionInBackground({
               const validHandlesForItem: string[] = [];
               
               for (const handle of itemHandles) {
-                const candidate = candidateMap.get(handle);
-                if (!candidate) continue;
-                
+            const candidate = candidateMap.get(handle);
+            if (!candidate) continue;
+            
                 // Check availability only
                 if (experience.inStockOnly && !candidate.available) {
                   continue;
@@ -8561,7 +9052,7 @@ async function processSessionInBackground({
                 if (!candidate) continue;
                 
                 // Check availability first
-                if (experience.inStockOnly && !candidate.available) {
+            if (experience.inStockOnly && !candidate.available) {
                   removedHandlesForItem.push(handle);
                   continue;
                 }
@@ -8615,7 +9106,7 @@ async function processSessionInBackground({
             }
             
             // REQUIREMENT 2: If constraint validation returns 0, keep AI handles if source=ai
-            if (constraintValid.length === 0) {
+          if (constraintValid.length === 0) {
               if (finalSource === "ai" && handleExistenceValid.length > 0) {
                 // Keep AI handles (existence + inStock filtered) - treat as suspicious
                 console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT source=ai - keeping AI handles (validation_suspicious=true)`);
@@ -8663,9 +9154,9 @@ async function processSessionInBackground({
               } else {
                 // Not AI source - validation correctly filtered invalid handles
                 console.warn(`[Bundle Validation] (b) constraint_validation: 0 handles pass constraints - removing invalid handles (NOT suspicious)`);
-                validatedHandles = [];
+            validatedHandles = [];
               }
-            } else {
+          } else {
               // Some handles passed - use them
               validatedHandles = constraintValid;
               
@@ -8695,15 +9186,15 @@ async function processSessionInBackground({
                 
                 const itemPool: EnrichedCandidate[] = [];
                 for (const c of sortedCandidates) {
-                  const haystack = [
+                const haystack = [
                     c.title || "",
                     c.productType || "",
                     (c.tags || []).join(" "),
                     c.vendor || "",
                     c.searchText || "",
-                  ].join(" ");
-                  
-                  const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                ].join(" ");
+                
+                const hasItemMatch = itemHardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
                   if (!hasItemMatch) continue;
                   
                   if (itemGenericConstraints.length > 0) {
@@ -8721,7 +9212,7 @@ async function processSessionInBackground({
               const usedRefillHandles = new Set(constraintValid);
               const targetPerItem = Math.ceil(finalResultCount / bundleIntent.items.length);
               
-              for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
                 const currentValid = validatedHandlesByItem.get(itemIdx) || [];
                 const needed = Math.max(0, targetPerItem - currentValid.length);
                 
@@ -8746,8 +9237,8 @@ async function processSessionInBackground({
                 }
                 }
                 
-                validatedHandles = constraintValid;
-              }
+              validatedHandles = constraintValid;
+            }
             }
           }
         }
@@ -8900,8 +9391,8 @@ async function processSessionInBackground({
         if (finalSource === "ai" && validatedHandles.length === 0 && finalHandles.length > 0) {
           console.warn(`[Bundle] validatedHandles is empty but keeping original AI finalHandles: ${finalHandles.length} handles`);
           finalHandlesGuaranteed = uniq(finalHandles);
-        } else {
-          finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+      } else {
+        finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
         }
       }
 
@@ -9175,7 +9666,7 @@ async function processSessionInBackground({
             console.warn(`[Bundle] validatedHandles is empty but keeping original AI finalHandles: ${finalHandles.length} handles`);
             finalHandlesGuaranteed = uniq(finalHandles);
           } else {
-            finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
+          finalHandlesGuaranteed = uniq(validatedHandles || finalHandles || []);
           }
         }
         
@@ -9247,7 +9738,7 @@ async function processSessionInBackground({
 
       // CRITICAL: Only update finalHandles if it wasn't set by AI (preserve AI result)
       if (finalSource !== "ai") {
-        finalHandles = finalHandlesGuaranteed;
+      finalHandles = finalHandlesGuaranteed;
       } else {
         // For AI source: use finalHandlesGuaranteed (which comes from validatedHandles) if it has handles
         // Otherwise, keep the original finalHandles (AI result) to prevent losing AI handles
@@ -9350,15 +9841,15 @@ async function processSessionInBackground({
             itemIdx = aiItemIndexMap.get(handle)!;
           } else {
             // Fallback: infer from candidate matching
-            const candidate = allCandidatesEnriched.find(c => c.handle === handle);
-            if (candidate) {
+          const candidate = allCandidatesEnriched.find(c => c.handle === handle);
+          if (candidate) {
               for (let idx = 0; idx < bundleIntent.items.length; idx++) {
                 const item = bundleIntent.items[idx];
-                const itemHardTerms = item.hardTerms || [];
-                const slotDescriptor = itemHardTerms.join(" ");
-                const slotScore = scoreProductForSlot(candidate, slotDescriptor);
-                
-                if (slotScore >= 0.1) {
+              const itemHardTerms = item.hardTerms || [];
+              const slotDescriptor = itemHardTerms.join(" ");
+              const slotScore = scoreProductForSlot(candidate, slotDescriptor);
+              
+              if (slotScore >= 0.1) {
                   itemIdx = idx;
                   break;
                 }
@@ -9367,10 +9858,10 @@ async function processSessionInBackground({
           }
           
           if (itemIdx !== null) {
-            if (!handlesPerItem.has(itemIdx)) {
-              handlesPerItem.set(itemIdx, []);
-            }
-            handlesPerItem.get(itemIdx)!.push(handle);
+                if (!handlesPerItem.has(itemIdx)) {
+                  handlesPerItem.set(itemIdx, []);
+                }
+                handlesPerItem.get(itemIdx)!.push(handle);
           }
         });
         
@@ -9455,8 +9946,8 @@ async function processSessionInBackground({
                   continue; // Skip this candidate - doesn't satisfy constraints
                 }
               }
-              
-              // Check availability
+                
+                // Check availability
               if (experience.inStockOnly && !c.available) continue;
               
               itemCandidates.push(c);
@@ -9508,7 +9999,7 @@ async function processSessionInBackground({
               if (map.has(handle)) {
                 itemIdx = map.get(handle)!;
               }
-          } else {
+        } else {
             // Fallback: infer from candidate
             const candidate = allCandidatesEnriched.find(c => c.handle === handle);
             if (candidate) {
@@ -10723,25 +11214,25 @@ async function processSessionInBackground({
   } catch (error: any) {
     // If error occurs in product fetching/processing, re-throw to be caught by outer try-catch
     console.error("[App Proxy] Error in product fetching/processing:", error);
-    // Mark session as FAILED
-    await prisma.conciergeSession.update({
-      where: { publicToken: sessionToken },
-      data: { 
-        status: ConciergeSessionStatus.FAILED,
-      },
-    }).catch(() => {});
-    
-    // Save error result
-    await saveConciergeResult({
-      sessionToken,
-      productHandles: [],
-      productIds: null,
-      reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
-    }).catch(() => {});
-    
-    // Re-throw to be caught by outer handler in setImmediate
-    throw error;
-  }
+      // Mark session as FAILED
+      await prisma.conciergeSession.update({
+        where: { publicToken: sessionToken },
+        data: { 
+          status: ConciergeSessionStatus.FAILED,
+        },
+      }).catch(() => {});
+      
+      // Save error result
+      await saveConciergeResult({
+        sessionToken,
+        productHandles: [],
+        productIds: null,
+        reasoning: error instanceof Error ? error.message : "Error processing request. Please try again.",
+      }).catch(() => {});
+      
+      // Re-throw to be caught by outer handler in setImmediate
+      throw error;
+    }
 }
 
 

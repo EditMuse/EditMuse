@@ -634,6 +634,16 @@ export async function fetchShopifyProductsGraphQL({
                       featuredImage {
                         url
                       }
+                      priceRangeV2 {
+                        minVariantPrice {
+                          amount
+                          currencyCode
+                        }
+                        maxVariantPrice {
+                          amount
+                          currencyCode
+                        }
+                      }
                       priceRange {
                         minVariantPrice {
                           amount
@@ -1016,33 +1026,49 @@ export async function fetchShopifyProductsGraphQL({
   });
 
   const mapped = products.map((node: any) => {
-    const priceData = node.priceRange?.minVariantPrice;
-    const rawAmount = priceData?.amount || null;
-    const currencyCode = priceData?.currencyCode || null;
+    // Prefer priceRangeV2 (has both min and max), fallback to priceRange
+    const priceRangeV2 = node.priceRangeV2;
+    const priceRange = node.priceRange;
     
-    // Convert price to major units if needed
-    // Shopify GraphQL Admin API should return prices in major units, but handle edge cases
-    // where prices might be in cents (e.g., "74995.0" should become "749.95")
-    let priceAmount: string | null = null;
-    if (rawAmount !== null) {
+    // Extract min price (prefer V2, fallback to V1)
+    const minPriceData = priceRangeV2?.minVariantPrice || priceRange?.minVariantPrice;
+    const minRawAmount = minPriceData?.amount || null;
+    const currencyCode = minPriceData?.currencyCode || priceRangeV2?.maxVariantPrice?.currencyCode || priceRange?.minVariantPrice?.currencyCode || null;
+    
+    // Extract max price (only from V2)
+    const maxPriceData = priceRangeV2?.maxVariantPrice;
+    const maxRawAmount = maxPriceData?.amount || null;
+    
+    // Helper to convert price to major units
+    const convertToMajorUnits = (rawAmount: string | null): string | null => {
+      if (rawAmount === null) return null;
       const numAmount = parseFloat(rawAmount);
+      if (isNaN(numAmount)) return null;
+      
       // Heuristic: if amount > 10000, almost certainly in cents
       // If amount between 1000-10000, check if dividing by 100 gives reasonable value (< 1000)
       if (numAmount > 10000) {
-        priceAmount = (numAmount / 100).toFixed(2);
+        return (numAmount / 100).toFixed(2);
       } else if (numAmount > 1000) {
         const majorUnits = numAmount / 100;
         // If dividing by 100 gives a value < 1000, assume it's in cents
         if (majorUnits < 1000 && majorUnits >= 1) {
-          priceAmount = majorUnits.toFixed(2);
+          return majorUnits.toFixed(2);
         } else {
-          priceAmount = numAmount.toString();
+          return numAmount.toString();
         }
       } else {
         // Already in major units (or very small price)
-        priceAmount = numAmount.toString();
+        return numAmount.toString();
       }
-    }
+    };
+    
+    // Convert both min and max to major units
+    const priceMinAmount = convertToMajorUnits(minRawAmount);
+    const priceMaxAmount = convertToMajorUnits(maxRawAmount);
+    
+    // For backwards compatibility, use min as the single price
+    const priceAmount = priceMinAmount;
     
     // Extract variant data (title, selectedOptions, availableForSale)
     const variants: Array<{
