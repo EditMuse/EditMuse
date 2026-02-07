@@ -3710,9 +3710,11 @@ async function processSessionInBackground({
   }
 
   // Parse answers to extract price/budget range if present
+  // Industry-agnostic: supports per-item budgets in bundle mode, most restrictive for single-item
   let priceMin: number | null = null;
   let priceMax: number | null = null;
   let userCurrency: string | null = null; // Track user-specified currency from answers
+  const detectedBudgets: Array<{ min: number | null; max: number | null; currency: string | null; source: string }> = []; // Track all detected budgets
   
   // Helper to detect currency symbol in answer string
   function detectCurrencySymbol(s: string): string | null {
@@ -3726,13 +3728,16 @@ async function processSessionInBackground({
     // Look for budget/price range answers - check if any answer matches common budget patterns
     for (const answer of answers) {
       const answerStr = String(answer);
+      let detectedMin: number | null = null;
+      let detectedMax: number | null = null;
+      let detectedCurrency: string | null = null;
       
       // First, try to extract price ceiling using improved parsing
       const priceCeilingResult = parsePriceCeiling(answerStr);
       if (priceCeilingResult !== null) {
-        priceMax = priceCeilingResult.value;
-        userCurrency = priceCeilingResult.currency || null;
-        // Currency conversion will be done later when shop currency is available
+        detectedMax = priceCeilingResult.value;
+        detectedCurrency = priceCeilingResult.currency || null;
+        detectedBudgets.push({ min: null, max: detectedMax, currency: detectedCurrency, source: answerStr });
         continue; // Found ceiling, move to next answer
       }
       
@@ -3743,9 +3748,9 @@ async function processSessionInBackground({
       if (answerLower.startsWith("under")) {
         const match = answerLower.match(/under[-\s]*\$?(\d+)/);
         if (match) {
-          priceMax = parseFloat(match[1]) - 0.01; // Under $50 means < $50, so max is 49.99
-          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
-          console.log("[App Proxy] Detected budget: under", match[1], "-> max:", priceMax, "userCurrency:", userCurrency || "none");
+          detectedMax = parseFloat(match[1]) - 0.01; // Under $50 means < $50, so max is 49.99
+          detectedCurrency = detectCurrencySymbol(answerStr);
+          detectedBudgets.push({ min: null, max: detectedMax, currency: detectedCurrency, source: answerStr });
         }
       } 
       // Handle "500-plus" or "500+" format
@@ -3753,19 +3758,19 @@ async function processSessionInBackground({
         const match = answerLower.match(/(\d+)[-\s]*plus|(\d+)[\s]*\+/i);
         const amount = match ? parseFloat(match[1] || match[2]) : null;
         if (amount) {
-          priceMin = amount;
-          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
-          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin, "userCurrency:", userCurrency || "none");
+          detectedMin = amount;
+          detectedCurrency = detectCurrencySymbol(answerStr);
+          detectedBudgets.push({ min: detectedMin, max: null, currency: detectedCurrency, source: answerStr });
         }
       } 
       // Handle range like "50-100" or "$50 - $100"
       else if (answerLower.match(/\d+[-\s]+\d+/)) {
         const match = answerLower.match(/\$?(\d+)[-\s]+\$?(\d+)/);
         if (match) {
-          priceMin = parseFloat(match[1]);
-          priceMax = parseFloat(match[2]);
-          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
-          console.log("[App Proxy] Detected budget range:", priceMin, "-", priceMax, "userCurrency:", userCurrency || "none");
+          detectedMin = parseFloat(match[1]);
+          detectedMax = parseFloat(match[2]);
+          detectedCurrency = detectCurrencySymbol(answerStr);
+          detectedBudgets.push({ min: detectedMin, max: detectedMax, currency: detectedCurrency, source: answerStr });
         }
       }
       // Handle "plus" or "+" with amount before it (e.g., "$500+", "500 and above")
@@ -3773,13 +3778,64 @@ async function processSessionInBackground({
         const match = answerLower.match(/\$?(\d+)[-\s]*plus|\$?(\d+)[-\s]*\+|\$?(\d+)[-\s]*and\s*above/i);
         const amount = match ? parseFloat(match[1] || match[2] || match[3]) : null;
         if (amount) {
-          priceMin = amount;
-          userCurrency = userCurrency || detectCurrencySymbol(answerStr);
-          console.log("[App Proxy] Detected budget:", amount, "and above -> min:", priceMin, "userCurrency:", userCurrency || "none");
+          detectedMin = amount;
+          detectedCurrency = detectCurrencySymbol(answerStr);
+          detectedBudgets.push({ min: detectedMin, max: null, currency: detectedCurrency, source: answerStr });
         }
       }
     }
   }
+  
+  // Resolve multiple budgets: per-item in bundle mode (will be set later), most restrictive for single-item
+  // For single-item mode: use most restrictive (highest min, lowest max)
+  if (detectedBudgets.length > 0) {
+    // Find most restrictive min (highest) and max (lowest)
+    let mostRestrictiveMin: number | null = null;
+    let mostRestrictiveMax: number | null = null;
+    let resolvedCurrency: string | null = null;
+    
+    for (const budget of detectedBudgets) {
+      if (budget.min !== null) {
+        if (mostRestrictiveMin === null || budget.min > mostRestrictiveMin) {
+          mostRestrictiveMin = budget.min;
+        }
+      }
+      if (budget.max !== null) {
+        if (mostRestrictiveMax === null || budget.max < mostRestrictiveMax) {
+          mostRestrictiveMax = budget.max;
+        }
+      }
+      if (budget.currency && !resolvedCurrency) {
+        resolvedCurrency = budget.currency;
+      }
+    }
+    
+    // Validate: if min > max, use only the constraint that makes sense
+    if (mostRestrictiveMin !== null && mostRestrictiveMax !== null && mostRestrictiveMin > mostRestrictiveMax) {
+      // Invalid range - use the most restrictive single constraint
+      // Prefer max if it's lower (more restrictive), otherwise use min
+      if (mostRestrictiveMax < mostRestrictiveMin) {
+        priceMax = mostRestrictiveMax;
+        priceMin = null; // Clear min to avoid invalid range
+        console.log(`[Budget] multiple_constraints_detected min=${mostRestrictiveMin} max=${mostRestrictiveMax} invalid_range=true using_max_only=${priceMax}`);
+      } else {
+        priceMin = mostRestrictiveMin;
+        priceMax = null; // Clear max to avoid invalid range
+        console.log(`[Budget] multiple_constraints_detected min=${mostRestrictiveMin} max=${mostRestrictiveMax} invalid_range=true using_min_only=${priceMin}`);
+      }
+    } else {
+      priceMin = mostRestrictiveMin;
+      priceMax = mostRestrictiveMax;
+      if (detectedBudgets.length > 1) {
+        console.log(`[Budget] multiple_constraints_detected count=${detectedBudgets.length} resolved_min=${priceMin ?? "null"} resolved_max=${priceMax ?? "null"} using=most_restrictive`);
+      }
+    }
+    
+    userCurrency = resolvedCurrency;
+  }
+  
+  // Store detected budgets for per-item assignment in bundle mode (will be used later)
+  const detectedBudgetsForBundle = detectedBudgets;
   
   // Log budget detection summary - answers are the SINGLE source of truth
   if (priceMin !== null || priceMax !== null) {
@@ -3831,6 +3887,9 @@ async function processSessionInBackground({
       
       // Variable to store bundle fetch products (will be populated after intent parsing)
       let bundleFetchProductsForMerge: any[] = [];
+      // Store per-item retrieval sets for building item pools (itemIndex -> products[])
+      // This will be populated after intent parsing in bundle mode
+      let bundleFetchByItemIndex: Map<number, any[]> = new Map();
       
       // Quick bundle pre-detection from userIntent (before full intent parsing)
       // Industry-agnostic: detect multi-item patterns like "X and Y", "X, Y", "X with Y"
@@ -4002,12 +4061,13 @@ async function processSessionInBackground({
         return true;
       });
       
-      // Merge bundle fetch products if available (from bundle retrieval after intent parsing)
+      // Merge bundle fetch products BEFORE filtering (Issue 2/3 fix)
+      // This ensures bundle products are available for item pool building
       if (bundleFetchProductsForMerge.length > 0) {
         const existingHandles = new Set(products.map((p: any) => p.handle));
         const newBundleProducts = bundleFetchProductsForMerge.filter((p: any) => !existingHandles.has(p.handle));
         products.push(...newBundleProducts);
-        console.log(`[BundleRetrieval] merged=${newBundleProducts.length} total_products=${products.length}`);
+        console.log(`[BundleRetrieval] merged=${newBundleProducts.length} BEFORE_filtering total_products=${products.length}`);
         bundleFetchProductsForMerge = []; // Clear after merge
       }
 
@@ -4018,7 +4078,7 @@ async function processSessionInBackground({
 
       let filteredProducts = [...baseProducts];
 
-      // Apply inStockOnly (experience setting)
+      // Apply inStockOnly (experience setting) - AFTER bundle merge
       if (experience.inStockOnly) {
         filteredProducts = filteredProducts.filter(p => p.available);
       }
@@ -5108,11 +5168,22 @@ async function processSessionInBackground({
             return true;
           });
           
-          // Store bundle fetch products for later merging (after initial product fetch)
-          // We'll merge them into the products array after initial filters are applied
+          // Store bundle fetch products for merging BEFORE filtering (Issue 2/3 fix)
           if (deduplicatedBundleProducts.length > 0) {
             bundleFetchProductsForMerge = deduplicatedBundleProducts;
-            console.log(`[BundleRetrieval] prepared=${deduplicatedBundleProducts.length} will_merge_after_initial_fetch`);
+            console.log(`[BundleRetrieval] prepared=${deduplicatedBundleProducts.length} will_merge_BEFORE_filtering`);
+          }
+          
+          // Store per-item retrieval sets for building item pools (Issue 2/3 fix)
+          // Map itemIndex -> products[] for this item
+          for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+            const item = bundleIntent.items[itemIdx];
+            const itemType = (item as any).canonicalType || item.hardTerms[0] || `item${itemIdx}`;
+            const itemProducts = bundleFetchByItemType.get(itemType) || [];
+            if (itemProducts.length > 0) {
+              bundleFetchByItemIndex.set(itemIdx, itemProducts);
+              console.log(`[BundleRetrieval] stored_itemPool itemIndex=${itemIdx} itemType=${itemType} count=${itemProducts.length}`);
+            }
           }
           
           // Log per-itemType counts
@@ -7876,6 +7947,47 @@ async function processSessionInBackground({
           const bundleItem = bundleItemsWithBudget[itemIdx] as BundleItemWithBudget;
           const itemHardTerms = bundleItem.hardTerms;
           
+          // Issue 2/3 fix: Use per-item retrieval set if available, otherwise fall back to allCandidatesEnriched
+          const itemRetrievalSet = bundleFetchByItemIndex.get(itemIdx);
+          const baseCandidatesForItem: EnrichedCandidate[] = itemRetrievalSet && itemRetrievalSet.length > 0 
+            ? itemRetrievalSet.map((p: any) => {
+                // Find corresponding EnrichedCandidate from allCandidatesEnriched
+                return allCandidatesEnriched.find(c => c.handle === p.handle);
+              }).filter((c: any): c is EnrichedCandidate => c !== undefined)
+            : allCandidatesEnriched;
+          
+          if (itemRetrievalSet && itemRetrievalSet.length > 0) {
+            console.log(`[Bundle] itemIndex=${itemIdx} using_per_item_retrieval_set count=${baseCandidatesForItem.length} from_retrieval=${itemRetrievalSet.length}`);
+          }
+          
+          // Issue 1 fix: Apply per-item budget if available (from detectedBudgetsForBundle)
+          // Extract budget for this item from conversation messages or item-specific constraints
+          let itemPriceMin: number | null = null;
+          let itemPriceMax: number | null = null;
+          
+          // Try to match budget to item by checking if budget source mentions this item type
+          const itemTypeForBudget = (bundleItem as any).canonicalType || itemHardTerms[0] || `item${itemIdx}`;
+          for (const budget of detectedBudgetsForBundle) {
+            const budgetSourceLower = budget.source.toLowerCase();
+            const itemTypeLower = itemTypeForBudget.toLowerCase();
+            // If budget source mentions this item type, assign budget to this item
+            if (budgetSourceLower.includes(itemTypeLower) || 
+                itemHardTerms.some(term => budgetSourceLower.includes(term.toLowerCase()))) {
+              if (budget.min !== null && itemPriceMin === null) itemPriceMin = budget.min;
+              if (budget.max !== null && itemPriceMax === null) itemPriceMax = budget.max;
+            }
+          }
+          
+          // If no item-specific budget found, use global budget as fallback
+          if (itemPriceMin === null && itemPriceMax === null) {
+            itemPriceMin = priceMin;
+            itemPriceMax = priceMax;
+          }
+          
+          if (itemPriceMin !== null || itemPriceMax !== null) {
+            console.log(`[Bundle] itemIndex=${itemIdx} itemType=${itemTypeForBudget} budget_min=${itemPriceMin ?? "null"} budget_max=${itemPriceMax ?? "null"}`);
+          }
+          
           // Gate candidates for this item using item-specific constraints
           // First pass: item-specific facet + hard term matching (no budget filter)
           const itemConstraints = bundleItem.constraints;
@@ -7891,8 +8003,42 @@ async function processSessionInBackground({
           console.log(`[Constraints] bundle_item=${itemIdx} global=[${globalFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] per_item=[${itemFacetConstraints.map(c => `${c.key}:${c.value}`).join(", ")}] merged=[${mergedItemConstraints.map(c => `${c.key}:${c.value}`).join(", ")}]`);
           
           // Gate with constraints using new helper that checks structured OR tag-derived facets
+          // Issue 2/3 fix: Use baseCandidatesForItem (per-item retrieval set) instead of allCandidatesEnriched
           let itemGatedUnfiltered: EnrichedCandidate[] = [];
-          for (const c of allCandidatesEnriched) {
+          for (const c of baseCandidatesForItem) {
+            // Issue 2/3 fix: Apply availability filter per-item
+            if (experience.inStockOnly && !c.available) {
+              continue; // Skip unavailable products
+            }
+            
+            // Issue 2/3 fix: Apply budget filter per-item
+            if (itemPriceMin !== null || itemPriceMax !== null) {
+              const productMin = (c as any).priceMinAmount ?? null;
+              const productMax = (c as any).priceMaxAmount ?? null;
+              const singlePrice = (c as any).priceAmount ? parseFloat(String((c as any).priceAmount)) : ((c as any).price ? parseFloat(String((c as any).price)) : NaN);
+              
+              if (productMin !== null || productMax !== null) {
+                const prodMin = productMin ?? productMax ?? singlePrice;
+                const prodMax = productMax ?? productMin ?? singlePrice;
+                
+                if (typeof itemPriceMin === "number" && prodMax < itemPriceMin) {
+                  continue; // Below min budget
+                }
+                if (typeof itemPriceMax === "number" && prodMin > itemPriceMax) {
+                  continue; // Above max budget
+                }
+              } else if (Number.isFinite(singlePrice)) {
+                // Fallback to single price
+                if (typeof itemPriceMin === "number" && singlePrice < itemPriceMin) {
+                  continue;
+                }
+                if (typeof itemPriceMax === "number" && singlePrice > itemPriceMax) {
+                  continue;
+                }
+              }
+            }
+            
+            // Apply facet constraints
             if (mergedItemConstraints.length > 0) {
               const constraintResult = await satisfiesConstraintsStructuredOrTags(c, mergedItemConstraints, facetVocabulary);
               if (!constraintResult.ok) {
@@ -7933,7 +8079,25 @@ async function processSessionInBackground({
             // Stage 1: relax least important constraint
             const stage1Result = relaxConstraints(mergedItemConstraints, facetVocabularyForBundle.optionNames, 1);
             const stage1Gated: EnrichedCandidate[] = [];
-            for (const c of allCandidatesEnriched) {
+            for (const c of baseCandidatesForItem) {
+              // Apply availability and budget filters
+              if (experience.inStockOnly && !c.available) continue;
+              
+              if (itemPriceMin !== null || itemPriceMax !== null) {
+                const productMin = (c as any).priceMinAmount ?? null;
+                const productMax = (c as any).priceMaxAmount ?? null;
+                const singlePrice = (c as any).priceAmount ? parseFloat(String((c as any).priceAmount)) : ((c as any).price ? parseFloat(String((c as any).price)) : NaN);
+                
+                if (productMin !== null || productMax !== null) {
+                  const prodMin = productMin ?? productMax ?? singlePrice;
+                  const prodMax = productMax ?? productMin ?? singlePrice;
+                  if (typeof itemPriceMin === "number" && prodMax < itemPriceMin) continue;
+                  if (typeof itemPriceMax === "number" && prodMin > itemPriceMax) continue;
+                } else if (Number.isFinite(singlePrice)) {
+                  if (typeof itemPriceMin === "number" && singlePrice < itemPriceMin) continue;
+                  if (typeof itemPriceMax === "number" && singlePrice > itemPriceMax) continue;
+                }
+              }
               if (stage1Result.relaxed.length > 0) {
                 // Use satisfiesConstraintsStructuredOrTags to check structured OR tags (not just structured)
                 const constraintResult = await satisfiesConstraintsStructuredOrTags(c, stage1Result.relaxed, facetVocabulary);
@@ -7967,7 +8131,25 @@ async function processSessionInBackground({
             } else {
               // Stage 2: remove all constraints (keep anchor terms only)
               const stage2Result = relaxConstraints(mergedItemConstraints, facetVocabularyForBundle.optionNames, 2);
-              const stage2Gated = allCandidatesEnriched.filter(c => {
+              const stage2Gated = baseCandidatesForItem.filter(c => {
+                // Apply availability and budget filters
+                if (experience.inStockOnly && !c.available) return false;
+                
+                if (itemPriceMin !== null || itemPriceMax !== null) {
+                  const productMin = (c as any).priceMinAmount ?? null;
+                  const productMax = (c as any).priceMaxAmount ?? null;
+                  const singlePrice = (c as any).priceAmount ? parseFloat(String((c as any).priceAmount)) : ((c as any).price ? parseFloat(String((c as any).price)) : NaN);
+                  
+                  if (productMin !== null || productMax !== null) {
+                    const prodMin = productMin ?? productMax ?? singlePrice;
+                    const prodMax = productMax ?? productMin ?? singlePrice;
+                    if (typeof itemPriceMin === "number" && prodMax < itemPriceMin) return false;
+                    if (typeof itemPriceMax === "number" && prodMin > itemPriceMax) return false;
+                  } else if (Number.isFinite(singlePrice)) {
+                    if (typeof itemPriceMin === "number" && singlePrice < itemPriceMin) return false;
+                    if (typeof itemPriceMax === "number" && singlePrice > itemPriceMax) return false;
+                  }
+                }
                 const slotDescriptor = itemHardTerms.join(" ");
                 const slotScore = scoreProductForSlot(c, slotDescriptor);
                 if (slotScore < 0.1) return false;
