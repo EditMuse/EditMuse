@@ -4961,6 +4961,7 @@ async function processSessionInBackground({
       
       // Detect constraint patterns (contains, with, includes, made of, ingredient(s))
       // Extract constraint phrases and add to hardTerms
+      // Industry-agnostic: keeps multi-word phrases intact, filters generic tokens
       const constraintPatterns = [
         /\b(?:contains?|containing)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
         /\b(?:with|having)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
@@ -4970,6 +4971,16 @@ async function processSessionInBackground({
         /\b(?:that\s+contains?|that\s+has|that\s+includes?)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
       ];
       
+      // Generic stopwords that should NOT be extracted as individual constraint tokens
+      // Industry-agnostic: common generic words that appear in many contexts
+      const genericConstraintStopwords = new Set([
+        "acid", "base", "salt", "oil", "water", "powder", "liquid", "solid", "gas",
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had",
+        "some", "any", "all", "both", "each", "every", "few", "many", "most", "other",
+        "this", "that", "these", "those", "it", "its", "they", "them", "their"
+      ]);
+      
       const constraintTerms: string[] = [];
       const userIntentLower = userIntent.toLowerCase();
       
@@ -4978,11 +4989,23 @@ async function processSessionInBackground({
         while ((match = pattern.exec(userIntentLower)) !== null) {
           const phrase = match[1].trim();
           if (phrase.length >= 3) {
-            // Add full phrase
+            // Always add the full phrase (preserves multi-word terms like "salicylic acid")
             constraintTerms.push(phrase);
-            // Also add individual tokens from phrase
-            const tokens = phrase.split(/\s+/).filter(t => t.length >= 3);
-            constraintTerms.push(...tokens);
+            
+            // Only add individual tokens if:
+            // 1. The phrase has multiple words (single words are already added as the phrase)
+            // 2. The token is not a generic stopword
+            // 3. The token is meaningful (length >= 4 to avoid very short generic words)
+            if (phrase.includes(" ")) {
+              const tokens = phrase.split(/\s+/).filter(t => {
+                const trimmed = t.trim();
+                return trimmed.length >= 4 && // Minimum 4 chars to avoid generic short words
+                       !genericConstraintStopwords.has(trimmed.toLowerCase());
+              });
+              // Only add tokens that are meaningful on their own
+              // For "salicylic acid": add "salicylic" (specific), skip "acid" (generic)
+              constraintTerms.push(...tokens);
+            }
           }
         }
       }
