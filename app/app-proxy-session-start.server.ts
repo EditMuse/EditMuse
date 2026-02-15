@@ -1883,9 +1883,10 @@ async function satisfiesConstraintsStructuredOrTags(
   const { productSatisfiesConstraints, extractConstraintsFromTags, normalizeFacetValue } = await import("~/utils/facets.server");
   
   // Helper to check if two values match (with equivalence)
-  function valueMatchesConstraint(productValue: string, constraintValue: string): boolean {
+  function valueMatchesConstraint(productValue: string, constraintValue: string, constraintKey?: string): boolean {
     const normalizedProduct = productValue.toLowerCase().trim();
     const normalizedConstraint = constraintValue.toLowerCase().trim();
+    const normalizedKey = constraintKey?.toLowerCase().trim() || "";
     
     // Exact match
     if (normalizedProduct === normalizedConstraint) return true;
@@ -1895,23 +1896,62 @@ async function satisfiesConstraintsStructuredOrTags(
       return true;
     }
     
-    // Size equivalences (only for size-related constraints)
-    const sizeEquivalences: Record<string, string[]> = {
-      "s": ["small", "s"],
-      "m": ["medium", "m"],
-      "l": ["large", "l"],
-      "xl": ["extra large", "x-large", "xl", "extra-large"],
-      "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
-    };
-    
-    if (sizeEquivalences[normalizedConstraint]) {
-      const aliases = sizeEquivalences[normalizedConstraint];
-      if (aliases.some(alias => normalizedProduct === alias)) return true;
+    // Color equivalences (industry-agnostic: shades match base colors)
+    const isColorConstraint = normalizedKey === "color" || normalizedKey === "colour" || normalizedKey === "shade";
+    if (isColorConstraint) {
+      const colorEquivalences: Record<string, string[]> = {
+        "blue": ["blue", "navy", "royal blue", "royal-blue", "royalblue", "dark blue", "dark-blue", "darkblue", "light blue", "light-blue", "lightblue", "sky blue", "sky-blue", "skyblue", "azure", "cobalt", "indigo", "teal", "turquoise", "cyan"],
+        "red": ["red", "crimson", "scarlet", "burgundy", "maroon", "pink", "rose", "coral", "salmon", "magenta", "fuchsia", "fuschia"],
+        "green": ["green", "emerald", "lime", "olive", "mint", "forest", "sage", "jade", "teal", "turquoise"],
+        "yellow": ["yellow", "gold", "amber", "mustard", "lemon", "cream", "beige", "tan"],
+        "orange": ["orange", "peach", "coral", "amber", "rust", "terracotta"],
+        "purple": ["purple", "violet", "lavender", "lilac", "plum", "mauve", "magenta"],
+        "black": ["black", "charcoal", "ebony", "onyx", "jet"],
+        "white": ["white", "ivory", "cream", "cream", "beige", "pearl", "off-white", "offwhite"],
+        "grey": ["grey", "gray", "silver", "charcoal", "slate", "ash"],
+        "brown": ["brown", "tan", "beige", "camel", "khaki", "taupe", "coffee", "chocolate", "caramel"],
+      };
+      
+      // Check if constraint value is a base color
+      if (colorEquivalences[normalizedConstraint]) {
+        const aliases = colorEquivalences[normalizedConstraint];
+        if (aliases.some(alias => normalizedProduct === alias)) return true;
+      }
+      
+      // Check if product value is a base color
+      if (colorEquivalences[normalizedProduct]) {
+        const aliases = colorEquivalences[normalizedProduct];
+        if (aliases.some(alias => normalizedConstraint === alias)) return true;
+      }
+      
+      // Check if both are shades of the same base color
+      for (const [baseColor, shades] of Object.entries(colorEquivalences)) {
+        const productIsShade = shades.includes(normalizedProduct);
+        const constraintIsShade = shades.includes(normalizedConstraint);
+        if (productIsShade && constraintIsShade) return true;
+      }
     }
     
-    if (sizeEquivalences[normalizedProduct]) {
-      const aliases = sizeEquivalences[normalizedProduct];
-      if (aliases.some(alias => normalizedConstraint === alias)) return true;
+    // Size equivalences (only for size-related constraints)
+    const isSizeConstraint = normalizedKey === "size" || normalizedKey === "sizing" || normalizedKey === "capacity";
+    if (isSizeConstraint) {
+      const sizeEquivalences: Record<string, string[]> = {
+        "s": ["small", "s"],
+        "m": ["medium", "m"],
+        "l": ["large", "l"],
+        "xl": ["extra large", "x-large", "xl", "extra-large"],
+        "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
+      };
+      
+      if (sizeEquivalences[normalizedConstraint]) {
+        const aliases = sizeEquivalences[normalizedConstraint];
+        if (aliases.some(alias => normalizedProduct === alias)) return true;
+      }
+      
+      if (sizeEquivalences[normalizedProduct]) {
+        const aliases = sizeEquivalences[normalizedProduct];
+        if (aliases.some(alias => normalizedConstraint === alias)) return true;
+      }
     }
     
     return false;
@@ -1941,7 +1981,7 @@ async function satisfiesConstraintsStructuredOrTags(
             
             if (optName === constraintKey) {
               // Check if values match (with equivalence)
-              const matches = valueMatchesConstraint(optValue, constraintValue);
+              const matches = valueMatchesConstraint(optValue, constraintValue, constraint.key);
               if (!matches) {
                 // Explicit conflict in structured data
                 return {
@@ -1976,7 +2016,7 @@ async function satisfiesConstraintsStructuredOrTags(
     
     if (tagValue) {
       // Tag has this facet - check if it matches
-      const matches = valueMatchesConstraint(tagValue, constraintValue);
+      const matches = valueMatchesConstraint(tagValue, constraintValue, constraint.key);
       if (matches) {
         // Tag matches - accept
         return { ok: true };
@@ -4374,28 +4414,28 @@ async function processSessionInBackground({
         console.log(`[SmartFetch] enabled=true mode=${modeUsed} reason=has_meaningful_signals likelyBundle=${likelyBundle}`);
         console.log(`[SmartFetch] signals keywords=${fetchSignals.keywords.length} selections=${fetchSignals.selections.length} rawPreview=${fetchSignals.rawPreview.substring(0, 100)}`);
         
-        // For bundle mode: fetch per itemType (will be determined more precisely after intent parsing)
-        // For now, use generic fetch but we'll enhance this after intent parsing
+        // For bundle mode: skip initial SmartFetch - bundle retrieval will fetch per itemType after intent parsing
+        // This avoids fetching irrelevant products (e.g., clothing with "cream" color when user wants "face cream")
         if (likelyBundle) {
-          console.log(`[SmartFetch] bundle_mode=true - will fetch per itemType after intent parsing`);
-        }
-        
-        // Step A: Build targeted query (using default field_restricted strategy)
-        let query = buildShopifySearchQuery(fetchSignals, 500, "field_restricted");
-        
-        if (query) {
-          console.log(`[SmartFetch] keywords=[${fetchSignals.keywords.join(", ")}] query="${query}"`);
-          console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
+          console.log(`[SmartFetch] bundle_mode=true - skipping initial fetch, will fetch per itemType after intent parsing`);
+          usingSmartFetch = false; // Skip initial SmartFetch for bundles
+        } else {
+          // Step A: Build targeted query (using default field_restricted strategy)
+          let query = buildShopifySearchQuery(fetchSignals, 500, "field_restricted");
           
-          try {
-            // Step A: Targeted fetch
-            const stepA = await fetchProductsByQueryPaginated(
-              shopDomain,
-              accessToken,
-              query,
-              SMART_FETCH_DESIRED_MIN,
-              200
-            );
+          if (query) {
+            console.log(`[SmartFetch] keywords=[${fetchSignals.keywords.join(", ")}] query="${query}"`);
+            console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
+            
+            try {
+              // Step A: Targeted fetch
+              const stepA = await fetchProductsByQueryPaginated(
+                shopDomain,
+                accessToken,
+                query,
+                SMART_FETCH_DESIRED_MIN,
+                200
+              );
             
             smartFetchProducts = stepA.products;
             const sampleTitles = stepA.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
@@ -4454,19 +4494,20 @@ async function processSessionInBackground({
               console.log(`[SmartFetch] widen_step=2 fetchedTotal=${smartFetchProducts.length}`);
             }
             
-            if (smartFetchProducts.length > 0) {
-              usingSmartFetch = true;
-              console.log(`[SmartFetch] final candidates=${smartFetchProducts.length} usingSmartFetch=true`);
-            } else {
-              console.log(`[SmartFetch] fallback_to_pool=true reason=insufficient_candidates`);
+              if (smartFetchProducts.length > 0) {
+                usingSmartFetch = true;
+                console.log(`[SmartFetch] final candidates=${smartFetchProducts.length} usingSmartFetch=true`);
+              } else {
+                console.log(`[SmartFetch] fallback_to_pool=true reason=insufficient_candidates`);
+              }
+            } catch (error) {
+              console.error(`[SmartFetch] Error during smart fetch:`, error);
+              console.log(`[SmartFetch] fallback_to_pool=true reason=query_error`);
+              smartFetchProducts = [];
             }
-          } catch (error) {
-            console.error(`[SmartFetch] Error during smart fetch:`, error);
-            console.log(`[SmartFetch] fallback_to_pool=true reason=query_error`);
-            smartFetchProducts = [];
+          } else {
+            console.log(`[SmartFetch] fallback_to_pool=true reason=no_keywords`);
           }
-        } else {
-          console.log(`[SmartFetch] fallback_to_pool=true reason=no_keywords`);
         }
       } else {
         console.log(`[SmartFetch] fallback_to_pool=true reason=no_meaningful_signals`);
@@ -5306,8 +5347,12 @@ async function processSessionInBackground({
           console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${scarcityReason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
           
           try {
+            // Limit to 10 terms for post-expansion to avoid query truncation (500 char limit)
+            // Each term creates ~60-80 chars: (title:term OR product_type:term OR tag:term OR vendor:term)
+            // 10 terms = ~600-800 chars, but we'll prioritize most relevant terms
+            const postExpansionTerms = expandedHardTermsList.slice(0, 10);
             const postExpansionSignals = {
-              keywords: expandedHardTermsList.slice(0, 20), // Cap to avoid query bloat
+              keywords: postExpansionTerms,
               selections: [], // Don't use selections for post-expansion (already expanded)
               hasMeaningfulSignals: true,
             };
@@ -5322,7 +5367,7 @@ async function processSessionInBackground({
                 postExpansionSignals,
                 500,
                 "field_restricted",
-                expandedHardTermsList.slice(0, 20)
+                postExpansionTerms
               );
               
               if (pass1Query) {
@@ -5349,7 +5394,7 @@ async function processSessionInBackground({
                     postExpansionSignals,
                     500,
                     "broad_text",
-                    expandedHardTermsList.slice(0, 20)
+                    postExpansionTerms
                   );
                   
                   if (pass2Query) {
@@ -5375,7 +5420,7 @@ async function processSessionInBackground({
                 postExpansionSignals,
                 500,
                 fieldStrategy.strategy,
-                expandedHardTermsList.slice(0, 20)
+                postExpansionTerms
               );
               
               if (postExpansionQuery) {
@@ -5389,8 +5434,12 @@ async function processSessionInBackground({
                   200
                 );
                 
+                console.log(`[SmartFetch] post_expansion shopify_returned=${postExpansionFetch.products.length} existing_handles=${existingHandles.size}`);
+                
                 const newProducts = postExpansionFetch.products.filter(p => !existingHandles.has(p.handle));
                 allNewProducts.push(...newProducts);
+                
+                console.log(`[SmartFetch] post_expansion new_products=${newProducts.length} (after dedupe)`);
               }
             }
             
@@ -5406,7 +5455,7 @@ async function processSessionInBackground({
               const sampleTitles = allNewProducts.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
               console.log(`[SmartFetch] post_expansion fetched=${allNewProducts.length} merged total=${allCandidatesEnriched.length} sample_titles=[${sampleTitles.join(", ")}]`);
             } else {
-              console.log(`[SmartFetch] post_expansion fetched=0 (no new products)`);
+              console.log(`[SmartFetch] post_expansion fetched=0 (no new products) existing_handles=${existingHandles.size} query_may_have_returned_duplicates=true`);
             }
             
             // DEEP ATTRIBUTE SEARCH FOR POST-EXPANSION: If broad_text strategy, also search descriptions
@@ -5425,6 +5474,8 @@ async function processSessionInBackground({
                 }, 500, "field_restricted");
                 
                 if (deepSearchQuery) {
+                  console.log(`[SmartFetch] post_expansion_deep_search query="${deepSearchQuery.substring(0, 200)}${deepSearchQuery.length > 200 ? "..." : ""}" primary_terms=[${primaryTerms.join(", ")}]`);
+                  
                   // Fetch products that might match in descriptions
                   const deepFetch = await fetchProductsByQueryPaginated(
                     shopDomain,
@@ -5434,89 +5485,105 @@ async function processSessionInBackground({
                     200
                   );
                   
+                  console.log(`[SmartFetch] post_expansion_deep_search shopify_returned=${deepFetch.products.length} existing_handles=${existingHandles.size}`);
+                  
                   if (deepFetch.products.length > 0) {
-                    // Fetch descriptions for these products
-                    const deepFetchHandles = deepFetch.products.map((p: any) => p.handle);
-                    const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
-                      shopDomain,
-                      accessToken,
-                      handles: deepFetchHandles,
-                    });
+                    // Filter out products already in pool before fetching descriptions (save API calls)
+                    const newProductsForDeepSearch = deepFetch.products.filter(p => !existingHandles.has(p.handle));
+                    console.log(`[SmartFetch] post_expansion_deep_search new_products=${newProductsForDeepSearch.length} (after dedupe, before description check)`);
                     
-                    // Filter products that match expanded terms in description
-                    const deepSearchProducts: any[] = [];
-                    const deepSearchHandles = new Set<string>();
-                    
-                    for (const product of deepFetch.products) {
-                      if (existingHandles.has(product.handle)) continue; // Skip already fetched
-                      
-                      const description = descriptionMap.get(product.handle) || null;
-                      const descPlain = cleanDescription(description);
-                      const descLower = descPlain.toLowerCase();
-                      
-                      // Check if any expanded term appears in description (industry-agnostic)
-                      const matchesExpandedTerm = expandedHardTermsList.slice(0, 20).some(term => {
-                        const termLower = term.toLowerCase();
-                        // For multi-word phrases, require full phrase match
-                        if (term.includes(" ")) {
-                          return descLower.includes(termLower);
-                        }
-                        // For single words, use word boundary matching
-                        const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                        return wordBoundaryRegex.test(descLower);
+                    if (newProductsForDeepSearch.length > 0) {
+                      // Fetch descriptions for these products
+                      const deepFetchHandles = newProductsForDeepSearch.map((p: any) => p.handle);
+                      const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                        shopDomain,
+                        accessToken,
+                        handles: deepFetchHandles,
                       });
                       
-                      if (matchesExpandedTerm && !deepSearchHandles.has(product.handle)) {
-                        deepSearchHandles.add(product.handle);
-                        deepSearchProducts.push({
-                          ...product,
-                          description: description,
-                        });
-                      }
-                    }
-                    
-                    if (deepSearchProducts.length > 0) {
-                      // Enrich and merge deep search products
-                      const enrichedDeepProducts: EnrichedCandidate[] = deepSearchProducts.map((p: any) => {
-                        const descPlain = cleanDescription(p.description || null);
-                        const desc1000 = descPlain.substring(0, 1000);
+                      // Filter products that match expanded terms in description
+                      const deepSearchProducts: any[] = [];
+                      const deepSearchHandles = new Set<string>();
+                      
+                      for (const product of newProductsForDeepSearch) {
+                        const description = descriptionMap.get(product.handle) || null;
+                        const descPlain = cleanDescription(description);
+                        const descLower = descPlain.toLowerCase();
                         
-                        return {
-                          handle: p.handle,
-                          title: p.title,
-                          productType: p.productType || null,
-                          productCategory: null,
-                          taxonomy: null,
-                          collections: p.collections || null,
-                          variants: p.variants || null,
-                          tags: p.tags || [],
-                          vendor: p.vendor || null,
-                          price: p.priceAmount || p.price || null,
-                          priceMinAmount: null,
-                          priceMaxAmount: null,
-                          priceCurrency: p.currencyCode || null,
-                          description: p.description || null,
-                          descPlain: descPlain,
-                          desc1000: desc1000,
-                          available: p.available,
-                          sizes: Array.isArray(p.sizes) ? p.sizes : [],
-                          colors: Array.isArray(p.colors) ? p.colors : [],
-                          materials: Array.isArray(p.materials) ? p.materials : [],
-                          optionValues: p.optionValues ?? {},
-                          metafields: p.metafields || null,
-                          searchText: extractSearchText({
-                            ...p,
+                        // Check if any expanded term appears in description (industry-agnostic)
+                        const matchesExpandedTerm = expandedHardTermsList.slice(0, 20).some(term => {
+                          const termLower = term.toLowerCase();
+                          // For multi-word phrases, require full phrase match
+                          if (term.includes(" ")) {
+                            return descLower.includes(termLower);
+                          }
+                          // For single words, use word boundary matching
+                          const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                          return wordBoundaryRegex.test(descLower);
+                        });
+                        
+                        if (matchesExpandedTerm && !deepSearchHandles.has(product.handle)) {
+                          deepSearchHandles.add(product.handle);
+                          deepSearchProducts.push({
+                            ...product,
+                            description: description,
+                          });
+                        }
+                      }
+                      
+                      console.log(`[SmartFetch] post_expansion_deep_search matched_in_description=${deepSearchProducts.length} (from ${newProductsForDeepSearch.length} checked)`);
+                      
+                      if (deepSearchProducts.length > 0) {
+                        // Enrich and merge deep search products
+                        const enrichedDeepProducts: EnrichedCandidate[] = deepSearchProducts.map((p: any) => {
+                          const descPlain = cleanDescription(p.description || null);
+                          const desc1000 = descPlain.substring(0, 1000);
+                          
+                          return {
+                            handle: p.handle,
+                            title: p.title,
+                            productType: p.productType || null,
+                            productCategory: null,
+                            taxonomy: null,
+                            collections: p.collections || null,
+                            variants: p.variants || null,
+                            tags: p.tags || [],
+                            vendor: p.vendor || null,
+                            price: p.priceAmount || p.price || null,
+                            priceMinAmount: null,
+                            priceMaxAmount: null,
+                            priceCurrency: p.currencyCode || null,
                             description: p.description || null,
                             descPlain: descPlain,
                             desc1000: desc1000,
-                          }, indexMetafields),
-                        } as EnrichedCandidate;
-                      });
-                      
-                      allCandidatesEnriched.push(...enrichedDeepProducts);
-                      console.log(`[SmartFetch] post_expansion_deep_search matched_in_description=${deepSearchProducts.length} merged total=${allCandidatesEnriched.length}`);
+                            available: p.available,
+                            sizes: Array.isArray(p.sizes) ? p.sizes : [],
+                            colors: Array.isArray(p.colors) ? p.colors : [],
+                            materials: Array.isArray(p.materials) ? p.materials : [],
+                            optionValues: p.optionValues ?? {},
+                            metafields: p.metafields || null,
+                            searchText: extractSearchText({
+                              ...p,
+                              description: p.description || null,
+                              descPlain: descPlain,
+                              desc1000: desc1000,
+                            }, indexMetafields),
+                          } as EnrichedCandidate;
+                        });
+                        
+                        allCandidatesEnriched.push(...enrichedDeepProducts);
+                        console.log(`[SmartFetch] post_expansion_deep_search merged=${deepSearchProducts.length} total_candidates=${allCandidatesEnriched.length}`);
+                      } else {
+                        console.log(`[SmartFetch] post_expansion_deep_search no_matches_in_description (checked ${newProductsForDeepSearch.length} products)`);
+                      }
+                    } else {
+                      console.log(`[SmartFetch] post_expansion_deep_search all_products_already_in_pool (${deepFetch.products.length} returned, all duplicates)`);
                     }
+                  } else {
+                    console.log(`[SmartFetch] post_expansion_deep_search shopify_returned_0 (query may be too restrictive or no matches)`);
                   }
+                } else {
+                  console.log(`[SmartFetch] post_expansion_deep_search no_query_built (primaryTerms=[${primaryTerms.join(", ")}])`);
                 }
               } catch (error) {
                 console.error(`[SmartFetch] post_expansion_deep_search error:`, error);
