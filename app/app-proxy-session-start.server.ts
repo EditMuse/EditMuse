@@ -5126,7 +5126,23 @@ async function processSessionInBackground({
         softTerms = Array.isArray(intent.softTerms) ? intent.softTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         avoidTerms = Array.isArray(intent.avoidTerms) ? intent.avoidTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         
+        // Filter out generic/meaningless words from hardTerms BEFORE adding constraint terms
+        // These words are too broad and dilute search precision (industry-agnostic)
+        const genericHardTermStopwords = new Set([
+          "products", "product", "items", "item", "goods", "good", "merchandise", "merchandises",
+          "things", "thing", "stuff", "stuff", "stuff", "stuff"
+        ]);
+        const originalHardTermsCount = hardTerms.length;
+        hardTerms = hardTerms.filter(term => {
+          const normalized = term.toLowerCase().trim();
+          return !genericHardTermStopwords.has(normalized);
+        });
+        if (hardTerms.length < originalHardTermsCount) {
+          console.log(`[Intent] filtered_generic_words from_hardTerms removed=${originalHardTermsCount - hardTerms.length} remaining=[${hardTerms.join(", ")}]`);
+        }
+        
         // Add constraint terms to hardTerms (if detected)
+        // Constraint terms are prioritized and should NOT be filtered out
         if (hasConstraintTerms) {
           hardTerms = [...hardTerms, ...uniqueConstraintTerms];
           console.log(`[DeepSearch] added_constraint_terms_to_hardTerms hardTerms=[${hardTerms.join(", ")}]`);
@@ -10430,9 +10446,19 @@ async function processSessionInBackground({
             const searchTextLower = searchText.toLowerCase();
             
             // Check if any constraint term matches in title/tags/vendor/productType OR description
+            // For multi-word constraint phrases (e.g., "salicylic acid"), require the full phrase to match
+            // For single-word constraints, require exact word match (not just substring)
             const matchesConstraint = uniqueConstraintTerms.some(term => {
               const termLower = term.toLowerCase();
-              return searchTextLower.includes(termLower);
+              // If it's a multi-word phrase, require the full phrase
+              if (term.includes(" ")) {
+                return searchTextLower.includes(termLower);
+              }
+              // For single words, use word boundary matching to avoid false positives
+              // e.g., "acid" should match "salicylic acid" but not "ascorbic acid" if constraint is "salicylic acid"
+              // But if constraint is just "acid", it should match any acid
+              const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+              return wordBoundaryRegex.test(searchTextLower);
             });
             
             if (matchesConstraint) {
