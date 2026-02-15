@@ -410,6 +410,7 @@ function extractSearchText(candidate: any, indexMetafields?: Array<{ namespace: 
   }
   
   // Description snippet (use existing cleanDescription if available, or extract snippet)
+  // When constraint terms exist, include longer description snippet (300-500 chars) for BM25 ranking
   let descText = "";
   if (candidate.description) {
     descText = cleanDescription(candidate.description);
@@ -419,9 +420,11 @@ function extractSearchText(candidate: any, indexMetafields?: Array<{ namespace: 
     descText = cleanDescription(candidate.desc1000);
   }
   
-  // Truncate description to 400 chars (snippet)
-  if (descText.length > 400) {
-    descText = descText.substring(0, 400);
+  // Truncate description: use longer snippet (500 chars) when constraints exist, otherwise 400 chars
+  // This helps BM25 rank products that match constraint terms in description
+  const descMaxChars = 500; // Increased from 400 to help with constraint term matching
+  if (descText.length > descMaxChars) {
+    descText = descText.substring(0, descMaxChars);
   }
   if (descText) {
     parts.push(descText);
@@ -4868,7 +4871,7 @@ async function processSessionInBackground({
       // Store facetVocabulary for use in bundle gating
       const facetVocabularyForBundle = facetVocabulary;
       
-      // Tokenize all candidates for indexing
+      // Tokenize all candidates for indexing (descriptions will be added later if constraints exist)
       const candidateDocs = enrichedCandidates.map(c => ({
         candidate: c,
         tokens: tokenize(c.searchText),
@@ -4956,6 +4959,42 @@ async function processSessionInBackground({
         }
       }
       
+      // Detect constraint patterns (contains, with, includes, made of, ingredient(s))
+      // Extract constraint phrases and add to hardTerms
+      const constraintPatterns = [
+        /\b(?:contains?|containing)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
+        /\b(?:with|having)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
+        /\b(?:includes?|including)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
+        /\b(?:made\s+of|made\s+with|composed\s+of)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
+        /\b(?:ingredients?|ingredient\s+list)\s*:?\s*([a-z]+(?:\s+[a-z]+)*)/gi,
+        /\b(?:that\s+contains?|that\s+has|that\s+includes?)\s+([a-z]+(?:\s+[a-z]+)*)/gi,
+      ];
+      
+      const constraintTerms: string[] = [];
+      const userIntentLower = userIntent.toLowerCase();
+      
+      for (const pattern of constraintPatterns) {
+        let match;
+        while ((match = pattern.exec(userIntentLower)) !== null) {
+          const phrase = match[1].trim();
+          if (phrase.length >= 3) {
+            // Add full phrase
+            constraintTerms.push(phrase);
+            // Also add individual tokens from phrase
+            const tokens = phrase.split(/\s+/).filter(t => t.length >= 3);
+            constraintTerms.push(...tokens);
+          }
+        }
+      }
+      
+      // Deduplicate constraint terms
+      const uniqueConstraintTerms = Array.from(new Set(constraintTerms.map(t => t.toLowerCase())));
+      const hasConstraintTerms = uniqueConstraintTerms.length > 0;
+      
+      if (hasConstraintTerms) {
+        console.log(`[DeepSearch] detected_constraint_patterns constraint_terms=[${uniqueConstraintTerms.join(", ")}]`);
+      }
+      
       if (llmIntentResult.success && llmIntentResult.intent) {
         // Use LLM-parsed intent
         llmIntentUsed = true;
@@ -4965,6 +5004,12 @@ async function processSessionInBackground({
         hardTerms = Array.isArray(intent.hardTerms) ? intent.hardTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         softTerms = Array.isArray(intent.softTerms) ? intent.softTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
         avoidTerms = Array.isArray(intent.avoidTerms) ? intent.avoidTerms.filter(t => typeof t === "string" && t.trim().length > 0) : [];
+        
+        // Add constraint terms to hardTerms (if detected)
+        if (hasConstraintTerms) {
+          hardTerms = [...hardTerms, ...uniqueConstraintTerms];
+          console.log(`[DeepSearch] added_constraint_terms_to_hardTerms hardTerms=[${hardTerms.join(", ")}]`);
+        }
         
         // SYNONYM EXPANSION: Expand hardTerms using Experience config (industry-agnostic)
         // Parse searchSynonymsJson from experience config
@@ -5695,6 +5740,178 @@ async function processSessionInBackground({
       console.log(`[Intent Parsing] Method: ${llmIntentUsed ? "LLM" : "pattern-based"}, isBundle: ${bundleIntent.isBundle}, hardTerms: ${hardTerms.length}, avoidTerms: ${avoidTerms.length}`);
       
       // Bundle detection already logged above or in parseBundleIntentGeneric
+      
+      // ============================================
+      // DEEP ATTRIBUTE SEARCH: Expand candidates for constraint terms (contains, with, includes, etc.)
+      // ============================================
+      // If constraint terms detected, fetch products matching in description/metafields
+      if (hasConstraintTerms && uniqueConstraintTerms.length > 0 && accessToken && !bundleIntent.isBundle) {
+        console.log(`[DeepSearch] starting_expansion constraint_terms=[${uniqueConstraintTerms.join(", ")}]`);
+        
+        try {
+          // For each constraint term, build a search query and fetch products
+          // Note: Shopify search only works on title/product_type/tags/vendor, so we'll fetch a broader set
+          // and then filter by checking descriptions locally
+          const deepSearchProducts: any[] = [];
+          const deepSearchHandles = new Set<string>();
+          
+          // Build a query using constraint terms (search in title/tags/product_type/vendor)
+          // This will get us products that might have the term in description even if not in title
+          const constraintQuery = buildShopifySearchQuery({
+            keywords: uniqueConstraintTerms,
+            selections: [],
+            hasMeaningfulSignals: true
+          }, 500);
+          
+          if (constraintQuery) {
+            console.log(`[DeepSearch] query="${constraintQuery}"`);
+            
+            // Fetch up to 250 products matching constraint terms
+            const deepFetch = await fetchProductsByQueryPaginated(
+              shopDomain,
+              accessToken,
+              constraintQuery,
+              250,
+              200
+            );
+            
+            console.log(`[DeepSearch] fetched=${deepFetch.products.length} from_shopify_search`);
+            
+            // Fetch descriptions for these products to check if they match constraint terms
+            if (deepFetch.products.length > 0) {
+              const deepFetchHandles = deepFetch.products.map((p: any) => p.handle);
+              const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                shopDomain,
+                accessToken,
+                handles: deepFetchHandles,
+              });
+              
+              // Filter products that match constraint terms in description/metafields
+              for (const product of deepFetch.products) {
+                const description = descriptionMap.get(product.handle) || null;
+                const descPlain = cleanDescription(description);
+                const descLower = descPlain.toLowerCase();
+                
+                // Check if any constraint term appears in description
+                const matchesConstraint = uniqueConstraintTerms.some(term => {
+                  const termLower = term.toLowerCase();
+                  return descLower.includes(termLower);
+                });
+                
+                if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                  deepSearchHandles.add(product.handle);
+                  deepSearchProducts.push(product);
+                }
+              }
+              
+              console.log(`[DeepSearch] matched_in_description=${deepSearchProducts.length} after_filtering`);
+              
+              // Merge deep search products into candidate pool (dedupe by handle)
+              const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+              const newDeepProducts = deepSearchProducts.filter((p: any) => !existingHandles.has(p.handle));
+              
+              if (newDeepProducts.length > 0) {
+                // Enrich new products and add to candidate pool
+                const enrichedDeepProducts: EnrichedCandidate[] = newDeepProducts.map((p: any) => {
+                  const descPlain = cleanDescription(p.description || null);
+                  const desc1000 = descPlain.substring(0, 1000);
+                  
+                  return {
+                    handle: p.handle,
+                    title: p.title,
+                    productType: p.productType || null,
+                    productCategory: null,
+                    taxonomy: null,
+                    collections: p.collections || null,
+                    variants: p.variants || null,
+                    tags: p.tags || [],
+                    vendor: p.vendor || null,
+                    price: p.priceAmount || p.price || null,
+                    priceMinAmount: null,
+                    priceMaxAmount: null,
+                    priceCurrency: p.currencyCode || null,
+                    description: p.description || null,
+                    descPlain: descPlain,
+                    desc1000: desc1000,
+                    available: p.available,
+                    sizes: Array.isArray(p.sizes) ? p.sizes : [],
+                    colors: Array.isArray(p.colors) ? p.colors : [],
+                    materials: Array.isArray(p.materials) ? p.materials : [],
+                    optionValues: p.optionValues ?? {},
+                    metafields: p.metafields || null,
+                    searchText: extractSearchText({
+                      ...p,
+                      description: p.description || null,
+                      descPlain: descPlain,
+                      desc1000: desc1000,
+                    }, indexMetafields),
+                  } as EnrichedCandidate;
+                });
+                
+                // Add to candidate pool
+                allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedDeepProducts];
+                console.log(`[DeepSearch] merged=${enrichedDeepProducts.length} total_candidates=${allCandidatesEnriched.length}`);
+                
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`[DeepSearch] error during expansion:`, error);
+          // Continue with existing candidates if deep search fails
+        }
+      }
+      
+      // DEEP ATTRIBUTE SEARCH: If constraint terms exist, fetch descriptions for all candidates for BM25
+      // This ensures BM25 can rank products that match constraint terms in description
+      if (hasConstraintTerms && uniqueConstraintTerms.length > 0 && accessToken && allCandidatesEnriched.length > 0) {
+        console.log(`[DeepSearch] fetching_descriptions_for_bm25 candidate_count=${allCandidatesEnriched.length}`);
+        
+        try {
+          // Fetch descriptions for all candidates (up to 500 to avoid timeout)
+          const candidatesToEnrich = allCandidatesEnriched.slice(0, 500);
+          const handlesToFetch = candidatesToEnrich
+            .filter(c => !c.description && !c.descPlain)
+            .map(c => c.handle);
+          
+          if (handlesToFetch.length > 0) {
+            const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+              shopDomain,
+              accessToken,
+              handles: handlesToFetch,
+            });
+            
+            // Enrich candidates with descriptions
+            for (const candidate of candidatesToEnrich) {
+              if (candidate.description || candidate.descPlain) continue; // Already has description
+              
+              const description = descriptionMap.get(candidate.handle) || null;
+              const descPlain = cleanDescription(description);
+              const desc1000 = descPlain.substring(0, 1000);
+              
+              candidate.description = description;
+              candidate.descPlain = descPlain;
+              candidate.desc1000 = desc1000;
+              
+              // Rebuild searchText with description (includes description snippet for BM25)
+              candidate.searchText = extractSearchText(candidate, indexMetafields);
+            }
+            
+            console.log(`[DeepSearch] enriched_with_descriptions count=${handlesToFetch.length}`);
+            
+            // Re-tokenize candidates for indexing (include descriptions in BM25)
+            const updatedCandidateDocs = allCandidatesEnriched.map(c => ({
+              candidate: c,
+              tokens: tokenize(c.searchText),
+            }));
+            // Update candidateDocs reference (used later for BM25)
+            candidateDocs.length = 0;
+            candidateDocs.push(...updatedCandidateDocs);
+          }
+        } catch (error) {
+          console.error(`[DeepSearch] error fetching descriptions for BM25:`, error);
+          // Continue without descriptions if fetch fails
+        }
+      }
       
       // ============================================
       // COLLECTION INTENT DETECTION (Multi-item intent for single-item queries)
@@ -9730,7 +9947,98 @@ async function processSessionInBackground({
         });
         
         for (const h of validHandles) used.add(h);
-        finalHandles = [...validHandles];
+        let finalHandlesBeforeConstraint = [...validHandles];
+        
+        // POST-AI ENFORCEMENT: Filter AI-selected handles to match constraint terms
+        // If constraint terms exist, filter to products that match in title/tags/vendor/productType OR description
+        if (hasConstraintTerms && uniqueConstraintTerms.length > 0 && finalHandlesBeforeConstraint.length > 0) {
+          console.log(`[DeepSearch] post_ai_enforcement constraint_terms=[${uniqueConstraintTerms.join(", ")}] before=${finalHandlesBeforeConstraint.length}`);
+          
+          // Fetch descriptions for AI-selected handles if not already available
+          const handlesNeedingDescriptions = finalHandlesBeforeConstraint.filter(handle => {
+            const candidate = sortedCandidates.find(c => c.handle === handle);
+            return candidate && !candidate.description && !candidate.descPlain;
+          });
+          
+          if (handlesNeedingDescriptions.length > 0 && accessToken) {
+            const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+              shopDomain,
+              accessToken,
+              handles: handlesNeedingDescriptions,
+            });
+            
+            // Enrich candidates with descriptions
+            for (const handle of handlesNeedingDescriptions) {
+              const candidate = sortedCandidates.find(c => c.handle === handle);
+              if (candidate) {
+                const description = descriptionMap.get(handle) || null;
+                const descPlain = cleanDescription(description);
+                const desc1000 = descPlain.substring(0, 1000);
+                candidate.description = description;
+                candidate.descPlain = descPlain;
+                candidate.desc1000 = desc1000;
+                // Rebuild searchText with description
+                candidate.searchText = extractSearchText(candidate, indexMetafields);
+              }
+            }
+          }
+          
+          // Filter handles to those that match constraint terms
+          const constraintMatchedHandles: string[] = [];
+          for (const handle of finalHandlesBeforeConstraint) {
+            const candidate = sortedCandidates.find(c => c.handle === handle);
+            if (!candidate) continue;
+            
+            // Build search text (includes title, tags, vendor, productType, description)
+            const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
+            const searchTextLower = searchText.toLowerCase();
+            
+            // Check if any constraint term matches in title/tags/vendor/productType OR description
+            const matchesConstraint = uniqueConstraintTerms.some(term => {
+              const termLower = term.toLowerCase();
+              return searchTextLower.includes(termLower);
+            });
+            
+            if (matchesConstraint) {
+              constraintMatchedHandles.push(handle);
+            }
+          }
+          
+          console.log(`[DeepSearch] post_ai_enforcement after=${constraintMatchedHandles.length} filtered=${finalHandlesBeforeConstraint.length - constraintMatchedHandles.length}`);
+          
+          // If fewer than requested remain, top-up from remaining candidates that match
+          if (constraintMatchedHandles.length < finalResultCount) {
+            const remainingCandidates = sortedCandidates.filter(c => 
+              !constraintMatchedHandles.includes(c.handle) && 
+              !used.has(c.handle)
+            );
+            
+            // Check remaining candidates for constraint matches
+            for (const candidate of remainingCandidates) {
+              if (constraintMatchedHandles.length >= finalResultCount) break;
+              
+              const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
+              const searchTextLower = searchText.toLowerCase();
+              
+              const matchesConstraint = uniqueConstraintTerms.some(term => {
+                const termLower = term.toLowerCase();
+                return searchTextLower.includes(termLower);
+              });
+              
+              if (matchesConstraint) {
+                constraintMatchedHandles.push(candidate.handle);
+                used.add(candidate.handle);
+              }
+            }
+            
+            console.log(`[DeepSearch] post_ai_topup after_topup=${constraintMatchedHandles.length} requested=${finalResultCount}`);
+          }
+          
+          finalHandles = constraintMatchedHandles;
+        } else {
+          finalHandles = finalHandlesBeforeConstraint;
+        }
+        
         if (ai1.reasoning) {
         reasoningParts.push(ai1.reasoning);
         }
