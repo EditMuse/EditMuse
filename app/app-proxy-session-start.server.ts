@@ -997,35 +997,72 @@ function extractSmartFetchSignals(
     }
   }
   
-  // Extract 2-word phrases (potential product types/selections)
-  const phrases: string[] = [];
+  // Extract phrases that the user ACTUALLY TYPED (not permutations)
+  // Check the original text to see what phrases exist
+  const originalTextLower = allText.toLowerCase();
+  const userTypedPhrases: string[] = [];
+  const phraseSeen = new Set<string>();
+  
+  // Only extract phrases that exist in the original text (consecutive words)
+  // This prevents creating permutations like "lotion cream" from "lotion or cream"
   for (let i = 0; i < words.length - 1; i++) {
-    const phrase = `${words[i]} ${words[i + 1]}`.replace(/[^\w\s]/g, "");
+    const phrase = `${words[i]} ${words[i + 1]}`.replace(/[^\w\s]/g, "").trim();
     // Skip phrases that are just numbers
     if (/^\d+\s+\d+$/.test(phrase)) continue;
-    if (phrase.length >= 6 && !seen.has(phrase)) {
-      seen.add(phrase);
-      phrases.push(phrase);
+    // Only add if it's a real multi-word phrase AND exists in original text
+    if (phrase.includes(" ") && phrase.length >= 6 && !phraseSeen.has(phrase)) {
+      // Check if this exact phrase exists in the original text (as consecutive words)
+      // Use word boundaries to ensure it's not part of a larger phrase
+      const phrasePattern = new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (phrasePattern.test(originalTextLower)) {
+        phraseSeen.add(phrase);
+        userTypedPhrases.push(phrase);
+      }
     }
   }
   
-  // Treat longer phrases as potential selections (product types)
-  for (const phrase of phrases) {
-    if (phrase.length >= 6) {
+  // Only add phrases that the user actually typed (not permutations)
+  for (const phrase of userTypedPhrases) {
+    if (phrase.includes(" ") && phrase.length >= 6) {
       selections.push(phrase);
     }
   }
   
-  const hasMeaningfulSignals = keywords.length > 0 || selections.length > 0;
+  // For >=2 keywords: Keep ALL keywords (don't remove them even if in phrases)
+  // We'll build token-OR queries, so we need all individual tokens
+  // Only deduplicate exact duplicates, not tokens that are part of phrases
+  const deduplicatedKeywords: string[] = [];
+  const keywordSeen = new Set<string>();
+  for (const keyword of keywords) {
+    const normalized = keyword.toLowerCase().trim();
+    // Only skip exact duplicates (not tokens that are part of phrases)
+    if (!keywordSeen.has(normalized)) {
+      keywordSeen.add(normalized);
+      deduplicatedKeywords.push(keyword);
+    }
+  }
+  
+  // Also deduplicate selections themselves
+  const deduplicatedSelections: string[] = [];
+  const selectionSeen = new Set<string>();
+  for (const selection of selections) {
+    const normalized = selection.toLowerCase().trim();
+    if (!selectionSeen.has(normalized)) {
+      selectionSeen.add(normalized);
+      deduplicatedSelections.push(selection);
+    }
+  }
+  
+  const hasMeaningfulSignals = deduplicatedKeywords.length > 0 || deduplicatedSelections.length > 0;
   
   // Log sanitization results with dropped tokens
   const uniqueDropped = Array.from(new Set(droppedTokens)).slice(0, 20);
-  console.log(`[SmartFetchTokens] intent=[${keywords.slice(0, 10).join(",")}${keywords.length > 10 ? "..." : ""}] dropped=[${uniqueDropped.join(",")}${uniqueDropped.length >= 20 ? "..." : ""}]`);
-  console.log(`[SmartFetch] signals_sanitized keywords=[${keywords.slice(0, 10).join(",")}${keywords.length > 10 ? "..." : ""}] selections=[${selections.slice(0, 5).join(",")}${selections.length > 5 ? "..." : ""}] droppedPriceAnswers=[${droppedPriceAnswers.join(",")}]`);
+  console.log(`[SmartFetchTokens] intent=[${deduplicatedKeywords.slice(0, 10).join(",")}${deduplicatedKeywords.length > 10 ? "..." : ""}] dropped=[${uniqueDropped.join(",")}${uniqueDropped.length >= 20 ? "..." : ""}]`);
+  console.log(`[SmartFetch] signals_sanitized keywords=[${deduplicatedKeywords.slice(0, 10).join(",")}${deduplicatedKeywords.length > 10 ? "..." : ""}] selections=[${deduplicatedSelections.slice(0, 5).join(",")}${deduplicatedSelections.length > 5 ? "..." : ""}] droppedPriceAnswers=[${droppedPriceAnswers.join(",")}]`);
   
   return {
-    keywords: keywords.slice(0, 20), // Cap to avoid query bloat
-    selections: selections.slice(0, 10), // Cap selections
+    keywords: deduplicatedKeywords.slice(0, 20), // Cap to avoid query bloat
+    selections: deduplicatedSelections.slice(0, 10), // Cap selections
     hasMeaningfulSignals,
     rawPreview,
   };
@@ -1034,6 +1071,8 @@ function extractSmartFetchSignals(
 /**
  * Build a Shopify Admin GraphQL products search query string from fetch signals
  * Industry-agnostic: uses generic keyword matching over title/tag/product_type/vendor
+ * Fixed: For >=2 keywords, builds token-OR queries (not phrase permutations)
+ * Only quotes phrases that user actually typed, always includes individual token clauses
  */
 function buildShopifySearchQuery(
   signals: { keywords: string[]; selections: string[]; hasMeaningfulSignals: boolean },
@@ -1043,80 +1082,72 @@ function buildShopifySearchQuery(
     return null;
   }
   
-  const clauses: string[] = [];
-  
-  // Filter out numbers-only tokens (should not be in keywords, but double-check)
+  // Filter out numbers-only tokens
   const safeKeywords = signals.keywords.filter(k => !/^\d+$/.test(k));
   const safeSelections = signals.selections.filter(s => !/^\d+/.test(s));
   
-  // Build selection clauses (stronger signals - product types/categories)
-  if (safeSelections.length > 0) {
-    const selectionClauses: string[] = [];
-    for (const selection of safeSelections) {
-      // Escape special characters and quote multi-word tokens
-      const escaped = selection.replace(/[\\"]/g, "\\$&");
-      // Quote multi-word selections
-      const quoted = selection.includes(" ") ? `"${escaped}"` : escaped;
-      selectionClauses.push(
-        `(title:${quoted} OR product_type:${quoted} OR tag:${quoted} OR vendor:${quoted})`
-      );
-    }
-    if (selectionClauses.length > 0) {
-      clauses.push(`(${selectionClauses.join(" OR ")})`);
-    }
-  }
+  // For >=2 keywords: Build token-OR query (each token gets its own clause)
+  // Always include individual token clauses, even if there's a phrase
+  const tokenClauses: string[] = [];
+  const tokensSeen = new Set<string>();
   
-  // Build keyword clauses (weaker signals - general keywords)
-  if (safeKeywords.length > 0) {
-    const keywordClauses: string[] = [];
-    for (const keyword of safeKeywords) {
-      // Skip numbers-only
-      if (/^\d+$/.test(keyword)) continue;
+  // First, add individual token clauses for all keywords (for >=2 keywords, this is the primary strategy)
+  for (const keyword of safeKeywords) {
+    const normalized = keyword.trim().toLowerCase();
+    if (normalized.length > 0 && !tokensSeen.has(normalized)) {
+      tokensSeen.add(normalized);
+      // Escape special characters
       const escaped = keyword.replace(/[\\"]/g, "\\$&");
-      // Use simple field matching (no wildcards for single words)
-      keywordClauses.push(
+      // Single tokens should NOT be quoted
+      tokenClauses.push(
         `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
       );
     }
-    if (keywordClauses.length > 0) {
-      clauses.push(`(${keywordClauses.join(" OR ")})`);
+  }
+  
+  // Then, add phrase clauses ONLY for phrases that user actually typed
+  // Always include these in addition to individual tokens (not instead of)
+  for (const selection of safeSelections) {
+    const normalized = selection.trim().toLowerCase();
+    // Only add if it's a real multi-word phrase (contains space)
+    if (normalized.includes(" ") && normalized.length > 0) {
+      // Escape special characters
+      const escaped = selection.replace(/[\\"]/g, "\\$&");
+      // Quote multi-word phrases
+      const quotedPhrase = `"${escaped}"`;
+      tokenClauses.push(
+        `(title:${quotedPhrase} OR product_type:${quotedPhrase} OR tag:${quotedPhrase} OR vendor:${quotedPhrase})`
+      );
     }
   }
   
-  if (clauses.length === 0) {
+  if (tokenClauses.length === 0) {
     return null;
   }
   
-  // Combine: if we have selections, use AND logic; otherwise use OR for keywords
-  let query: string;
-  if (safeSelections.length > 0 && safeKeywords.length > 0) {
-    // Selections AND keywords (more targeted)
-    query = `${clauses[0]} AND ${clauses[1]}`;
-  } else {
-    // Just selections OR just keywords (OR logic within each)
-    query = clauses.join(" OR ");
-  }
+  // Build single OR query (no AND logic)
+  const query = tokenClauses.join(" OR ");
   
   // Truncate if too long
-  if (query.length > maxQueryLength) {
-    query = query.substring(0, maxQueryLength);
-    // Try to end at a logical point (before a closing paren or AND/OR)
-    const lastAnd = query.lastIndexOf(" AND ");
-    const lastOr = query.lastIndexOf(" OR ");
-    const lastParen = query.lastIndexOf(")");
-    const cutPoint = Math.max(lastAnd, lastOr, lastParen);
+  let finalQuery = query;
+  if (finalQuery.length > maxQueryLength) {
+    finalQuery = finalQuery.substring(0, maxQueryLength);
+    // Try to end at a logical point (before a closing paren or OR)
+    const lastOr = finalQuery.lastIndexOf(" OR ");
+    const lastParen = finalQuery.lastIndexOf(")");
+    const cutPoint = Math.max(lastOr, lastParen);
     if (cutPoint > maxQueryLength * 0.7) {
-      query = query.substring(0, cutPoint);
+      finalQuery = finalQuery.substring(0, cutPoint);
     }
   }
   
   // Final safety check: if query is empty or only contains numbers, return null
-  const queryWithoutParens = query.replace(/[()]/g, "").trim();
+  const queryWithoutParens = finalQuery.replace(/[()]/g, "").trim();
   if (queryWithoutParens.length === 0 || /^\d+$/.test(queryWithoutParens)) {
     return null;
   }
   
-  return query;
+  return finalQuery;
 }
 
 /**
@@ -4228,6 +4259,7 @@ async function processSessionInBackground({
         let query = buildShopifySearchQuery(fetchSignals);
         
         if (query) {
+          console.log(`[SmartFetch] keywords=[${fetchSignals.keywords.join(", ")}] query="${query}"`);
           console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
           
           try {
@@ -4241,6 +4273,8 @@ async function processSessionInBackground({
             );
             
             smartFetchProducts = stepA.products;
+            const sampleTitles = stepA.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
+            console.log(`[SmartFetch] fetched=${stepA.products.length} sample_titles=[${sampleTitles.join(", ")}]`);
             console.log(`[SmartFetch] query_step=A fetched=${stepA.products.length} totalFetched=${stepA.totalFetched} hadMorePages=${stepA.hasMorePages}`);
             
             // Step B: Widen if insufficient (remove AND constraints, keep OR keywords)
@@ -4252,6 +4286,7 @@ async function processSessionInBackground({
               }, 400);
               
               if (widen1Query && widen1Query !== query) {
+                console.log(`[SmartFetch] built_query="${widen1Query}"`);
                 console.log(`[SmartFetch] widen_step=1 query="${widen1Query.substring(0, 200)}${widen1Query.length > 200 ? "..." : ""}"`);
                 
                 const stepB = await fetchProductsByQueryPaginated(
@@ -4261,6 +4296,9 @@ async function processSessionInBackground({
                   SMART_FETCH_DESIRED_MIN - smartFetchProducts.length,
                   200
                 );
+                
+                const sampleTitlesB = stepB.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
+                console.log(`[SmartFetch] fetched=${stepB.products.length} sample_titles=[${sampleTitlesB.join(", ")}]`);
                 
                 // Deduplicate
                 const seenHandles = new Set(smartFetchProducts.map((p: any) => p.handle));
@@ -5475,6 +5513,7 @@ async function processSessionInBackground({
             
             if (itemQuery) {
               try {
+                console.log(`[SmartFetch] built_query="${itemQuery}"`);
                 console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} query="${itemQuery.substring(0, 150)}${itemQuery.length > 150 ? "..." : ""}"`);
                 
                 const itemFetch = await fetchProductsByQueryPaginated(
@@ -5484,6 +5523,9 @@ async function processSessionInBackground({
                   Math.ceil(SMART_FETCH_DESIRED_MIN / bundleIntent.items.length),
                   100
                 );
+                
+                const sampleTitlesItem = itemFetch.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
+                console.log(`[SmartFetch] fetched=${itemFetch.products.length} sample_titles=[${sampleTitlesItem.join(", ")}]`);
                 
                 // Tag products with itemType for later filtering
                 const taggedProducts = itemFetch.products.map((p: any) => ({
@@ -5509,6 +5551,7 @@ async function processSessionInBackground({
                   });
                   
                   if (fallbackQuery) {
+                    console.log(`[SmartFetch] built_query="${fallbackQuery}"`);
                     const fallbackFetch = await fetchProductsByQueryPaginated(
                       shopDomain,
                       accessToken,
@@ -5516,6 +5559,9 @@ async function processSessionInBackground({
                       50,
                       50
                     );
+                    
+                    const sampleTitlesFallback = fallbackFetch.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
+                    console.log(`[SmartFetch] fetched=${fallbackFetch.products.length} sample_titles=[${sampleTitlesFallback.join(", ")}]`);
                     
                     const fallbackTagged = fallbackFetch.products.map((p: any) => ({
                       ...p,
