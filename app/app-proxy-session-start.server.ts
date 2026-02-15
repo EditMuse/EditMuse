@@ -4428,10 +4428,13 @@ async function processSessionInBackground({
             console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
             
             try {
-              // Helper function to filter negative matches (industry-agnostic)
-              const filterNegativeMatches = (products: any[], keywords: string[]): any[] => {
+              // Helper function to filter negative matches and phrase mismatches (industry-agnostic)
+              const filterNegativeMatches = (products: any[], keywords: string[], selections: string[] = []): any[] => {
                 const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "ohne", "sin"];
                 const meaningfulKeywords = keywords.filter(k => k.length >= 4); // Only meaningful terms
+                
+                // Extract phrase selections (multi-word phrases)
+                const phraseSelections = selections.filter(s => s.includes(" ") && s.trim().length >= 6);
                 
                 return products.filter((p: any) => {
                   const searchableText = [
@@ -4441,17 +4444,55 @@ async function processSessionInBackground({
                     p.vendor || ""
                   ].join(" ").toLowerCase();
                   
-                  // Check for negative patterns with keywords
+                  // Check for negative patterns with keywords (with space and hyphen support)
                   const hasNegativeMatch = meaningfulKeywords.some(keyword => {
                     const keywordLower = keyword.toLowerCase();
-                    // Pattern 1: negative indicator + keyword (e.g., "no perfume", "sans parfum")
-                    const pattern1 = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    // Pattern 2: keyword + negative indicator (e.g., "perfume free", "parfum sans")
-                    const pattern2 = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
-                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                    // Pattern 1a: negative indicator + keyword with space (e.g., "no perfume", "sans parfum")
+                    const pattern1a = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 1b: negative indicator + keyword with hyphen (e.g., "no-perfume", "0-perfume")
+                    const pattern1b = new RegExp(`\\b(?:${negativeIndicators.join("|")})[-_]${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2a: keyword + negative indicator with space (e.g., "perfume free", "parfum sans")
+                    const pattern2a = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    // Pattern 2b: keyword + negative indicator with hyphen (e.g., "perfume-free", "parfum-sans")
+                    const pattern2b = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_](?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
                   });
                   
-                  return !hasNegativeMatch;
+                  if (hasNegativeMatch) return false;
+                  
+                  // If we have phrase selections, filter out products that match individual tokens
+                  // in negative/unrelated contexts (e.g., "food" in "non food products" when searching "pet food")
+                  if (phraseSelections.length > 0 && keywords.length >= 2) {
+                    // Check if product matches the phrase (preferred)
+                    const matchesPhrase = phraseSelections.some(phrase => {
+                      const phraseLower = phrase.toLowerCase();
+                      // Check if phrase appears as a whole (word boundaries)
+                      const phrasePattern = new RegExp(`\\b${phraseLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                      return phrasePattern.test(searchableText);
+                    });
+                    
+                    // If product matches the phrase, keep it
+                    if (matchesPhrase) {
+                      return true;
+                    }
+                    
+                    // If product doesn't match phrase, check if individual tokens appear in negative contexts
+                    // For example: "food" in "non food products" or "non-food products" should be filtered when searching "pet food"
+                    const hasTokenInNegativeContext = keywords.some(keyword => {
+                      const keywordLower = keyword.toLowerCase();
+                      // Check if keyword appears with a negative indicator before it (with space or hyphen)
+                      const negativeBeforePatternSpace = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                      const negativeBeforePatternHyphen = new RegExp(`\\b(?:${negativeIndicators.join("|")})[-_]${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                      return negativeBeforePatternSpace.test(searchableText) || negativeBeforePatternHyphen.test(searchableText);
+                    });
+                    
+                    // Filter out products where tokens appear in negative contexts
+                    if (hasTokenInNegativeContext) {
+                      return false;
+                    }
+                  }
+                  
+                  return true;
                 });
               };
               
@@ -4465,7 +4506,7 @@ async function processSessionInBackground({
               );
             
             // Filter negative matches from Step A
-            const stepAFiltered = filterNegativeMatches(stepA.products, fetchSignals.keywords);
+            const stepAFiltered = filterNegativeMatches(stepA.products, fetchSignals.keywords, fetchSignals.selections);
             const stepAFilteredCount = stepA.products.length - stepAFiltered.length;
             if (stepAFilteredCount > 0) {
               console.log(`[SmartFetch] stepA filtered_negative_matches=${stepAFilteredCount} remaining=${stepAFiltered.length}`);
@@ -4500,7 +4541,7 @@ async function processSessionInBackground({
                 console.log(`[SmartFetch] fetched=${stepB.products.length} sample_titles=[${sampleTitlesB.join(", ")}]`);
                 
                 // Filter negative matches from Step B
-                const stepBFiltered = filterNegativeMatches(stepB.products, fetchSignals.keywords);
+                const stepBFiltered = filterNegativeMatches(stepB.products, fetchSignals.keywords, fetchSignals.selections);
                 const stepBFilteredCount = stepB.products.length - stepBFiltered.length;
                 if (stepBFilteredCount > 0) {
                   console.log(`[SmartFetch] stepB filtered_negative_matches=${stepBFilteredCount} remaining=${stepBFiltered.length}`);
@@ -4528,7 +4569,7 @@ async function processSessionInBackground({
               );
               
               // Filter negative matches from Step C
-              const stepCFiltered = filterNegativeMatches(stepC.products, fetchSignals.keywords);
+              const stepCFiltered = filterNegativeMatches(stepC.products, fetchSignals.keywords, fetchSignals.selections);
               const stepCFilteredCount = stepC.products.length - stepCFiltered.length;
               if (stepCFilteredCount > 0) {
                 console.log(`[SmartFetch] stepC filtered_negative_matches=${stepCFilteredCount} remaining=${stepCFiltered.length}`);
@@ -5388,7 +5429,8 @@ async function processSessionInBackground({
         
         // If scarcity detected and we have expanded terms, do a post-expansion SmartFetch
         // Also run if candidates don't match expanded terms (even if count is high)
-        if (scarcitySignal && expandedHardTermsList.length > 0 && accessToken) {
+        // SKIP in bundle mode: bundle retrieval already handles per-item fetching
+        if (scarcitySignal && expandedHardTermsList.length > 0 && accessToken && !bundleIntent.isBundle) {
           const scarcityReason = currentCandidateCount < minNeededForExpansion 
             ? `count_low (${currentCandidateCount} < ${minNeededForExpansion})` 
             : `mismatch_expanded_terms (${currentCandidateCount} candidates don't match expanded terms)`;
@@ -6266,21 +6308,29 @@ async function processSessionInBackground({
                     p.vendor || ""
                   ].join(" ").toLowerCase();
                   
-                  // Check for negative patterns
+                  // Check for negative patterns (industry-agnostic)
                   const hasNegativeMatch = meaningfulTermsForNegative.some(term => {
                     const termLower = term.toLowerCase();
-                    // Pattern 1: negative indicator + term (e.g., "no perfume", "sans parfum")
-                    const pattern1 = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    // Pattern 2: term + negative indicator (e.g., "perfume free", "parfum sans")
-                    const pattern2 = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
-                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                    // Pattern 1: negative indicator + term with space (e.g., "no perfume", "sans parfum")
+                    const pattern1a = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 1b: negative indicator + term with hyphen (e.g., "no-perfume", "0-perfume")
+                    const pattern1b = new RegExp(`\\b(?:${negativeIndicators.join("|")})[-_]${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2: term + negative indicator with space (e.g., "perfume free", "parfum sans")
+                    const pattern2a = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    // Pattern 2b: term + negative indicator with hyphen (e.g., "perfume-free", "parfum-sans")
+                    const pattern2b = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_](?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
                   });
                   
                   // Also check itemType itself for negative patterns
                   const itemTypeNegative = negativeIndicators.some(indicator => {
-                    const pattern1 = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    const pattern2 = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
-                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                    // Pattern 1: negative indicator + itemType with space or hyphen
+                    const pattern1a = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    const pattern1b = new RegExp(`\\b${indicator}[-_]${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2: itemType + negative indicator with space or hyphen
+                    const pattern2a = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
+                    const pattern2b = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]${indicator}\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
                   });
                   
                   return !hasNegativeMatch && !itemTypeNegative;
@@ -6336,11 +6386,13 @@ async function processSessionInBackground({
                         p.vendor || ""
                       ].join(" ").toLowerCase();
                       
-                      // Check itemType for negative patterns
+                      // Check itemType for negative patterns (with space and hyphen support)
                       const itemTypeNegative = negativeIndicators.some(indicator => {
-                        const pattern1 = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                        const pattern2 = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
-                        return pattern1.test(searchableText) || pattern2.test(searchableText);
+                        const pattern1a = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        const pattern1b = new RegExp(`\\b${indicator}[-_]${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        const pattern2a = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
+                        const pattern2b = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]${indicator}\\b`, 'i');
+                        return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
                       });
                       
                       return !itemTypeNegative;
@@ -11924,7 +11976,8 @@ async function processSessionInBackground({
         pool: typeof allCandidates,
         target: number,
         constraints?: Array<{ key: string; value: string }>,
-        facetVocabulary?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> }
+        facetVocabulary?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> },
+        constraintTerms?: string[] // Industry-agnostic: constraint terms like "salicylic acid"
       ) {
         const have = new Set(ranked);
         const out = ranked.slice();
@@ -11933,6 +11986,30 @@ async function processSessionInBackground({
           if (out.length >= target) break;
           if (!p?.handle) continue;
           if (have.has(p.handle)) continue;
+          
+          // Check constraint terms if provided (industry-agnostic: e.g., "salicylic acid", "zinc oxide")
+          if (constraintTerms && constraintTerms.length > 0) {
+            const searchText = (p as any).searchText || extractSearchText(p as EnrichedCandidate, indexMetafields);
+            const searchTextLower = searchText.toLowerCase();
+            const descText = ((p as any).descPlain || (p as any).description || "").toLowerCase();
+            const combinedText = `${searchTextLower} ${descText}`;
+            
+            // Check if any constraint term matches (same logic as post-AI enforcement)
+            const matchesConstraint = constraintTerms.some(term => {
+              const termLower = term.toLowerCase();
+              // For multi-word phrases, require full phrase
+              if (term.includes(" ")) {
+                return combinedText.includes(termLower);
+              }
+              // For single words, use word boundary matching
+              const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+              return wordBoundaryRegex.test(combinedText);
+            });
+            
+            if (!matchesConstraint) {
+              continue; // Skip this candidate - doesn't match constraint terms
+            }
+          }
           
           // Check constraints if provided (single-item top-up must respect constraints)
           if (constraints && constraints.length > 0) {
@@ -12317,19 +12394,19 @@ async function processSessionInBackground({
       if (!trustFallback) {
         // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
         if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle, hasConstraintTerms ? uniqueConstraintTerms : undefined);
         }
         // If still short after gated top-up, return fewer results (better than drift)
           console.log("[App Proxy] [Layer 3] Intent-safe top-up complete:", finalHandlesGuaranteed.length, "handles (requested:", finalResultCount, ")");
       } else {
         // Trust fallback: can use broader pool, but prefer gated first
         if (gatedCandidates.length > 0) {
-            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, gatedCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle, hasConstraintTerms ? uniqueConstraintTerms : undefined);
         }
         
         // If still short, use broader pool (allCandidatesForTopUp)
           if (finalHandlesGuaranteed.length < finalResultCount && allCandidatesForTopUp.length > 0) {
-            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount, topUpConstraints, facetVocabularyForBundle);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, allCandidatesForTopUp, finalResultCount, topUpConstraints, facetVocabularyForBundle, hasConstraintTerms ? uniqueConstraintTerms : undefined);
         }
         
         // Last resort: baseProducts (only if trust fallback AND both pools exhausted)
@@ -12365,7 +12442,7 @@ async function processSessionInBackground({
               optionValues: (p as any).optionValues ?? {},
             } as EnrichedCandidate;
           });
-            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle);
+            finalHandlesGuaranteed = await topUpHandlesFromGated(finalHandlesGuaranteed, baseCandidates, finalResultCount, topUpConstraints, facetVocabularyForBundle, hasConstraintTerms ? uniqueConstraintTerms : undefined);
             }
           }
         }
