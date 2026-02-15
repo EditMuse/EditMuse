@@ -959,7 +959,11 @@ function extractSmartFetchSignals(
     "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
     "want", "looking", "for", "need", "prefer", "like",
     // Constraint/filler tokens that should be removed from SmartFetch keywords
-    "add", "also", "less", "than", "below", "over", "between", "then"
+    "add", "also", "less", "than", "below", "over", "between", "then",
+    // Generic product/constraint words that shouldn't be search keywords
+    "products", "product", "items", "item", "goods", "merchandise",
+    "contain", "contains", "containing", "with", "having", "includes", "including",
+    "that", "which", "who", "whose", "where", "when"
   ]);
   
   // Track dropped tokens for logging
@@ -5214,11 +5218,29 @@ async function processSessionInBackground({
         const currentCandidateCount = allCandidatesEnriched.length;
         const minNeededForExpansion = finalResultCount * 8;
         
+        // Check if current candidates actually match expanded terms
+        // For queries like "perfume", initial SmartFetch might only get 7 products matching "perfume",
+        // then fallback gets 200 generic products. We need to check if those 200 actually match
+        // expanded terms like "fragrance", "parfume", etc. If not, we should still do post-expansion fetch.
+        let candidatesMatchExpandedTerms = false;
+        if (expandedHardTermsList.length > 0 && allCandidatesEnriched.length > 0) {
+          // Check if at least 50% of candidates match any expanded term
+          const expandedTermsLower = new Set(expandedHardTermsList.map(t => t.toLowerCase()));
+          const matchingCount = allCandidatesEnriched.filter(c => {
+            const searchText = (c.searchText || "").toLowerCase();
+            return Array.from(expandedTermsLower).some(term => searchText.includes(term));
+          }).length;
+          const matchRatio = matchingCount / allCandidatesEnriched.length;
+          candidatesMatchExpandedTerms = matchRatio >= 0.5; // At least 50% should match
+          console.log(`[SmartFetch] expanded_terms_match_check candidates=${allCandidatesEnriched.length} matching=${matchingCount} ratio=${matchRatio.toFixed(2)} matchesExpanded=${candidatesMatchExpandedTerms}`);
+        }
+        
         // Detect signals for field strategy
         const exactPhraseSignal = queryTokens.some(t => t.includes(" "));
         const attributeSignal = hasConstraintTerms; // Already detected constraint patterns
         const broadCategorySignal = expansionResult.canonicalTerms.length <= 2 && expansionResult.canonicalTerms.some(t => t.length <= 6);
-        const scarcitySignal = currentCandidateCount < minNeededForExpansion;
+        // Scarcity signal: either low count OR candidates don't match expanded terms
+        const scarcitySignal = currentCandidateCount < minNeededForExpansion || !candidatesMatchExpandedTerms;
         
         const fieldStrategy = determineFieldStrategy({
           exactPhraseSignal,
@@ -5230,8 +5252,12 @@ async function processSessionInBackground({
         });
         
         // If scarcity detected and we have expanded terms, do a post-expansion SmartFetch
+        // Also run if candidates don't match expanded terms (even if count is high)
         if (scarcitySignal && expandedHardTermsList.length > 0 && accessToken) {
-          console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${fieldStrategy.reason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion}`);
+          const scarcityReason = currentCandidateCount < minNeededForExpansion 
+            ? `count_low (${currentCandidateCount} < ${minNeededForExpansion})` 
+            : `mismatch_expanded_terms (${currentCandidateCount} candidates don't match expanded terms)`;
+          console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${scarcityReason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
           
           try {
             const postExpansionSignals = {
@@ -5340,7 +5366,7 @@ async function processSessionInBackground({
             console.error(`[SmartFetch] post_expansion error:`, error);
           }
         } else if (!scarcitySignal) {
-          console.log(`[SmartFetch] post_expansion skipped reason=no_scarcity currentCount=${currentCandidateCount} >= minNeeded=${minNeededForExpansion}`);
+          console.log(`[SmartFetch] post_expansion skipped reason=no_scarcity currentCount=${currentCandidateCount} >= minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
         }
         
         // Merge LLM-extracted facets with variant constraints from answers
