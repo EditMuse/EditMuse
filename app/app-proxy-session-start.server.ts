@@ -963,7 +963,9 @@ function extractSmartFetchSignals(
     // Generic product/constraint words that shouldn't be search keywords
     "products", "product", "items", "item", "goods", "merchandise",
     "contain", "contains", "containing", "with", "having", "includes", "including",
-    "that", "which", "who", "whose", "where", "when"
+    "that", "which", "who", "whose", "where", "when",
+    // Generic placeholders that shouldn't be search keywords (industry-agnostic)
+    "something", "anything", "everything", "nothing", "some", "any", "all"
   ]);
   
   // Track dropped tokens for logging
@@ -4265,6 +4267,28 @@ async function processSessionInBackground({
     });
   });
   
+  // Industry-agnostic fix: For single-item queries with per-item budgets, convert to global priceMax
+  // This ensures budget filtering works during gating (before we know if it's a bundle)
+  // For bundles, per-item budgets will be used later in bundle-specific logic
+  if (perItemBudgets.length > 0 && (priceMin === null && priceMax === null)) {
+    // Check if this looks like a single-item query (not a bundle)
+    // If per-item budgets exist but no global budget, and it's likely a single item, use the per-item budget
+    // This handles cases like "i want a face cream less then $75" where budget is per-item but query is single-item
+    const hasMultipleItems = perItemBudgets.length > 1 || 
+                            (conversationMessages && conversationMessages.some(msg => 
+                              msg.role === "user" && /\b(and|&|,)\s+\w+/i.test(msg.content || "")
+                            ));
+    
+    if (!hasMultipleItems && perItemBudgets.length === 1) {
+      // Single-item query with per-item budget - convert to global budget
+      const singleItemBudget = perItemBudgets[0];
+      priceMax = singleItemBudget.max;
+      priceMin = singleItemBudget.min;
+      userCurrency = singleItemBudget.currency || userCurrency;
+      console.log(`[Budget] converted_per_item_to_global single_item=true priceMin=${priceMin ?? "null"} priceMax=${priceMax ?? "null"} from_perItemBudget=${JSON.stringify(singleItemBudget)}`);
+    }
+  }
+  
   // Log budget detection summary - answers are the SINGLE source of truth
   if (priceMin !== null || priceMax !== null) {
     console.log(`[Budget] source=answers priceMin=${priceMin ?? "null"} priceMax=${priceMax ?? "null"} userCurrency=${userCurrency ?? "none"} ignore_llm_totalBudget=true`);
@@ -5384,6 +5408,120 @@ async function processSessionInBackground({
             } else {
               console.log(`[SmartFetch] post_expansion fetched=0 (no new products)`);
             }
+            
+            // DEEP ATTRIBUTE SEARCH FOR POST-EXPANSION: If broad_text strategy, also search descriptions
+            // This finds products where expanded terms appear in descriptions/metafields (industry-agnostic)
+            if (fieldStrategy.strategy === "broad_text" && expandedHardTermsList.length > 0 && accessToken && allNewProducts.length === 0) {
+              // Only run if initial query returned 0, to avoid redundant fetches
+              console.log(`[SmartFetch] post_expansion_deep_search strategy=broad_text expanded_terms=[${expandedHardTermsList.slice(0, 10).join(", ")}...]`);
+              
+              try {
+                // Fetch a broader set of products using primary terms (not all expanded terms to avoid query bloat)
+                const primaryTerms = expandedHardTermsList.slice(0, 5); // Use first 5 expanded terms
+                const deepSearchQuery = buildShopifySearchQuery({
+                  keywords: primaryTerms,
+                  selections: [],
+                  hasMeaningfulSignals: true
+                }, 500, "field_restricted");
+                
+                if (deepSearchQuery) {
+                  // Fetch products that might match in descriptions
+                  const deepFetch = await fetchProductsByQueryPaginated(
+                    shopDomain,
+                    accessToken,
+                    deepSearchQuery,
+                    Math.min(minNeededForExpansion - currentCandidateCount, 250),
+                    200
+                  );
+                  
+                  if (deepFetch.products.length > 0) {
+                    // Fetch descriptions for these products
+                    const deepFetchHandles = deepFetch.products.map((p: any) => p.handle);
+                    const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                      shopDomain,
+                      accessToken,
+                      handles: deepFetchHandles,
+                    });
+                    
+                    // Filter products that match expanded terms in description
+                    const deepSearchProducts: any[] = [];
+                    const deepSearchHandles = new Set<string>();
+                    
+                    for (const product of deepFetch.products) {
+                      if (existingHandles.has(product.handle)) continue; // Skip already fetched
+                      
+                      const description = descriptionMap.get(product.handle) || null;
+                      const descPlain = cleanDescription(description);
+                      const descLower = descPlain.toLowerCase();
+                      
+                      // Check if any expanded term appears in description (industry-agnostic)
+                      const matchesExpandedTerm = expandedHardTermsList.slice(0, 20).some(term => {
+                        const termLower = term.toLowerCase();
+                        // For multi-word phrases, require full phrase match
+                        if (term.includes(" ")) {
+                          return descLower.includes(termLower);
+                        }
+                        // For single words, use word boundary matching
+                        const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        return wordBoundaryRegex.test(descLower);
+                      });
+                      
+                      if (matchesExpandedTerm && !deepSearchHandles.has(product.handle)) {
+                        deepSearchHandles.add(product.handle);
+                        deepSearchProducts.push({
+                          ...product,
+                          description: description,
+                        });
+                      }
+                    }
+                    
+                    if (deepSearchProducts.length > 0) {
+                      // Enrich and merge deep search products
+                      const enrichedDeepProducts: EnrichedCandidate[] = deepSearchProducts.map((p: any) => {
+                        const descPlain = cleanDescription(p.description || null);
+                        const desc1000 = descPlain.substring(0, 1000);
+                        
+                        return {
+                          handle: p.handle,
+                          title: p.title,
+                          productType: p.productType || null,
+                          productCategory: null,
+                          taxonomy: null,
+                          collections: p.collections || null,
+                          variants: p.variants || null,
+                          tags: p.tags || [],
+                          vendor: p.vendor || null,
+                          price: p.priceAmount || p.price || null,
+                          priceMinAmount: null,
+                          priceMaxAmount: null,
+                          priceCurrency: p.currencyCode || null,
+                          description: p.description || null,
+                          descPlain: descPlain,
+                          desc1000: desc1000,
+                          available: p.available,
+                          sizes: Array.isArray(p.sizes) ? p.sizes : [],
+                          colors: Array.isArray(p.colors) ? p.colors : [],
+                          materials: Array.isArray(p.materials) ? p.materials : [],
+                          optionValues: p.optionValues ?? {},
+                          metafields: p.metafields || null,
+                          searchText: extractSearchText({
+                            ...p,
+                            description: p.description || null,
+                            descPlain: descPlain,
+                            desc1000: desc1000,
+                          }, indexMetafields),
+                        } as EnrichedCandidate;
+                      });
+                      
+                      allCandidatesEnriched.push(...enrichedDeepProducts);
+                      console.log(`[SmartFetch] post_expansion_deep_search matched_in_description=${deepSearchProducts.length} merged total=${allCandidatesEnriched.length}`);
+                    }
+                  }
+                }
+              } catch (error) {
+                console.error(`[SmartFetch] post_expansion_deep_search error:`, error);
+              }
+            }
           } catch (error) {
             console.error(`[SmartFetch] post_expansion error:`, error);
           }
@@ -5516,10 +5654,13 @@ async function processSessionInBackground({
                 // Don't treat as phrase
                 continue;
               } else if (!term1IsFacet && term2IsFacet) {
-                // Pattern: "<type> <facet>" (e.g., "face cream", "hand cream")
-                // If phrase is long enough (>= 8), treat as product type phrase
-                // This handles cases where the facet term is part of the product name
-                if (phrase.length >= 8) {
+                // Pattern: "<type> <facet>" (e.g., "face cream", "hand cream", "body lotion")
+                // Industry-agnostic: If phrase is long enough (>= 8 chars) OR first term is >= 4 chars,
+                // treat as product type phrase (facet term is part of product name, not a color/size/material)
+                // This handles: "face cream" (10 chars, "face"=4), "hand lotion" (11 chars, "hand"=4), "body wash" (9 chars, "body"=4)
+                const phraseLength = phrase.length;
+                const term1Length = term1.length;
+                if (phraseLength >= 8 || (phraseLength >= 6 && term1Length >= 4)) {
                   multiWordPhrase = phrase;
                   break;
                 }
@@ -5544,9 +5685,17 @@ async function processSessionInBackground({
           
           for (const term of hardTerms) {
             const termLower = term.toLowerCase();
-            // Skip terms that are part of the multi-word phrase
-            if (multiWordPhrase && phraseTerms.includes(termLower)) {
-              continue; // Don't extract as facet if it's part of product type phrase
+            // Skip terms that are part of the multi-word phrase (industry-agnostic)
+            // Check both exact match and normalized match to handle variations
+            if (multiWordPhrase) {
+              const isPartOfPhrase = phraseTerms.some(phraseTerm => {
+                const normalizedPhraseTerm = normalizeFacetValue(phraseTerm);
+                const normalizedTerm = normalizeFacetValue(termLower);
+                return phraseTerm === termLower || normalizedPhraseTerm === normalizedTerm;
+              });
+              if (isPartOfPhrase) {
+                continue; // Don't extract as facet if it's part of product type phrase
+              }
             }
             
             const normalized = normalizeFacetValue(term);
@@ -7864,6 +8013,11 @@ async function processSessionInBackground({
         let removedBelow = 0;
         let removedAbove = 0;
         
+        // Log budget filtering (industry-agnostic)
+        if (hadBudget) {
+          console.log(`[BudgetFilter] applying budget min=${priceMin ?? "null"} max=${priceMax ?? "null"} before=${before}`);
+        }
+        
         const out = candidates.filter(c => {
           // Get price range from candidate (prefer explicit min/max, fallback to single price)
           const candidateMin = (c as any).priceMinAmount ?? null;
@@ -7910,6 +8064,11 @@ async function processSessionInBackground({
         });
         
         const after = out.length;
+        
+        // Log budget filtering results (industry-agnostic)
+        if (hadBudget && (removedBelow > 0 || removedAbove > 0)) {
+          console.log(`[BudgetFilter] after=${after} removed_below_min=${removedBelow} removed_above_max=${removedAbove} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
+        }
         if (before !== after) {
           console.log(`[BudgetFilter] applied=true before=${before} after=${after} min=${priceMin ?? "null"} max=${priceMax ?? "null"}`);
           console.log(`[BudgetConstraint] applied=true floor=${priceMin ?? "null"} ceiling=${priceMax ?? "null"} removedBelow=${removedBelow} removedAbove=${removedAbove}`);
@@ -8332,19 +8491,69 @@ async function processSessionInBackground({
               } else {
             // Stage C: Relax hard terms (allow token containment matching)
             // Use token-based matching: check if any normalized hard term token appears in indexed text
+            // BUT: prioritize primary/canonical terms and filter out negative matches
             const hardTermTokens = new Set<string>();
+            const primaryTermTokens = new Set<string>(); // Original terms before expansion (more important)
+            const expandedTermTokens = new Set<string>(); // Expanded terms (less important)
+            
+            // Separate primary terms (from original hardTerms before expansion) from expanded terms
+            // For now, treat all hardTerms equally, but prioritize longer/more specific terms
             hardTerms.forEach(phrase => {
               const normalized = unifiedNormalize(phrase);
               const tokens = tokenize(normalized);
               tokens.forEach(t => hardTermTokens.add(t));
+              
+              // Prioritize multi-word phrases and longer terms (more specific)
+              if (phrase.includes(" ") || phrase.length >= 6) {
+                tokens.forEach(t => primaryTermTokens.add(t));
+              } else {
+                tokens.forEach(t => expandedTermTokens.add(t));
+              }
             });
+            
+            // Filter out common stopwords that cause false matches
+            const stopwordTokens = new Set(["de", "du", "des", "le", "la", "les", "un", "une", "eau", "eau"]);
+            const meaningfulTokens = Array.from(hardTermTokens).filter(t => 
+              t.length >= 3 && !stopwordTokens.has(t.toLowerCase())
+            );
             
             const stageC = gatedCandidates.filter(candidate => {
               const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
+              const haystackLower = haystack.toLowerCase();
+              
+              // Filter out negative matches (industry-agnostic)
+              // Detect negative patterns dynamically based on hard terms
+              // Common negative indicators: "no", "sans", "free", "without", "not", "non", "zero"
+              const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "sans", "ohne", "sin"];
+              
+              // Build negative patterns dynamically for each primary hard term (industry-agnostic)
+              const primaryHardTerms = hardTerms.filter(term => term.length >= 4); // Only meaningful terms
+              const hasNegativeMatch = primaryHardTerms.some(term => {
+                const termLower = term.toLowerCase();
+                // Pattern 1: negative indicator + term (e.g., "no perfume", "sans parfum")
+                const pattern1 = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                // Pattern 2: term + negative indicator (e.g., "perfume free", "parfum sans")
+                const pattern2 = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
+                return pattern1.test(haystackLower) || pattern2.test(haystackLower);
+              });
+              
+              if (hasNegativeMatch) {
+                return false; // Exclude negative matches
+              }
+              
               const candidateTokens = new Set(tokenize(haystack));
               
-              // Check if at least one hard term token appears in candidate
-              return Array.from(hardTermTokens).some(token => candidateTokens.has(token));
+              // Check if at least one meaningful hard term token appears in candidate
+              // Prioritize primary terms if available
+              if (primaryTermTokens.size > 0) {
+                const primaryMatch = Array.from(primaryTermTokens).some(token => 
+                  token.length >= 3 && !stopwordTokens.has(token.toLowerCase()) && candidateTokens.has(token)
+                );
+                if (primaryMatch) return true;
+              }
+              
+              // Fallback to any meaningful token
+              return meaningfulTokens.some(token => candidateTokens.has(token));
             });
             
             console.log(`[Gating] Stage C: token containment - count=${stageC.length} hardTermTokens=[${Array.from(hardTermTokens).join(", ")}]`);
@@ -10436,14 +10645,19 @@ async function processSessionInBackground({
           }
           
           // Filter handles to those that match constraint terms
+          // Industry-agnostic: checks both searchText (title/tags/vendor/productType) AND description explicitly
           const constraintMatchedHandles: string[] = [];
           for (const handle of finalHandlesBeforeConstraint) {
             const candidate = sortedCandidates.find(c => c.handle === handle);
             if (!candidate) continue;
             
-            // Build search text (includes title, tags, vendor, productType, description)
+            // Build search text (includes title, tags, vendor, productType, description if available)
             const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
             const searchTextLower = searchText.toLowerCase();
+            
+            // Also check description explicitly (in case it's not in searchText yet)
+            const descText = (candidate.descPlain || candidate.description || "").toLowerCase();
+            const combinedText = `${searchTextLower} ${descText}`;
             
             // Check if any constraint term matches in title/tags/vendor/productType OR description
             // For multi-word constraint phrases (e.g., "salicylic acid"), require the full phrase to match
@@ -10452,13 +10666,13 @@ async function processSessionInBackground({
               const termLower = term.toLowerCase();
               // If it's a multi-word phrase, require the full phrase
               if (term.includes(" ")) {
-                return searchTextLower.includes(termLower);
+                return combinedText.includes(termLower);
               }
               // For single words, use word boundary matching to avoid false positives
               // e.g., "acid" should match "salicylic acid" but not "ascorbic acid" if constraint is "salicylic acid"
               // But if constraint is just "acid", it should match any acid
               const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-              return wordBoundaryRegex.test(searchTextLower);
+              return wordBoundaryRegex.test(combinedText);
             });
             
             if (matchesConstraint) {
@@ -10469,22 +10683,59 @@ async function processSessionInBackground({
           console.log(`[DeepSearch] post_ai_enforcement after=${constraintMatchedHandles.length} filtered=${finalHandlesBeforeConstraint.length - constraintMatchedHandles.length}`);
           
           // If fewer than requested remain, top-up from remaining candidates that match
+          // Industry-agnostic: aggressively search remaining candidates, including fetching descriptions if needed
           if (constraintMatchedHandles.length < finalResultCount) {
             const remainingCandidates = sortedCandidates.filter(c => 
               !constraintMatchedHandles.includes(c.handle) && 
               !used.has(c.handle)
             );
             
-            // Check remaining candidates for constraint matches
+            // Fetch descriptions for remaining candidates that don't have them yet (for better matching)
+            const remainingNeedingDescriptions = remainingCandidates
+              .filter(c => !c.description && !c.descPlain)
+              .slice(0, Math.min(50, remainingCandidates.length)); // Limit to avoid too many API calls
+            
+            if (remainingNeedingDescriptions.length > 0 && accessToken) {
+              const remainingHandles = remainingNeedingDescriptions.map(c => c.handle);
+              const remainingDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                shopDomain,
+                accessToken,
+                handles: remainingHandles,
+              });
+              
+              // Enrich remaining candidates with descriptions
+              for (const candidate of remainingNeedingDescriptions) {
+                const description = remainingDescriptionMap.get(candidate.handle) || null;
+                const descPlain = cleanDescription(description);
+                const desc1000 = descPlain.substring(0, 1000);
+                candidate.description = description;
+                candidate.descPlain = descPlain;
+                candidate.desc1000 = desc1000;
+                // Rebuild searchText with description
+                candidate.searchText = extractSearchText(candidate, indexMetafields);
+              }
+            }
+            
+            // Check remaining candidates for constraint matches (now with descriptions if fetched)
             for (const candidate of remainingCandidates) {
               if (constraintMatchedHandles.length >= finalResultCount) break;
               
               const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
               const searchTextLower = searchText.toLowerCase();
               
+              // Also check description explicitly
+              const descText = (candidate.descPlain || candidate.description || "").toLowerCase();
+              const combinedText = `${searchTextLower} ${descText}`;
+              
               const matchesConstraint = uniqueConstraintTerms.some(term => {
                 const termLower = term.toLowerCase();
-                return searchTextLower.includes(termLower);
+                // For multi-word phrases, require full phrase
+                if (term.includes(" ")) {
+                  return combinedText.includes(termLower);
+                }
+                // For single words, use word boundary matching
+                const wordBoundaryRegex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                return wordBoundaryRegex.test(combinedText);
               });
               
               if (matchesConstraint) {
@@ -10493,7 +10744,7 @@ async function processSessionInBackground({
               }
             }
             
-            console.log(`[DeepSearch] post_ai_topup after_topup=${constraintMatchedHandles.length} requested=${finalResultCount}`);
+            console.log(`[DeepSearch] post_ai_topup after_topup=${constraintMatchedHandles.length} requested=${finalResultCount} descriptions_fetched=${remainingNeedingDescriptions.length}`);
           }
           
           finalHandles = constraintMatchedHandles;
