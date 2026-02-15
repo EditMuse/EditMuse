@@ -5444,14 +5444,36 @@ async function processSessionInBackground({
           };
           
           // FIRST: Check if hardTerms form a multi-word phrase (e.g., "face cream", "running shoes")
-          // If so, use it as canonicalType and don't extract individual terms as facets
+          // BUT: Don't treat as phrase if one term is a known facet value (e.g., "white shirt" -> color="white", type="shirt")
+          // Industry-agnostic: uses generic facet detection, no hardcoded product types
           let multiWordPhrase: string | null = null;
           if (hardTerms.length >= 2) {
             // Try consecutive combinations to form phrases
             for (let i = 0; i < hardTerms.length - 1; i++) {
-              const phrase = `${hardTerms[i]} ${hardTerms[i + 1]}`.toLowerCase();
+              const term1 = hardTerms[i].toLowerCase();
+              const term2 = hardTerms[i + 1].toLowerCase();
+              const phrase = `${term1} ${term2}`;
               const phraseNormalized = normalizeFacetValue(phrase);
-              // Check if phrase is NOT a known facet value (if it is, it's probably not a product type)
+              
+              // Check if EITHER term is a known facet value
+              const term1Normalized = normalizeFacetValue(term1);
+              const term2Normalized = normalizeFacetValue(term2);
+              const term1IsFacet = 
+                discoveredColorValues.has(term1Normalized) ||
+                discoveredSizeValues.has(term1Normalized) ||
+                discoveredMaterialValues.has(term1Normalized) ||
+                colorTerms.has(term1Normalized) ||
+                sizeTerms.has(term1Normalized) ||
+                materialTerms.has(term1Normalized);
+              const term2IsFacet = 
+                discoveredColorValues.has(term2Normalized) ||
+                discoveredSizeValues.has(term2Normalized) ||
+                discoveredMaterialValues.has(term2Normalized) ||
+                colorTerms.has(term2Normalized) ||
+                sizeTerms.has(term2Normalized) ||
+                materialTerms.has(term2Normalized);
+              
+              // Check if phrase itself is a known facet value
               const isPhraseAFacet = 
                 discoveredColorValues.has(phraseNormalized) ||
                 discoveredSizeValues.has(phraseNormalized) ||
@@ -5460,11 +5482,42 @@ async function processSessionInBackground({
                 sizeTerms.has(phraseNormalized) ||
                 materialTerms.has(phraseNormalized);
               
-              // If phrase is long enough and not a facet, it's likely a product type
-              if (!isPhraseAFacet && phrase.length >= 6) {
-                multiWordPhrase = phrase;
-                break; // Use first valid phrase
+              // Industry-agnostic phrase detection rules:
+              // 1. If first term is facet and second is not: extract facet, use second as type (e.g., "white shirt")
+              // 2. If first term is not facet and second is facet: check if phrase is product type
+              //    - If phrase is long enough (>= 8) and second term can be part of product name: treat as phrase
+              //    - Otherwise: extract second as facet, use first as type
+              // 3. If neither term is facet: treat as phrase if long enough (>= 6)
+              // This handles: "white shirt" (facet + type), "face cream" (type phrase), "running shoes" (type phrase)
+              
+              if (isPhraseAFacet) {
+                // Phrase itself is a facet value - don't treat as product type
+                continue;
               }
+              
+              if (term1IsFacet && !term2IsFacet) {
+                // Pattern: "<facet> <type>" (e.g., "white shirt") - extract facet, use second as type
+                // Don't treat as phrase
+                continue;
+              } else if (!term1IsFacet && term2IsFacet) {
+                // Pattern: "<type> <facet>" (e.g., "face cream", "hand cream")
+                // If phrase is long enough (>= 8), treat as product type phrase
+                // This handles cases where the facet term is part of the product name
+                if (phrase.length >= 8) {
+                  multiWordPhrase = phrase;
+                  break;
+                }
+                // Otherwise, extract second as facet, use first as type
+                continue;
+              } else if (!term1IsFacet && !term2IsFacet) {
+                // Pattern: "<type> <type>" (e.g., "running shoes", "face mask")
+                // Treat as product type phrase if long enough
+                if (phrase.length >= 6) {
+                  multiWordPhrase = phrase;
+                  break;
+                }
+              }
+              // If both are facets, skip (shouldn't happen, but handle gracefully)
             }
           }
           
@@ -8371,11 +8424,20 @@ async function processSessionInBackground({
         
         const afterTypeAnchor = typeAnchoredCandidates.length;
         
-        // SAFETY CHECK: If anchor would shrink below minNeeded, use as boost instead of filter
-        if (afterTypeAnchor < minNeeded && beforeTypeAnchor >= minNeeded) {
+        // SAFETY CHECK: If anchor would shrink below minNeeded OR make it worse, use as boost instead of filter
+        // Use boost mode if:
+        // 1. After filtering would be below minNeeded AND before was >= minNeeded (would make it worse)
+        // 2. OR after filtering is significantly worse than before (reduces by >50% and below a reasonable threshold)
+        const wouldShrinkBelowMin = afterTypeAnchor < minNeeded && beforeTypeAnchor >= minNeeded;
+        const wouldMakeWorse = afterTypeAnchor < beforeTypeAnchor && 
+                                afterTypeAnchor < Math.max(finalResultCount * 2, 20) && // At least need 2x requested or 20
+                                (beforeTypeAnchor - afterTypeAnchor) > (beforeTypeAnchor * 0.5); // Reduced by more than 50%
+        
+        if (wouldShrinkBelowMin || wouldMakeWorse) {
           // Revert to pre-anchor pool and apply anchor as scoring boost
           typeAnchorInBoostMode = true; // Set flag for BM25 boost
-          console.log(`[TypeAnchor] mode=boost anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} minNeeded=${minNeeded} reverted=true`);
+          const reason = wouldShrinkBelowMin ? "would_shrink_below_min" : "would_make_worse";
+          console.log(`[TypeAnchor] mode=boost anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} minNeeded=${minNeeded} reason=${reason} reverted=true`);
           // Keep gatedCandidates unchanged, but we'll boost anchor matches in BM25 ranking
           // Store anchor info for boosting in ranking phase
           // (The boost will be applied in the BM25 ranking section below)
