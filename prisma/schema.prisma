@@ -54,6 +54,7 @@ model Shop {
   trialEndsAt       DateTime?
   usageEvents       UsageEvent[]
   aiRankingCaches   AIRankingCache[]
+  queryExpansionCaches QueryExpansionCache[]
   orderAttributions OrderAttribution[]
   attributionAttempts AttributionAttempt[]
   experiments       Experiment[]
@@ -238,6 +239,21 @@ model AIRankingCache {
   resultCount   Int // Number of results cached
   createdAt     DateTime @default(now())
   expiresAt     DateTime // Cache expiration (24-48 hours)
+
+  @@index([shopId, expiresAt])
+  @@index([cacheKey, expiresAt])
+  @@index([expiresAt]) // For cleanup of expired entries
+}
+
+model QueryExpansionCache {
+  id          String   @id @default(cuid())
+  cacheKey    String   @unique // Format: "shopId:term" (e.g., "shop123:trainers")
+  shopId      String
+  shop        Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  term        String   // Original term (for debugging)
+  synonymsJson String  // JSON array of synonyms
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime // Cache expiration (30 days)
 
   @@index([shopId, expiresAt])
   @@index([cacheKey, expiresAt])

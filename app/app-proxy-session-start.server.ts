@@ -20,6 +20,7 @@ import {
   expandQueryTokens,
   expandTokenMorphology,
 } from "~/utils/text-indexing.server";
+import { expandTerms } from "~/utils/term-expansion.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
@@ -1072,27 +1073,50 @@ function extractSmartFetchSignals(
 }
 
 /**
+ * Field strategy types for Shopify retrieval
+ */
+type FieldStrategy = "field_restricted" | "broad_text" | "two_pass";
+
+/**
  * Build a Shopify Admin GraphQL products search query string from fetch signals
  * Industry-agnostic: uses generic keyword matching over title/tag/product_type/vendor
  * Fixed: For >=2 keywords, builds token-OR queries (not phrase permutations)
  * Only quotes phrases that user actually typed, always includes individual token clauses
+ * 
+ * @param signals - Fetch signals (keywords, selections)
+ * @param maxQueryLength - Maximum query length
+ * @param strategy - Field strategy: "field_restricted" (default), "broad_text" (no field qualifiers), or "two_pass"
+ * @param expandedTerms - Optional expanded terms to use instead of signals.keywords
  */
 function buildShopifySearchQuery(
   signals: { keywords: string[]; selections: string[]; hasMeaningfulSignals: boolean },
-  maxQueryLength: number = 500
+  maxQueryLength: number = 500,
+  strategy: FieldStrategy = "field_restricted",
+  expandedTerms?: string[]
 ): string | null {
-  if (!signals.hasMeaningfulSignals) {
+  if (!signals.hasMeaningfulSignals && (!expandedTerms || expandedTerms.length === 0)) {
     return null;
   }
   
+  // Use expanded terms if provided, otherwise use signals.keywords
+  const keywordsToUse = expandedTerms && expandedTerms.length > 0 ? expandedTerms : signals.keywords;
+  
   // Filter out numbers-only tokens
-  const safeKeywords = signals.keywords.filter(k => !/^\d+$/.test(k));
+  const safeKeywords = keywordsToUse.filter(k => !/^\d+$/.test(k));
   const safeSelections = signals.selections.filter(s => !/^\d+/.test(s));
+  
+  if (safeKeywords.length === 0 && safeSelections.length === 0) {
+    return null;
+  }
   
   // For >=2 keywords: Build token-OR query (each token gets its own clause)
   // Always include individual token clauses, even if there's a phrase
   const tokenClauses: string[] = [];
   const tokensSeen = new Set<string>();
+  
+  // Field strategy: "field_restricted" uses field qualifiers, "broad_text" avoids them
+  // "two_pass" is handled at the caller level (not in query building), so treat as field_restricted here
+  const useFieldQualifiers = strategy === "field_restricted" || strategy === "two_pass";
   
   // First, add individual token clauses for all keywords (for >=2 keywords, this is the primary strategy)
   for (const keyword of safeKeywords) {
@@ -1102,9 +1126,15 @@ function buildShopifySearchQuery(
       // Escape special characters
       const escaped = keyword.replace(/[\\"]/g, "\\$&");
       // Single tokens should NOT be quoted
-      tokenClauses.push(
-        `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
-      );
+      if (useFieldQualifiers) {
+        // field_restricted: use field qualifiers
+        tokenClauses.push(
+          `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
+        );
+      } else {
+        // broad_text: no field qualifiers, let Shopify search across all fields
+        tokenClauses.push(escaped);
+      }
     }
   }
   
@@ -1118,9 +1148,15 @@ function buildShopifySearchQuery(
       const escaped = selection.replace(/[\\"]/g, "\\$&");
       // Quote multi-word phrases
       const quotedPhrase = `"${escaped}"`;
-      tokenClauses.push(
-        `(title:${quotedPhrase} OR product_type:${quotedPhrase} OR tag:${quotedPhrase} OR vendor:${quotedPhrase})`
-      );
+      if (useFieldQualifiers) {
+        // field_restricted: use field qualifiers
+        tokenClauses.push(
+          `(title:${quotedPhrase} OR product_type:${quotedPhrase} OR tag:${quotedPhrase} OR vendor:${quotedPhrase})`
+        );
+      } else {
+        // broad_text: no field qualifiers
+        tokenClauses.push(quotedPhrase);
+      }
     }
   }
   
@@ -1129,7 +1165,11 @@ function buildShopifySearchQuery(
   }
   
   // Build single OR query (no AND logic)
-  const query = tokenClauses.join(" OR ");
+  // For broad_text strategy, join with OR (Shopify will search across all fields)
+  // For field_restricted, we already have field qualifiers in each clause
+  const query = useFieldQualifiers 
+    ? tokenClauses.join(" OR ")
+    : tokenClauses.join(" OR ");
   
   // Truncate if too long
   let finalQuery = query;
@@ -1151,6 +1191,54 @@ function buildShopifySearchQuery(
   }
   
   return finalQuery;
+}
+
+/**
+ * Determine field strategy based on intent signals and candidate scarcity
+ * Industry-agnostic: selects retrieval strategy to maximize recall while preserving precision
+ */
+function determineFieldStrategy(options: {
+  exactPhraseSignal: boolean;
+  attributeSignal: boolean;
+  broadCategorySignal: boolean;
+  scarcitySignal: boolean;
+  fetchedCount: number;
+  minNeeded: number;
+}): { strategy: FieldStrategy; reason: string } {
+  const { exactPhraseSignal, attributeSignal, broadCategorySignal, scarcitySignal, fetchedCount, minNeeded } = options;
+  
+  const MIN_FETCH = 64; // Minimum fetch threshold for field_restricted strategy
+  
+  // Strategy selection logic
+  if (scarcitySignal || attributeSignal) {
+    // Scarcity or attribute signals -> use broad_text to search across all fields
+    return {
+      strategy: "broad_text",
+      reason: scarcitySignal ? `scarcity_signal (fetched=${fetchedCount} < minNeeded=${minNeeded})` : `attribute_signal (contains/with/ingredient patterns)`
+    };
+  }
+  
+  if (broadCategorySignal && fetchedCount < MIN_FETCH) {
+    // Broad category with low fetch -> use two_pass
+    return {
+      strategy: "two_pass",
+      reason: `broad_category_signal (generic term) + fetched=${fetchedCount} < MIN_FETCH=${MIN_FETCH}`
+    };
+  }
+  
+  if (fetchedCount >= MIN_FETCH && !scarcitySignal) {
+    // Sufficient results -> use field_restricted for precision
+    return {
+      strategy: "field_restricted",
+      reason: `fetched=${fetchedCount} >= MIN_FETCH=${MIN_FETCH} && no_scarcity`
+    };
+  }
+  
+  // Default: field_restricted
+  return {
+    strategy: "field_restricted",
+    reason: "default"
+  };
 }
 
 /**
@@ -4258,8 +4346,8 @@ async function processSessionInBackground({
           console.log(`[SmartFetch] bundle_mode=true - will fetch per itemType after intent parsing`);
         }
         
-        // Step A: Build targeted query
-        let query = buildShopifySearchQuery(fetchSignals);
+        // Step A: Build targeted query (using default field_restricted strategy)
+        let query = buildShopifySearchQuery(fetchSignals, 500, "field_restricted");
         
         if (query) {
           console.log(`[SmartFetch] keywords=[${fetchSignals.keywords.join(", ")}] query="${query}"`);
@@ -4286,7 +4374,7 @@ async function processSessionInBackground({
                 keywords: fetchSignals.keywords,
                 selections: [], // Drop selections for widening
                 hasMeaningfulSignals: fetchSignals.keywords.length > 0,
-              }, 400);
+              }, 400, "field_restricted");
               
               if (widen1Query && widen1Query !== query) {
                 console.log(`[SmartFetch] built_query="${widen1Query}"`);
@@ -5087,6 +5175,173 @@ async function processSessionInBackground({
         
         // Use expanded terms for gating (but keep original for logging/reasoning)
         hardTerms = expandedHardTermsArray;
+        
+        // TERM EXPANSION PIPELINE: Expand terms using morphology, locale variants, abbreviations, and LLM synonyms
+        // Industry-agnostic expansion to handle synonyms, regional words, abbreviations, and marketing terms
+        const expansionStart = performance.now();
+        const shouldExpandLLMSynonyms = expandedHardTermsArray.length <= 3 || expandedHardTermsArray.some(t => t.length <= 4); // Expand for short/broad queries
+        const expansionResult = await expandTerms(hardTerms, {
+          shopId: shop.id,
+          contextTerms: [...hardTerms, ...softTerms],
+          includeLLMSynonyms: shouldExpandLLMSynonyms,
+          maxLLMSynonyms: 6, // Up to 6 synonyms per hard term
+        });
+        
+        const expandedHardTermsSet = expansionResult.expandedTerms;
+        const expandedHardTermsList = Array.from(expandedHardTermsSet);
+        const queryTokens = expansionResult.queryTokens;
+        
+        // Also expand soft terms (with fewer synonyms)
+        const softExpansionResult = await expandTerms(softTerms, {
+          shopId: shop.id,
+          contextTerms: [...hardTerms, ...softTerms],
+          includeLLMSynonyms: shouldExpandLLMSynonyms && softTerms.length > 0,
+          maxLLMSynonyms: 4, // Up to 4 synonyms per soft term
+        });
+        const expandedSoftTermsSet = softExpansionResult.expandedTerms;
+        const expandedSoftTermsList = Array.from(expandedSoftTermsSet);
+        
+        const expansionMs = Math.round(performance.now() - expansionStart);
+        console.log(`[Expansion] applied=true hardTerms=[${expansionResult.canonicalTerms.join(", ")}] expandedHard=[${expandedHardTermsList.slice(0, 20).join(", ")}${expandedHardTermsList.length > 20 ? "..." : ""}] softTerms=[${softTerms.join(", ")}] expandedSoft=[${expandedSoftTermsList.slice(0, 15).join(", ")}${expandedSoftTermsList.length > 15 ? "..." : ""}] localePairsUsed=[${expansionResult.localePairsUsed.join(", ")}] abbrevPreserved=[${expansionResult.abbrevPreserved.join(", ")}] queryTokens=[${queryTokens.slice(0, 30).join(", ")}${queryTokens.length > 30 ? "..." : ""}] ms=${expansionMs}`);
+        
+        // Update hardTerms and softTerms with expanded versions for downstream use
+        hardTerms = expandedHardTermsList;
+        softTerms = expandedSoftTermsList;
+        
+        // POST-EXPANSION SMARTFETCH: If scarcity detected, fetch additional products using expanded terms
+        // This helps when initial SmartFetch was too restrictive or didn't use expanded terms
+        const MIN_FETCH_FOR_EXPANSION = 64;
+        const currentCandidateCount = allCandidatesEnriched.length;
+        const minNeededForExpansion = finalResultCount * 8;
+        
+        // Detect signals for field strategy
+        const exactPhraseSignal = queryTokens.some(t => t.includes(" "));
+        const attributeSignal = hasConstraintTerms; // Already detected constraint patterns
+        const broadCategorySignal = expansionResult.canonicalTerms.length <= 2 && expansionResult.canonicalTerms.some(t => t.length <= 6);
+        const scarcitySignal = currentCandidateCount < minNeededForExpansion;
+        
+        const fieldStrategy = determineFieldStrategy({
+          exactPhraseSignal,
+          attributeSignal,
+          broadCategorySignal,
+          scarcitySignal,
+          fetchedCount: currentCandidateCount,
+          minNeeded: minNeededForExpansion,
+        });
+        
+        // If scarcity detected and we have expanded terms, do a post-expansion SmartFetch
+        if (scarcitySignal && expandedHardTermsList.length > 0 && accessToken) {
+          console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${fieldStrategy.reason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion}`);
+          
+          try {
+            const postExpansionSignals = {
+              keywords: expandedHardTermsList.slice(0, 20), // Cap to avoid query bloat
+              selections: [], // Don't use selections for post-expansion (already expanded)
+              hasMeaningfulSignals: true,
+            };
+            
+            let allNewProducts: any[] = [];
+            const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+            
+            // Handle two_pass strategy: Pass 1 (field_restricted) then Pass 2 (broad_text) if needed
+            if (fieldStrategy.strategy === "two_pass") {
+              // Pass 1: field_restricted
+              const pass1Query = buildShopifySearchQuery(
+                postExpansionSignals,
+                500,
+                "field_restricted",
+                expandedHardTermsList.slice(0, 20)
+              );
+              
+              if (pass1Query) {
+                console.log(`[SmartFetch] two_pass pass1 built_query="${pass1Query.substring(0, 200)}${pass1Query.length > 200 ? "..." : ""}"`);
+                const pass1Fetch = await fetchProductsByQueryPaginated(
+                  shopDomain,
+                  accessToken,
+                  pass1Query,
+                  minNeededForExpansion - currentCandidateCount,
+                  200
+                );
+                
+                const pass1New = pass1Fetch.products.filter(p => !existingHandles.has(p.handle));
+                allNewProducts.push(...pass1New);
+                for (const p of pass1New) {
+                  existingHandles.add(p.handle);
+                }
+                
+                console.log(`[SmartFetch] two_pass pass1 fetched=${pass1New.length} total=${allNewProducts.length}`);
+                
+                // Pass 2: broad_text if still insufficient
+                if (allNewProducts.length < (minNeededForExpansion - currentCandidateCount)) {
+                  const pass2Query = buildShopifySearchQuery(
+                    postExpansionSignals,
+                    500,
+                    "broad_text",
+                    expandedHardTermsList.slice(0, 20)
+                  );
+                  
+                  if (pass2Query) {
+                    console.log(`[SmartFetch] two_pass pass2 built_query="${pass2Query.substring(0, 200)}${pass2Query.length > 200 ? "..." : ""}"`);
+                    const pass2Fetch = await fetchProductsByQueryPaginated(
+                      shopDomain,
+                      accessToken,
+                      pass2Query,
+                      minNeededForExpansion - currentCandidateCount - allNewProducts.length,
+                      200
+                    );
+                    
+                    const pass2New = pass2Fetch.products.filter(p => !existingHandles.has(p.handle));
+                    allNewProducts.push(...pass2New);
+                    
+                    console.log(`[SmartFetch] two_pass pass2 fetched=${pass2New.length} total=${allNewProducts.length}`);
+                  }
+                }
+              }
+            } else {
+              // Single pass: use the determined strategy
+              const postExpansionQuery = buildShopifySearchQuery(
+                postExpansionSignals,
+                500,
+                fieldStrategy.strategy,
+                expandedHardTermsList.slice(0, 20)
+              );
+              
+              if (postExpansionQuery) {
+                console.log(`[SmartFetch] post_expansion built_query="${postExpansionQuery.substring(0, 200)}${postExpansionQuery.length > 200 ? "..." : ""}" expanded=true`);
+                
+                const postExpansionFetch = await fetchProductsByQueryPaginated(
+                  shopDomain,
+                  accessToken,
+                  postExpansionQuery,
+                  minNeededForExpansion - currentCandidateCount,
+                  200
+                );
+                
+                const newProducts = postExpansionFetch.products.filter(p => !existingHandles.has(p.handle));
+                allNewProducts.push(...newProducts);
+              }
+            }
+            
+            // Merge all new products into allCandidatesEnriched
+            if (allNewProducts.length > 0) {
+              // Enrich new products (basic enrichment)
+              const newEnriched = allNewProducts.map(p => ({
+                ...p,
+                searchText: extractSearchText(p, indexMetafields),
+              }));
+              
+              allCandidatesEnriched.push(...newEnriched);
+              const sampleTitles = allNewProducts.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
+              console.log(`[SmartFetch] post_expansion fetched=${allNewProducts.length} merged total=${allCandidatesEnriched.length} sample_titles=[${sampleTitles.join(", ")}]`);
+            } else {
+              console.log(`[SmartFetch] post_expansion fetched=0 (no new products)`);
+            }
+          } catch (error) {
+            console.error(`[SmartFetch] post_expansion error:`, error);
+          }
+        } else if (!scarcitySignal) {
+          console.log(`[SmartFetch] post_expansion skipped reason=no_scarcity currentCount=${currentCandidateCount} >= minNeeded=${minNeededForExpansion}`);
+        }
         
         // Merge LLM-extracted facets with variant constraints from answers
         // This ensures we capture both LLM understanding and explicit user selections
@@ -8024,8 +8279,11 @@ async function processSessionInBackground({
       
       // PRIMARY TYPE ANCHOR GATING: Hard filter by primaryTypeAnchor BEFORE ranking
       // Only for single-item queries (not bundles) and when primaryTypeAnchor is selected
+      // SAFETY: If anchor would shrink below minNeeded, use as boost instead of filter
+      let typeAnchorInBoostMode = false; // Track if we're using boost mode
       if (primaryTypeAnchor && !bundleIntent.isBundle && gatedCandidates.length > 0) {
         const beforeTypeAnchor = gatedCandidates.length;
+        const minNeeded = Math.max(MIN_CANDIDATES_FOR_AI, finalResultCount * 2);
         
         // First try exact match with primaryTypeAnchor
         let typeAnchoredCandidates = gatedCandidates.filter(c => 
@@ -8034,7 +8292,7 @@ async function processSessionInBackground({
         
         // If insufficient results, widen within anchor family (morphology/synonyms)
         // Never drop the type anchor - only widen within the anchor family
-        if (typeAnchoredCandidates.length < Math.max(MIN_CANDIDATES_FOR_AI, finalResultCount * 2) && typeAnchorVariants.length > 1) {
+        if (typeAnchoredCandidates.length < minNeeded && typeAnchorVariants.length > 1) {
           console.log(`[TypeAnchor] insufficient_results=${typeAnchoredCandidates.length} widening_within_family variants=[${typeAnchorVariants.join(", ")}]`);
           
           // Include products matching any variant in the anchor family
@@ -8043,9 +8301,22 @@ async function processSessionInBackground({
           );
         }
         
-        gatedCandidates = typeAnchoredCandidates;
-        const afterTypeAnchor = gatedCandidates.length;
-        console.log(`[TypeAnchor] applied=true anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} variants_used=${typeAnchorVariants.length > 1 ? "true" : "false"}`);
+        const afterTypeAnchor = typeAnchoredCandidates.length;
+        
+        // SAFETY CHECK: If anchor would shrink below minNeeded, use as boost instead of filter
+        if (afterTypeAnchor < minNeeded && beforeTypeAnchor >= minNeeded) {
+          // Revert to pre-anchor pool and apply anchor as scoring boost
+          typeAnchorInBoostMode = true; // Set flag for BM25 boost
+          console.log(`[TypeAnchor] mode=boost anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} minNeeded=${minNeeded} reverted=true`);
+          // Keep gatedCandidates unchanged, but we'll boost anchor matches in BM25 ranking
+          // Store anchor info for boosting in ranking phase
+          // (The boost will be applied in the BM25 ranking section below)
+        } else {
+          // Safe to filter: apply anchor filter
+          gatedCandidates = typeAnchoredCandidates;
+          typeAnchorInBoostMode = false;
+          console.log(`[TypeAnchor] mode=filter anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} variants_used=${typeAnchorVariants.length > 1 ? "true" : "false"} reverted=false`);
+        }
       } else if (primaryTypeAnchor && bundleIntent.isBundle) {
         console.log(`[TypeAnchor] skipped=true reason=bundle_mode anchor="${primaryTypeAnchor}"`);
       } else if (!primaryTypeAnchor) {
@@ -8142,6 +8413,10 @@ async function processSessionInBackground({
       // Pre-rank gated candidates with BM25 + boosts
       const bm25StartSingle = performance.now();
       console.log("[App Proxy] [Layer 2] Pre-ranking candidates with BM25");
+      
+      // TypeAnchor boost mode is already determined above (typeAnchorInBoostMode variable)
+      // Use it for BM25 boosting
+      
       const rankedCandidates = gatedCandidates.map(c => {
         const docTokens = tokenize(c.searchText);
         const docTokenFreq = new Map<string, number>();
@@ -8171,6 +8446,14 @@ async function processSessionInBackground({
         for (const boostTerm of boostTerms) {
           if (matchesHardTermWithBoundary(haystack, boostTerm)) {
             score += 1.5; // Boost for collection/multi-piece terms
+          }
+        }
+        
+        // TypeAnchor boost (when in boost mode, not filter mode)
+        if (typeAnchorInBoostMode && primaryTypeAnchor) {
+          if (productMatchesTypeAnchor(c, primaryTypeAnchor) || 
+              (typeAnchorVariants.length > 1 && typeAnchorVariants.some(variant => productMatchesTypeAnchor(c, variant)))) {
+            score += 3.0; // Strong boost for type anchor match when in boost mode
           }
         }
         
