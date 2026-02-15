@@ -4428,6 +4428,33 @@ async function processSessionInBackground({
             console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
             
             try {
+              // Helper function to filter negative matches (industry-agnostic)
+              const filterNegativeMatches = (products: any[], keywords: string[]): any[] => {
+                const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "ohne", "sin"];
+                const meaningfulKeywords = keywords.filter(k => k.length >= 4); // Only meaningful terms
+                
+                return products.filter((p: any) => {
+                  const searchableText = [
+                    p.title || "",
+                    p.productType || "",
+                    (p.tags || []).join(" "),
+                    p.vendor || ""
+                  ].join(" ").toLowerCase();
+                  
+                  // Check for negative patterns with keywords
+                  const hasNegativeMatch = meaningfulKeywords.some(keyword => {
+                    const keywordLower = keyword.toLowerCase();
+                    // Pattern 1: negative indicator + keyword (e.g., "no perfume", "sans parfum")
+                    const pattern1 = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2: keyword + negative indicator (e.g., "perfume free", "parfum sans")
+                    const pattern2 = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                  });
+                  
+                  return !hasNegativeMatch;
+                });
+              };
+              
               // Step A: Targeted fetch
               const stepA = await fetchProductsByQueryPaginated(
                 shopDomain,
@@ -4437,7 +4464,14 @@ async function processSessionInBackground({
                 200
               );
             
-            smartFetchProducts = stepA.products;
+            // Filter negative matches from Step A
+            const stepAFiltered = filterNegativeMatches(stepA.products, fetchSignals.keywords);
+            const stepAFilteredCount = stepA.products.length - stepAFiltered.length;
+            if (stepAFilteredCount > 0) {
+              console.log(`[SmartFetch] stepA filtered_negative_matches=${stepAFilteredCount} remaining=${stepAFiltered.length}`);
+            }
+            
+            smartFetchProducts = stepAFiltered;
             const sampleTitles = stepA.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
             console.log(`[SmartFetch] fetched=${stepA.products.length} sample_titles=[${sampleTitles.join(", ")}]`);
             console.log(`[SmartFetch] query_step=A fetched=${stepA.products.length} totalFetched=${stepA.totalFetched} hadMorePages=${stepA.hasMorePages}`);
@@ -4465,9 +4499,16 @@ async function processSessionInBackground({
                 const sampleTitlesB = stepB.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
                 console.log(`[SmartFetch] fetched=${stepB.products.length} sample_titles=[${sampleTitlesB.join(", ")}]`);
                 
+                // Filter negative matches from Step B
+                const stepBFiltered = filterNegativeMatches(stepB.products, fetchSignals.keywords);
+                const stepBFilteredCount = stepB.products.length - stepBFiltered.length;
+                if (stepBFilteredCount > 0) {
+                  console.log(`[SmartFetch] stepB filtered_negative_matches=${stepBFilteredCount} remaining=${stepBFiltered.length}`);
+                }
+                
                 // Deduplicate
                 const seenHandles = new Set(smartFetchProducts.map((p: any) => p.handle));
-                const newProducts = stepB.products.filter((p: any) => !seenHandles.has(p.handle));
+                const newProducts = stepBFiltered.filter((p: any) => !seenHandles.has(p.handle));
                 smartFetchProducts.push(...newProducts);
                 
                 console.log(`[SmartFetch] widen_step=1 fetchedTotal=${smartFetchProducts.length}`);
@@ -4486,9 +4527,16 @@ async function processSessionInBackground({
                 200
               );
               
+              // Filter negative matches from Step C
+              const stepCFiltered = filterNegativeMatches(stepC.products, fetchSignals.keywords);
+              const stepCFilteredCount = stepC.products.length - stepCFiltered.length;
+              if (stepCFilteredCount > 0) {
+                console.log(`[SmartFetch] stepC filtered_negative_matches=${stepCFilteredCount} remaining=${stepCFiltered.length}`);
+              }
+              
               // Deduplicate
               const seenHandles = new Set(smartFetchProducts.map((p: any) => p.handle));
-              const newProducts = stepC.products.filter((p: any) => !seenHandles.has(p.handle));
+              const newProducts = stepCFiltered.filter((p: any) => !seenHandles.has(p.handle));
               smartFetchProducts.push(...newProducts);
               
               console.log(`[SmartFetch] widen_step=2 fetchedTotal=${smartFetchProducts.length}`);
@@ -6203,8 +6251,48 @@ async function processSessionInBackground({
                 const sampleTitlesItem = itemFetch.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
                 console.log(`[SmartFetch] fetched=${itemFetch.products.length} sample_titles=[${sampleTitlesItem.join(", ")}]`);
                 
+                // Filter out negative matches (industry-agnostic)
+                // Exclude products that mention the itemType in negative contexts (e.g., "perfume free", "no perfume")
+                const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "ohne", "sin"];
+                const itemTypeLower = itemType.toLowerCase();
+                const meaningfulTermsForNegative = meaningfulTerms.filter(term => term.length >= 4); // Only meaningful terms for negative check
+                
+                const filteredProducts = itemFetch.products.filter((p: any) => {
+                  // Build searchable text from product
+                  const searchableText = [
+                    p.title || "",
+                    p.productType || "",
+                    (p.tags || []).join(" "),
+                    p.vendor || ""
+                  ].join(" ").toLowerCase();
+                  
+                  // Check for negative patterns
+                  const hasNegativeMatch = meaningfulTermsForNegative.some(term => {
+                    const termLower = term.toLowerCase();
+                    // Pattern 1: negative indicator + term (e.g., "no perfume", "sans parfum")
+                    const pattern1 = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2: term + negative indicator (e.g., "perfume free", "parfum sans")
+                    const pattern2 = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                  });
+                  
+                  // Also check itemType itself for negative patterns
+                  const itemTypeNegative = negativeIndicators.some(indicator => {
+                    const pattern1 = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    const pattern2 = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
+                    return pattern1.test(searchableText) || pattern2.test(searchableText);
+                  });
+                  
+                  return !hasNegativeMatch && !itemTypeNegative;
+                });
+                
+                const filteredCount = itemFetch.products.length - filteredProducts.length;
+                if (filteredCount > 0) {
+                  console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} filtered_negative_matches=${filteredCount} remaining=${filteredProducts.length}`);
+                }
+                
                 // Tag products with itemType for later filtering
-                const taggedProducts = itemFetch.products.map((p: any) => ({
+                const taggedProducts = filteredProducts.map((p: any) => ({
                   ...p,
                   _bundleItemType: itemType,
                   _bundleItemIndex: itemIdx
@@ -6239,7 +6327,31 @@ async function processSessionInBackground({
                     const sampleTitlesFallback = fallbackFetch.products.slice(0, 5).map((p: any) => p.title || "").filter((t: string) => t.length > 0);
                     console.log(`[SmartFetch] fetched=${fallbackFetch.products.length} sample_titles=[${sampleTitlesFallback.join(", ")}]`);
                     
-                    const fallbackTagged = fallbackFetch.products.map((p: any) => ({
+                    // Filter out negative matches in fallback fetch too (industry-agnostic)
+                    const fallbackFiltered = fallbackFetch.products.filter((p: any) => {
+                      const searchableText = [
+                        p.title || "",
+                        p.productType || "",
+                        (p.tags || []).join(" "),
+                        p.vendor || ""
+                      ].join(" ").toLowerCase();
+                      
+                      // Check itemType for negative patterns
+                      const itemTypeNegative = negativeIndicators.some(indicator => {
+                        const pattern1 = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        const pattern2 = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
+                        return pattern1.test(searchableText) || pattern2.test(searchableText);
+                      });
+                      
+                      return !itemTypeNegative;
+                    });
+                    
+                    const fallbackFilteredCount = fallbackFetch.products.length - fallbackFiltered.length;
+                    if (fallbackFilteredCount > 0) {
+                      console.log(`[BundleRetrieval] itemIndex=${itemIdx} itemType=${itemType} fallback_filtered_negative=${fallbackFilteredCount} remaining=${fallbackFiltered.length}`);
+                    }
+                    
+                    const fallbackTagged = fallbackFiltered.map((p: any) => ({
                       ...p,
                       _bundleItemType: itemType,
                       _bundleItemIndex: itemIdx
