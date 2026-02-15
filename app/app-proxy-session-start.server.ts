@@ -3725,6 +3725,164 @@ async function processSessionInBackground({
   // This will be populated from conversation messages and answers array
   const perItemBudgets: Array<{ itemType: string; itemTerms: string[]; min: number | null; max: number | null; currency: string | null; source: string }> = [];
   
+  // Helper to extract meaningful item terms from text (industry-agnostic)
+  // Removes stopwords and extracts nouns/meaningful phrases before budget indicators
+  function extractItemTerms(text: string): string[] {
+    const stopwords = new Set([
+      "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+      "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
+      "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "these", "those",
+      "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+      "what", "which", "who", "whom", "where", "when", "why", "how", "if", "then", "else",
+      "about", "above", "after", "before", "below", "between", "during", "through", "under", "over",
+      "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
+      "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "such",
+      "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
+      "less", "than", "more", "most", "least", "fewer", "greater"
+    ]);
+    
+    // Remove budget-related words
+    const budgetWords = new Set(["for", "less", "than", "then", "under", "over", "above", "below", "plus", "and", "or"]);
+    
+    // Tokenize and filter
+    const tokens = text.toLowerCase()
+      .split(/\s+/)
+      .map(t => t.replace(/[^\w]/g, ""))
+      .filter(t => t.length >= 2 && !stopwords.has(t) && !budgetWords.has(t) && !/^\d+$/.test(t));
+    
+    // Extract meaningful phrases (2-3 word combinations that might be product types)
+    const phrases: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      // Single meaningful token (3+ chars, not a number)
+      if (tokens[i].length >= 3) {
+        phrases.push(tokens[i]);
+      }
+      // Two-word phrase
+      if (i < tokens.length - 1 && tokens[i].length >= 2 && tokens[i + 1].length >= 2) {
+        phrases.push(`${tokens[i]} ${tokens[i + 1]}`);
+      }
+      // Three-word phrase (for compound product types)
+      if (i < tokens.length - 2 && tokens[i].length >= 2 && tokens[i + 1].length >= 2 && tokens[i + 2].length >= 2) {
+        phrases.push(`${tokens[i]} ${tokens[i + 1]} ${tokens[i + 2]}`);
+      }
+    }
+    
+    // Return unique phrases, prioritizing shorter ones first
+    return Array.from(new Set(phrases)).sort((a, b) => a.length - b.length);
+  }
+  
+  // Issue 2/3 fix: Parse per-item budgets from answers array BEFORE global budget resolution
+  // This handles cases like ["Suit", "Black", "100-250", "Any", "And Shirt For Less Than $50"]
+  // where "100-250" should be treated as a per-item budget for the suit, not a global budget
+  // Industry-agnostic: Uses quiz question metadata to map budgets to items
+  // CRITICAL: This must happen BEFORE global budget resolution (line 3798) so perItemBudgets is populated
+  if (Array.isArray(answers) && answers.length > 0) {
+    // Parse questionsJson to get question metadata (industry-agnostic)
+    let questions: Array<{ type?: string; question?: string; options?: Array<{ value?: string; label?: string }> }> = [];
+    try {
+      if (experience.questionsJson && typeof experience.questionsJson === "string") {
+        questions = JSON.parse(experience.questionsJson);
+      } else if (Array.isArray(experience.questionsJson)) {
+        questions = experience.questionsJson;
+      }
+    } catch (e) {
+      console.warn("[Budget] Failed to parse questionsJson for budget mapping:", e);
+    }
+    
+    // Check if this looks like a bundle query (multiple items mentioned)
+    const answersText = answers.join(" ").toLowerCase();
+    const likelyBundleFromAnswers = /\b(and|&|,)\s+\w+/i.test(answersText) || 
+                                    answers.some((a: any) => typeof a === "string" && /\b(and|&|,)\s+\w+/i.test(String(a)));
+    
+    // If bundle-like, try to parse per-item budgets from answers using question metadata
+    if (likelyBundleFromAnswers) {
+      // Look for range patterns that might be per-item (e.g., "100-250" for first item)
+      for (let i = 0; i < answers.length; i++) {
+        const answerStr = String(answers[i]).trim();
+        
+        // Check if this answer is a range (e.g., "100-250", "100 to 250", "100 and 250") and might be item-specific
+        const rangeMatch = answerStr.match(/^\$?(\d+)[\s\-]+(?:to|and|-)?\s*\$?(\d+)$/i);
+        if (rangeMatch) {
+          const minAmount = parseFloat(rangeMatch[1]);
+          const maxAmount = parseFloat(rangeMatch[2]);
+          
+          // Industry-agnostic: Try to find the item type using question metadata
+          // Look for the question that corresponds to this answer index
+          let itemType: string | null = null;
+          const itemTerms: string[] = [];
+          
+          // Strategy 1: Check if this question is a budget question (has options with price ranges)
+          // If so, look for the previous "What are you looking for" type question
+          const currentQuestion = questions[i];
+          const isBudgetQuestion = currentQuestion && (
+            (currentQuestion.question && /budget|price|cost/i.test(currentQuestion.question)) ||
+            (currentQuestion.options && currentQuestion.options.some((opt: any) => 
+              opt.value && /\d+/.test(String(opt.value))
+            ))
+          );
+          
+          if (isBudgetQuestion) {
+            // Look backwards for product type question (industry-agnostic)
+            for (let j = Math.max(0, i - 3); j < i; j++) {
+              const prevQuestion = questions[j];
+              const prevAnswer = String(answers[j]).trim().toLowerCase();
+              
+              // Skip generic answers and budget answers
+              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
+              
+              // Check if previous question is a product type question (industry-agnostic)
+              const isProductTypeQuestion = prevQuestion && (
+                (prevQuestion.question && /what.*looking|what.*need|what.*want|product|item|type/i.test(prevQuestion.question)) ||
+                (prevQuestion.type === "select" && prevQuestion.options && prevQuestion.options.length > 0)
+              );
+              
+              if (isProductTypeQuestion) {
+                // Extract meaningful terms from the answer to this product type question
+                const terms = extractItemTerms(String(answers[j]));
+                if (terms.length > 0) {
+                  itemType = terms[0];
+                  itemTerms.push(...terms);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Strategy 2: Fallback - look at previous answers for product type (original logic)
+          if (!itemType) {
+            for (let j = Math.max(0, i - 3); j < i; j++) {
+              const prevAnswer = String(answers[j]).trim().toLowerCase();
+              // Skip generic answers
+              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
+              
+              // Extract meaningful terms
+              const terms = extractItemTerms(String(answers[j]));
+              if (terms.length > 0) {
+                itemType = terms[0];
+                itemTerms.push(...terms);
+                break;
+              }
+            }
+          }
+          
+          // If we found an item type, add as per-item budget
+          if (itemType && minAmount > 0 && maxAmount > 0 && minAmount <= maxAmount) {
+            const currency = detectCurrencySymbol(answerStr) || (answerStr.includes("$") ? "USD" : null);
+            perItemBudgets.push({
+              itemType,
+              itemTerms,
+              min: minAmount,
+              max: maxAmount,
+              currency,
+              source: answerStr
+            });
+            console.log(`[Budget] per_item_detected_from_answers itemType=${itemType} min=${minAmount} max=${maxAmount} itemTerms=[${itemTerms.join(", ")}] source="${answerStr}" questionIndex=${i}`);
+          }
+        }
+      }
+    }
+  }
+  
   // Helper to detect currency symbol in answer string
   function detectCurrencySymbol(s: string): string | null {
     if (s.includes("£")) return "GBP";
@@ -3861,53 +4019,7 @@ async function processSessionInBackground({
   // Issue 2/3 fix: Parse per-item budgets from BOTH conversation messages AND answers array (industry-agnostic)
   // Look for patterns like "Suit Less Than $250 and A Shirt Less Than $50" or "100-250" (range for first item)
   // Industry-agnostic: extracts meaningful terms before budget indicators, not hardcoded product types
-  // Note: perItemBudgets is already declared above (before global budget resolution) - do not redeclare
-  
-  // Helper to extract meaningful item terms from text (industry-agnostic)
-  // Removes stopwords and extracts nouns/meaningful phrases before budget indicators
-  function extractItemTerms(text: string): string[] {
-    const stopwords = new Set([
-      "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
-      "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
-      "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "these", "those",
-      "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
-      "what", "which", "who", "whom", "where", "when", "why", "how", "if", "then", "else",
-      "about", "above", "after", "before", "below", "between", "during", "through", "under", "over",
-      "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
-      "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "such",
-      "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
-      "less", "than", "more", "most", "least", "fewer", "greater"
-    ]);
-    
-    // Remove budget-related words
-    const budgetWords = new Set(["for", "less", "than", "under", "over", "above", "below", "plus", "and", "or"]);
-    
-    // Tokenize and filter
-    const tokens = text.toLowerCase()
-      .split(/\s+/)
-      .map(t => t.replace(/[^\w]/g, ""))
-      .filter(t => t.length >= 2 && !stopwords.has(t) && !budgetWords.has(t) && !/^\d+$/.test(t));
-    
-    // Extract meaningful phrases (2-3 word combinations that might be product types)
-    const phrases: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      // Single meaningful token (3+ chars, not a number)
-      if (tokens[i].length >= 3) {
-        phrases.push(tokens[i]);
-      }
-      // Two-word phrase
-      if (i < tokens.length - 1 && tokens[i].length >= 2 && tokens[i + 1].length >= 2) {
-        phrases.push(`${tokens[i]} ${tokens[i + 1]}`);
-      }
-      // Three-word phrase (for compound product types)
-      if (i < tokens.length - 2 && tokens[i].length >= 2 && tokens[i + 1].length >= 2 && tokens[i + 2].length >= 2) {
-        phrases.push(`${tokens[i]} ${tokens[i + 1]} ${tokens[i + 2]}`);
-      }
-    }
-    
-    // Return unique phrases, prioritizing shorter ones first
-    return Array.from(new Set(phrases)).sort((a, b) => a.length - b.length);
-  }
+  // Note: extractItemTerms function is already defined above (before global budget resolution)
   
   // Parse per-item budgets from conversation messages
   if (conversationMessages && conversationMessages.length > 0) {
@@ -3925,8 +4037,9 @@ async function processSessionInBackground({
           if (partTrimmed.length === 0) continue;
           
           // Try to extract item type and budget from this part
-          // Pattern 1: "itemType [for] less than $amount" or "itemType [for] under $amount"
-          const lessThanMatch = partTrimmed.match(/(.+?)\s+(?:for\s+)?(?:less\s+than|under)\s+\$?(\d+)/i);
+          // Pattern 1: "itemType [for] less than/then $amount" or "itemType [for] under $amount" (industry-agnostic)
+          // Note: Handles typo "less then" as well as "less than"
+          const lessThanMatch = partTrimmed.match(/(.+?)\s+(?:for\s+)?(?:less\s+(?:than|then)|under)\s+\$?(\d+)/i);
           if (lessThanMatch) {
             const itemPart = lessThanMatch[1].trim();
             const amount = parseFloat(lessThanMatch[2]);
@@ -3999,117 +4112,6 @@ async function processSessionInBackground({
               });
               console.log(`[Budget] per_item_detected itemType=${primaryItemType} max=${amount} itemTerms=[${itemTerms.join(", ")}] source="${partTrimmed.substring(0, 50)}"`);
             }
-          }
-        }
-      }
-    }
-  }
-  
-  // Issue 3 fix: Also parse per-item budgets from answers array (for guided quiz/hybrid mode)
-  // This handles cases like ["Suit", "Black", "100-250", "Any", "And Shirt For Less Than $50"]
-  // where "100-250" should be treated as a per-item budget for the suit, not a global budget
-  // Industry-agnostic: Uses quiz question metadata to map budgets to items
-  if (Array.isArray(answers) && answers.length > 0) {
-    // Parse questionsJson to get question metadata (industry-agnostic)
-    let questions: Array<{ type?: string; question?: string; options?: Array<{ value?: string; label?: string }> }> = [];
-    try {
-      if (experience.questionsJson && typeof experience.questionsJson === "string") {
-        questions = JSON.parse(experience.questionsJson);
-      } else if (Array.isArray(experience.questionsJson)) {
-        questions = experience.questionsJson;
-      }
-    } catch (e) {
-      console.warn("[Budget] Failed to parse questionsJson for budget mapping:", e);
-    }
-    
-    // Check if this looks like a bundle query (multiple items mentioned)
-    const answersText = answers.join(" ").toLowerCase();
-    const likelyBundleFromAnswers = /\b(and|&|,)\s+\w+/i.test(answersText) || 
-                                    answers.some((a: any) => typeof a === "string" && /\b(and|&|,)\s+\w+/i.test(String(a)));
-    
-    // If bundle-like, try to parse per-item budgets from answers using question metadata
-    if (likelyBundleFromAnswers) {
-      // Look for range patterns that might be per-item (e.g., "100-250" for first item)
-      for (let i = 0; i < answers.length; i++) {
-        const answerStr = String(answers[i]).trim();
-        
-        // Check if this answer is a range (e.g., "100-250", "100 to 250", "100 and 250") and might be item-specific
-        const rangeMatch = answerStr.match(/^\$?(\d+)[\s\-]+(?:to|and|-)?\s*\$?(\d+)$/i);
-        if (rangeMatch) {
-          const minAmount = parseFloat(rangeMatch[1]);
-          const maxAmount = parseFloat(rangeMatch[2]);
-          
-          // Industry-agnostic: Try to find the item type using question metadata
-          // Look for the question that corresponds to this answer index
-          let itemType: string | null = null;
-          const itemTerms: string[] = [];
-          
-          // Strategy 1: Check if this question is a budget question (has options with price ranges)
-          // If so, look for the previous "What are you looking for" type question
-          const currentQuestion = questions[i];
-          const isBudgetQuestion = currentQuestion && (
-            (currentQuestion.question && /budget|price|cost/i.test(currentQuestion.question)) ||
-            (currentQuestion.options && currentQuestion.options.some((opt: any) => 
-              opt.value && /\d+/.test(String(opt.value))
-            ))
-          );
-          
-          if (isBudgetQuestion) {
-            // Look backwards for product type question (industry-agnostic)
-            for (let j = Math.max(0, i - 3); j < i; j++) {
-              const prevQuestion = questions[j];
-              const prevAnswer = String(answers[j]).trim().toLowerCase();
-              
-              // Skip generic answers and budget answers
-              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
-              
-              // Check if previous question is a product type question (industry-agnostic)
-              const isProductTypeQuestion = prevQuestion && (
-                (prevQuestion.question && /what.*looking|what.*need|what.*want|product|item|type/i.test(prevQuestion.question)) ||
-                (prevQuestion.type === "select" && prevQuestion.options && prevQuestion.options.length > 0)
-              );
-              
-              if (isProductTypeQuestion) {
-                // Extract meaningful terms from the answer to this product type question
-                const terms = extractItemTerms(String(answers[j]));
-                if (terms.length > 0) {
-                  itemType = terms[0];
-                  itemTerms.push(...terms);
-                  break;
-                }
-              }
-            }
-          }
-          
-          // Strategy 2: Fallback - look at previous answers for product type (original logic)
-          if (!itemType) {
-            for (let j = Math.max(0, i - 3); j < i; j++) {
-              const prevAnswer = String(answers[j]).trim().toLowerCase();
-              // Skip generic answers
-              if (prevAnswer === "any" || prevAnswer === "all" || /^\d+/.test(prevAnswer)) continue;
-              
-              // Extract meaningful terms
-              const terms = extractItemTerms(String(answers[j]));
-              if (terms.length > 0) {
-                itemType = terms[0];
-                itemTerms.push(...terms);
-                break;
-              }
-            }
-          }
-          
-          // If we found an item type, add as per-item budget
-          if (itemType && minAmount > 0 && maxAmount > 0 && minAmount <= maxAmount) {
-            const currency = detectCurrencySymbol(answerStr) || (answerStr.includes("$") ? "USD" : null);
-            perItemBudgets.push({
-              itemType,
-              itemTerms,
-              min: minAmount,
-              max: maxAmount,
-              currency,
-              source: answerStr
-            });
-            console.log(`[Budget] per_item_detected_from_answers itemType=${itemType} min=${minAmount} max=${maxAmount} itemTerms=[${itemTerms.join(", ")}] source="${answerStr}" questionIndex=${i}`);
           }
         }
       }
@@ -4803,6 +4805,17 @@ async function processSessionInBackground({
       // Use enrichedCandidates for all subsequent operations
       let allCandidatesEnriched: EnrichedCandidate[] = enrichedCandidates;
       
+      // Build Type Lexicon from Shopify catalog (Primary Item-Type Anchor)
+      const { 
+        buildTypeLexicon, 
+        parseTypeTermsVsAttributes, 
+        selectPrimaryTypeAnchor,
+        productMatchesTypeAnchor,
+        generateTypeAnchorVariants
+      } = await import("~/utils/type-lexicon.server");
+      const typeLexicon = buildTypeLexicon(enrichedCandidates);
+      console.log(`[TypeAnchor] lexicon_size=${typeLexicon.size} sample_terms=[${Array.from(typeLexicon).slice(0, 10).join(", ")}]`);
+      
       // Discover facet vocabulary from candidate pool (industry-agnostic)
       const { discoverFacetVocabulary, normalizeOptionName } = await import("~/utils/facets.server");
       const facetVocabulary = discoverFacetVocabulary(enrichedCandidates);
@@ -4889,6 +4902,21 @@ async function processSessionInBackground({
       // Try LLM intent parsing
       const llmIntentResult = await parseIntentWithLLM(userIntent, conversationHistoryForIntent);
       intentParseCallCount = llmIntentResult.fallbackUsed ? 0 : 1; // Track if LLM was used (not fallback)
+      
+      // Parse user text into type terms vs attribute terms (Primary Item-Type Anchor)
+      const typeParseResult = parseTypeTermsVsAttributes(userIntent, typeLexicon);
+      console.log(`[TypeAnchor] parsed type_terms=[${typeParseResult.typeTerms.join(", ")}] attribute_terms=[${typeParseResult.attributeTerms.join(", ")}]`);
+      
+      // Select primary type anchor for single-item queries (not bundles)
+      let primaryTypeAnchor: string | null = null;
+      let typeAnchorVariants: string[] = [];
+      if (!llmIntentResult.intent?.isBundle && typeParseResult.typeTerms.length > 0) {
+        primaryTypeAnchor = selectPrimaryTypeAnchor(typeParseResult.typeTerms, typeParseResult.typeTermMatches);
+        if (primaryTypeAnchor) {
+          typeAnchorVariants = generateTypeAnchorVariants(primaryTypeAnchor, typeLexicon);
+          console.log(`[TypeAnchor] selected_anchor="${primaryTypeAnchor}" variants=[${typeAnchorVariants.join(", ")}]`);
+        }
+      }
       
       if (llmIntentResult.success && llmIntentResult.intent) {
         // Use LLM-parsed intent
@@ -6865,7 +6893,8 @@ async function processSessionInBackground({
       // STEP 3: Apply facet gating with fallback matching for missing structured facets
       let gatedCandidates: EnrichedCandidate[] = allCandidatesEnriched.filter(c => {
         // Helper to check if a facet value matches (structured OR indexedText fallback)
-        const checkFacetMatch = (facetValue: string | null, structuredValues: string[], indexedText: string): boolean => {
+        // For color constraints: also check variants - do NOT reject products if any variant matches
+        const checkFacetMatch = (facetValue: string | null, structuredValues: string[], indexedText: string, facetName: string, candidate: EnrichedCandidate): boolean => {
           if (!facetValue) return true; // No constraint
           
           // First try structured matching
@@ -6878,6 +6907,28 @@ async function processSessionInBackground({
                      normalizedFacet.includes(normalizedVal);
             });
             if (hasStructuredMatch) return true;
+          }
+          
+          // For color constraints: check variants if product-level doesn't match
+          // Do NOT reject products at product-level if any variant matches
+          if (facetName === "color" && Array.isArray(candidate.variants)) {
+            const normalizedFacet = normalizeText(facetValue);
+            for (const variant of candidate.variants) {
+              if (Array.isArray(variant.selectedOptions)) {
+                for (const option of variant.selectedOptions) {
+                  const normalizedOptionName = normalizeOptionName(option.name || "");
+                  if (normalizedOptionName === "color" && option.value) {
+                    const normalizedVal = normalizeText(option.value);
+                    if (normalizedVal === normalizedFacet ||
+                        normalizedVal.includes(normalizedFacet) ||
+                        normalizedFacet.includes(normalizedVal)) {
+                      console.log(`[VariantMatch] product=${candidate.handle} variant_color="${option.value}" matches_constraint="${facetValue}"`);
+                      return true; // Variant matches - keep product
+                    }
+                  }
+                }
+              }
+            }
           }
           
           // Fallback: check indexedText if structured facet is missing
@@ -6930,31 +6981,32 @@ async function processSessionInBackground({
         // Check ALL enforced constraints (industry-agnostic: works for any facet type)
         for (const [facetName, constraintValue] of enforcedConstraints.entries()) {
           const structuredValues = getStructuredValuesForFacet(c, facetName);
-          if (!checkFacetMatch(constraintValue, structuredValues, indexedText)) {
+          if (!checkFacetMatch(constraintValue, structuredValues, indexedText, facetName, c)) {
             return false;
           }
         }
         
         // Legacy: Also check enforcedFacets for backwards compatibility (size/color/material)
         if (enforcedFacets.size) {
-          if (!checkFacetMatch(enforcedFacets.size, c.sizes || [], indexedText)) {
+          if (!checkFacetMatch(enforcedFacets.size, c.sizes || [], indexedText, "size", c)) {
             return false;
           }
         }
         
         if (enforcedFacets.color) {
-          if (!checkFacetMatch(enforcedFacets.color, c.colors || [], indexedText)) {
+          if (!checkFacetMatch(enforcedFacets.color, c.colors || [], indexedText, "color", c)) {
             return false;
           }
         }
         
         if (enforcedFacets.material) {
-          if (!checkFacetMatch(enforcedFacets.material, c.materials || [], indexedText)) {
+          if (!checkFacetMatch(enforcedFacets.material, c.materials || [], indexedText, "material", c)) {
             return false;
           }
         }
         
         // Check allowValues (OR logic) with fallback - industry-agnostic: works for any facet type
+        // For color constraints: also check variants - do NOT reject products if any variant matches
         const allowValues = variantConstraints2.allowValues;
         
         if (allowValues) {
@@ -6970,7 +7022,7 @@ async function processSessionInBackground({
             const structuredValues = getStructuredValuesForFacet(c, normalizedFacetName);
             
             // Check if any allowed value matches (structured OR indexedText)
-            const hasMatch = structuredValues.some((val: string) => 
+            let hasMatch = structuredValues.some((val: string) => 
               allowedValues.some(allowedValue => {
                 const normalizedVal = normalizeText(val);
                 const normalizedAllowed = normalizeText(allowedValue);
@@ -6981,6 +7033,32 @@ async function processSessionInBackground({
             ) || allowedValues.some(allowedValue => 
               indexedText.includes(normalizeText(allowedValue))
             );
+            
+            // For color constraints: also check variants if product-level doesn't match
+            if (!hasMatch && normalizedFacetName === "color" && Array.isArray(c.variants)) {
+              for (const variant of c.variants) {
+                if (Array.isArray(variant.selectedOptions)) {
+                  for (const option of variant.selectedOptions) {
+                    const normalizedOptionName = normalizeOptionName(option.name || "");
+                    if (normalizedOptionName === "color" && option.value) {
+                      const normalizedVal = normalizeText(option.value);
+                      const variantHasMatch = allowedValues.some((allowed: string) => {
+                        const normalizedAllowed = normalizeText(allowed);
+                        return normalizedVal === normalizedAllowed ||
+                               normalizedVal.includes(normalizedAllowed) ||
+                               normalizedAllowed.includes(normalizedVal);
+                      });
+                      if (variantHasMatch) {
+                        console.log(`[VariantMatch] product=${c.handle} variant_color="${option.value}" matches_allowValues=[${allowedValues.join(", ")}]`);
+                        hasMatch = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (hasMatch) break;
+              }
+            }
             
             if (!hasMatch) return false;
           }
@@ -7656,6 +7734,36 @@ async function processSessionInBackground({
         console.log(`[Gating] mode=${modeUsed} flow=single anchor_terms_empty=true (skipping anchor filter)`);
       } else if (!isStageA && !isBundleFlow && hardTerms.length > 0) {
         console.log(`[Gating] mode=${modeUsed} flow=single anchor_terms=[${hardTerms.join(", ")}] (already applied in staged fallback, skipping anchor filter)`);
+      }
+      
+      // PRIMARY TYPE ANCHOR GATING: Hard filter by primaryTypeAnchor BEFORE ranking
+      // Only for single-item queries (not bundles) and when primaryTypeAnchor is selected
+      if (primaryTypeAnchor && !bundleIntent.isBundle && gatedCandidates.length > 0) {
+        const beforeTypeAnchor = gatedCandidates.length;
+        
+        // First try exact match with primaryTypeAnchor
+        let typeAnchoredCandidates = gatedCandidates.filter(c => 
+          productMatchesTypeAnchor(c, primaryTypeAnchor)
+        );
+        
+        // If insufficient results, widen within anchor family (morphology/synonyms)
+        // Never drop the type anchor - only widen within the anchor family
+        if (typeAnchoredCandidates.length < Math.max(MIN_CANDIDATES_FOR_AI, finalResultCount * 2) && typeAnchorVariants.length > 1) {
+          console.log(`[TypeAnchor] insufficient_results=${typeAnchoredCandidates.length} widening_within_family variants=[${typeAnchorVariants.join(", ")}]`);
+          
+          // Include products matching any variant in the anchor family
+          typeAnchoredCandidates = gatedCandidates.filter(c => 
+            typeAnchorVariants.some(variant => productMatchesTypeAnchor(c, variant))
+          );
+        }
+        
+        gatedCandidates = typeAnchoredCandidates;
+        const afterTypeAnchor = gatedCandidates.length;
+        console.log(`[TypeAnchor] applied=true anchor="${primaryTypeAnchor}" before=${beforeTypeAnchor} after=${afterTypeAnchor} variants_used=${typeAnchorVariants.length > 1 ? "true" : "false"}`);
+      } else if (primaryTypeAnchor && bundleIntent.isBundle) {
+        console.log(`[TypeAnchor] skipped=true reason=bundle_mode anchor="${primaryTypeAnchor}"`);
+      } else if (!primaryTypeAnchor) {
+        console.log(`[TypeAnchor] skipped=true reason=no_anchor_selected`);
       }
       
       // Filter avoid terms (penalty/filter) - use extractSearchText for consistency
@@ -10944,7 +11052,21 @@ async function processSessionInBackground({
       // Enforce intent-safe top-up: when trustFallback=false, ONLY use gated pool
       // Convert hardFacets to constraints for constraint checking
       const { convertHardFacetsToConstraints } = await import("~/utils/facets.server");
-      const topUpConstraints = convertHardFacetsToConstraints(hardFacets);
+      let topUpConstraints = convertHardFacetsToConstraints(hardFacets);
+      
+      // Issue 1 fix: Filter out degraded facets from top-up constraints
+      if (degradedFacetsMap && degradedFacetsMap.size > 0) {
+        const beforeCount = topUpConstraints.length;
+        topUpConstraints = topUpConstraints.filter(c => {
+          const facetNameLower = c.key.toLowerCase();
+          const isDegraded = degradedFacetsMap.has(facetNameLower);
+          return !isDegraded;
+        });
+        if (topUpConstraints.length < beforeCount) {
+          const degradedList = Array.from(degradedFacetsMap.keys()).join(",");
+          console.log(`[TopUp] degradedFacets filtered=${degradedList} before=${beforeCount} after=${topUpConstraints.length}`);
+        }
+      }
       
       if (!trustFallback) {
         // Intent-safe: top-up ONLY from gated candidates (no drift allowed)
