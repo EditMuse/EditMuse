@@ -1136,8 +1136,12 @@ function buildShopifySearchQuery(
           `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
         );
       } else {
-        // broad_text: no field qualifiers, let Shopify search across all fields
-        tokenClauses.push(escaped);
+        // broad_text: still use field qualifiers (Shopify API requires them)
+        // But we can include more fields or use a broader search pattern
+        // For now, use same field qualifiers as field_restricted (Shopify Admin API limitation)
+        tokenClauses.push(
+          `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
+        );
       }
     }
   }
@@ -1158,8 +1162,10 @@ function buildShopifySearchQuery(
           `(title:${quotedPhrase} OR product_type:${quotedPhrase} OR tag:${quotedPhrase} OR vendor:${quotedPhrase})`
         );
       } else {
-        // broad_text: no field qualifiers
-        tokenClauses.push(quotedPhrase);
+        // broad_text: still use field qualifiers (Shopify API requires them)
+        tokenClauses.push(
+          `(title:${quotedPhrase} OR product_type:${quotedPhrase} OR tag:${quotedPhrase} OR vendor:${quotedPhrase})`
+        );
       }
     }
   }
@@ -5437,9 +5443,43 @@ async function processSessionInBackground({
             material: existingFacets?.material || null
           };
           
+          // FIRST: Check if hardTerms form a multi-word phrase (e.g., "face cream", "running shoes")
+          // If so, use it as canonicalType and don't extract individual terms as facets
+          let multiWordPhrase: string | null = null;
+          if (hardTerms.length >= 2) {
+            // Try consecutive combinations to form phrases
+            for (let i = 0; i < hardTerms.length - 1; i++) {
+              const phrase = `${hardTerms[i]} ${hardTerms[i + 1]}`.toLowerCase();
+              const phraseNormalized = normalizeFacetValue(phrase);
+              // Check if phrase is NOT a known facet value (if it is, it's probably not a product type)
+              const isPhraseAFacet = 
+                discoveredColorValues.has(phraseNormalized) ||
+                discoveredSizeValues.has(phraseNormalized) ||
+                discoveredMaterialValues.has(phraseNormalized) ||
+                colorTerms.has(phraseNormalized) ||
+                sizeTerms.has(phraseNormalized) ||
+                materialTerms.has(phraseNormalized);
+              
+              // If phrase is long enough and not a facet, it's likely a product type
+              if (!isPhraseAFacet && phrase.length >= 6) {
+                multiWordPhrase = phrase;
+                break; // Use first valid phrase
+              }
+            }
+          }
+          
           // Extract facets from hardTerms using discovered vocabulary
+          // BUT: if we found a multi-word phrase, exclude those terms from facet extraction
           const remainingTerms: string[] = [];
+          const phraseTerms = multiWordPhrase ? multiWordPhrase.split(/\s+/) : [];
+          
           for (const term of hardTerms) {
+            const termLower = term.toLowerCase();
+            // Skip terms that are part of the multi-word phrase
+            if (multiWordPhrase && phraseTerms.includes(termLower)) {
+              continue; // Don't extract as facet if it's part of product type phrase
+            }
+            
             const normalized = normalizeFacetValue(term);
             let isFacet = false;
             
@@ -5460,10 +5500,12 @@ async function processSessionInBackground({
             }
           }
           
-          // Canonical type is the longest remaining term (likely the head noun)
-          // If no terms remain, use the first hardTerm as fallback
+          // Canonical type: prefer multi-word phrase, then longest remaining term
           let canonicalType = "unknown";
-          if (remainingTerms.length > 0) {
+          if (multiWordPhrase) {
+            // Use the multi-word phrase as canonicalType
+            canonicalType = normalizeItemLabel(multiWordPhrase);
+          } else if (remainingTerms.length > 0) {
             // Prefer longer terms (more specific nouns)
             canonicalType = remainingTerms.reduce((longest, current) => 
               current.length > longest.length ? current : longest, remainingTerms[0]
