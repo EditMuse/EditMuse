@@ -4611,13 +4611,56 @@ async function processSessionInBackground({
       } else {
       console.log("[App Proxy] Fetching products from Shopify Admin API (two-stage fetch)");
       
-        // STAGE 1: First fetch (200 products) - existing generic fetch
-        products = await fetchShopifyProducts({
-        shopDomain,
-        accessToken,
-        limit: PRODUCT_POOL_LIMIT_FIRST,
-        collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-      });
+        // Industry-agnostic: Try query-based search first, even if SmartFetch is disabled
+        // This ensures we search for relevant products, not random ones
+        if (fetchSignals.keywords.length > 0 || fetchSignals.selections.length > 0) {
+          // Build query using available signals (even if not "meaningful" enough for SmartFetch)
+          const fallbackQuery = buildShopifySearchQuery(fetchSignals, 500, "field_restricted");
+          
+          if (fallbackQuery && accessToken) {
+            console.log(`[App Proxy] Using query-based fetch (SmartFetch disabled but keywords available) query="${fallbackQuery.substring(0, 200)}${fallbackQuery.length > 200 ? "..." : ""}"`);
+            
+            try {
+              const queryFetch = await fetchProductsByQueryPaginated(
+                shopDomain,
+                accessToken,
+                fallbackQuery,
+                PRODUCT_POOL_LIMIT_FIRST,
+                200
+              );
+              
+              products = queryFetch.products;
+              console.log(`[App Proxy] Query-based fetch returned ${products.length} products`);
+            } catch (error) {
+              console.error(`[App Proxy] Query-based fetch error, falling back to collection-based fetch:`, error);
+              // Fall back to collection-based fetch if query fails
+              products = await fetchShopifyProducts({
+                shopDomain,
+                accessToken,
+                limit: PRODUCT_POOL_LIMIT_FIRST,
+                collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+              });
+            }
+          } else {
+            // No query possible - use collection-based fetch (better than random)
+            console.log(`[App Proxy] No query possible - using collection-based fetch`);
+            products = await fetchShopifyProducts({
+              shopDomain,
+              accessToken,
+              limit: PRODUCT_POOL_LIMIT_FIRST,
+              collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+            });
+          }
+        } else {
+          // No keywords at all - use collection-based fetch (better than random)
+          console.log(`[App Proxy] No keywords available - using collection-based fetch`);
+          products = await fetchShopifyProducts({
+            shopDomain,
+            accessToken,
+            limit: PRODUCT_POOL_LIMIT_FIRST,
+            collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+          });
+        }
       }
 
       const firstFetchCount = products.length;
@@ -4653,39 +4696,56 @@ async function processSessionInBackground({
         return true;
       });
       
-      // Issue 1 fix: Single-item fallback - if SmartFetch returned insufficient products, do broader fallback BEFORE filtering/enrichment
+      // Issue 1 fix: Single-item fallback - if SmartFetch returned insufficient products, do broader QUERY-BASED fallback BEFORE filtering/enrichment
+      // Industry-agnostic: Always use query terms to search, never fetch random products
       // Only for single-item mode (bundle mode has its own per-item retrieval)
-      if (usingSmartFetch && products.length < finalResultCount * 8 && !likelyBundle && accessToken) {
+      if (usingSmartFetch && products.length < finalResultCount * 8 && !likelyBundle && accessToken && fetchSignals.hasMeaningfulSignals) {
         console.log(`[SmartFetch] single_item_fallback triggered product_count=${products.length} min_needed=${finalResultCount * 8} reason=insufficient_before_filtering`);
         
         try {
-          // Broader fallback: fetch generic pool (no query constraints)
-          const fallbackProducts = await fetchShopifyProducts({
-            shopDomain,
-            accessToken,
-            limit: PRODUCT_POOL_LIMIT_FIRST,
-            collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-          });
+          // Industry-agnostic: Use query-based search with broader strategy (broad_text) to find more relevant products
+          // This ensures we search for products matching the query, not random products
+          const fallbackQuery = buildShopifySearchQuery(fetchSignals, 500, "broad_text");
           
-          // Merge with existing products (avoid duplicates)
-          const existingHandles = new Set(products.map((p: any) => p.handle));
-          const newFallbackProducts = fallbackProducts.filter((p: any) => !existingHandles.has(p.handle));
-          
-          if (newFallbackProducts.length > 0) {
-            products = [...products, ...newFallbackProducts];
-            console.log(`[SmartFetch] single_item_fallback merged=${newFallbackProducts.length} total_products=${products.length} BEFORE_filtering`);
+          if (fallbackQuery) {
+            console.log(`[SmartFetch] single_item_fallback query="${fallbackQuery.substring(0, 200)}${fallbackQuery.length > 200 ? "..." : ""}" strategy=broad_text`);
             
-            // Re-deduplicate after merge
-            const seenAfterFallback = new Set<string>();
-            products = products.filter(p => {
-              if (seenAfterFallback.has(p.handle)) return false;
-              seenAfterFallback.add(p.handle);
-              return true;
-            });
+            // Fetch products using query-based search (industry-agnostic)
+            const fallbackFetch = await fetchProductsByQueryPaginated(
+              shopDomain,
+              accessToken,
+              fallbackQuery,
+              Math.max(finalResultCount * 8 - products.length, 200), // Fetch enough to meet min_needed
+              200
+            );
+            
+            // Merge with existing products (avoid duplicates)
+            const existingHandles = new Set(products.map((p: any) => p.handle));
+            const newFallbackProducts = fallbackFetch.products.filter((p: any) => !existingHandles.has(p.handle));
+            
+            if (newFallbackProducts.length > 0) {
+              products = [...products, ...newFallbackProducts];
+              console.log(`[SmartFetch] single_item_fallback query_based_fetch=${fallbackFetch.products.length} new=${newFallbackProducts.length} merged_total=${products.length} BEFORE_filtering`);
+              
+              // Re-deduplicate after merge
+              const seenAfterFallback = new Set<string>();
+              products = products.filter(p => {
+                if (seenAfterFallback.has(p.handle)) return false;
+                seenAfterFallback.add(p.handle);
+                return true;
+              });
+            } else {
+              console.log(`[SmartFetch] single_item_fallback query_based_fetch=${fallbackFetch.products.length} new=0 (all duplicates or no matches)`);
+            }
+          } else {
+            console.warn(`[SmartFetch] single_item_fallback could_not_build_query - skipping fallback (no random products will be fetched)`);
           }
         } catch (error) {
           console.error(`[SmartFetch] single_item_fallback error:`, error);
         }
+      } else if (usingSmartFetch && products.length < finalResultCount * 8 && !likelyBundle && accessToken && !fetchSignals.hasMeaningfulSignals) {
+        // Edge case: No meaningful signals - cannot build query, so skip fallback (better than random products)
+        console.warn(`[SmartFetch] single_item_fallback skipped - no meaningful signals to build query (will not fetch random products)`);
       }
       
       // Merge bundle fetch products (if any were fetched before this point)
@@ -4779,16 +4839,59 @@ async function processSessionInBackground({
       const minNeededAfterFilter = finalResultCount * 8;
 
       // STAGE 2: Fetch additional products if needed (only for generic fetch, not smart fetch)
+      // Industry-agnostic: Use query-based search, not random products
       if (!usingSmartFetch && firstStageFilteredCount < minNeededAfterFilter && mightHaveMorePages && products.length < PRODUCT_POOL_LIMIT_MAX) {
-        console.log("[App Proxy] Filtered candidates", firstStageFilteredCount, "<", minNeededAfterFilter, "- fetching up to", PRODUCT_POOL_LIMIT_MAX, "total products");
+        console.log("[App Proxy] Filtered candidates", firstStageFilteredCount, "<", minNeededAfterFilter, "- fetching more products using query-based search");
         
-        // Fetch up to max limit (will fetch from beginning, but we'll deduplicate)
-        const allProducts = await fetchShopifyProducts({
-          shopDomain,
-          accessToken,
-          limit: PRODUCT_POOL_LIMIT_MAX,
-          collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-        });
+        // Try query-based search first (industry-agnostic)
+        let allProducts: any[] = [];
+        if (fetchSignals.keywords.length > 0 || fetchSignals.selections.length > 0) {
+          const secondStageQuery = buildShopifySearchQuery(fetchSignals, 500, "broad_text"); // Use broader strategy for second fetch
+          
+          if (secondStageQuery && accessToken) {
+            console.log(`[App Proxy] Stage 2 query-based fetch query="${secondStageQuery.substring(0, 200)}${secondStageQuery.length > 200 ? "..." : ""}"`);
+            
+            try {
+              const secondStageFetch = await fetchProductsByQueryPaginated(
+                shopDomain,
+                accessToken,
+                secondStageQuery,
+                PRODUCT_POOL_LIMIT_MAX - products.length, // Fetch enough to reach max limit
+                200
+              );
+              
+              allProducts = secondStageFetch.products;
+              console.log(`[App Proxy] Stage 2 query-based fetch returned ${allProducts.length} products`);
+            } catch (error) {
+              console.error(`[App Proxy] Stage 2 query-based fetch error, falling back to collection-based fetch:`, error);
+              // Fall back to collection-based fetch if query fails
+              allProducts = await fetchShopifyProducts({
+                shopDomain,
+                accessToken,
+                limit: PRODUCT_POOL_LIMIT_MAX,
+                collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+              });
+            }
+          } else {
+            // No query possible - use collection-based fetch (better than random)
+            console.log(`[App Proxy] Stage 2 no query possible - using collection-based fetch`);
+            allProducts = await fetchShopifyProducts({
+              shopDomain,
+              accessToken,
+              limit: PRODUCT_POOL_LIMIT_MAX,
+              collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+            });
+          }
+        } else {
+          // No keywords - use collection-based fetch (better than random)
+          console.log(`[App Proxy] Stage 2 no keywords - using collection-based fetch`);
+          allProducts = await fetchShopifyProducts({
+            shopDomain,
+            accessToken,
+            limit: PRODUCT_POOL_LIMIT_MAX,
+            collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+          });
+        }
 
         const secondFetchCount = allProducts.length;
         console.log("[App Proxy] Second fetch:", secondFetchCount, "total products (will deduplicate)");
@@ -5358,25 +5461,25 @@ async function processSessionInBackground({
         
         // TERM EXPANSION PIPELINE: Expand terms using morphology, locale variants, abbreviations, and LLM synonyms
         // Industry-agnostic expansion to handle synonyms, regional words, abbreviations, and marketing terms
+        // ALWAYS enable LLM synonyms for thoroughness (cost not a concern)
         const expansionStart = performance.now();
-        const shouldExpandLLMSynonyms = expandedHardTermsArray.length <= 3 || expandedHardTermsArray.some(t => t.length <= 4); // Expand for short/broad queries
         const expansionResult = await expandTerms(hardTerms, {
           shopId: shop.id,
           contextTerms: [...hardTerms, ...softTerms],
-          includeLLMSynonyms: shouldExpandLLMSynonyms,
-          maxLLMSynonyms: 6, // Up to 6 synonyms per hard term
+          includeLLMSynonyms: true, // Always enable for thoroughness
+          maxLLMSynonyms: 12, // Increased to 12 synonyms per hard term for thoroughness
         });
         
         const expandedHardTermsSet = expansionResult.expandedTerms;
         const expandedHardTermsList = Array.from(expandedHardTermsSet);
         const queryTokens = expansionResult.queryTokens;
         
-        // Also expand soft terms (with fewer synonyms)
+        // Also expand soft terms (with fewer synonyms but still thorough)
         const softExpansionResult = await expandTerms(softTerms, {
           shopId: shop.id,
           contextTerms: [...hardTerms, ...softTerms],
-          includeLLMSynonyms: shouldExpandLLMSynonyms && softTerms.length > 0,
-          maxLLMSynonyms: 4, // Up to 4 synonyms per soft term
+          includeLLMSynonyms: true, // Always enable for thoroughness
+          maxLLMSynonyms: 8, // Increased to 8 synonyms per soft term for thoroughness
         });
         const expandedSoftTermsSet = softExpansionResult.expandedTerms;
         const expandedSoftTermsList = Array.from(expandedSoftTermsSet);
@@ -5427,20 +5530,22 @@ async function processSessionInBackground({
           minNeeded: minNeededForExpansion,
         });
         
-        // If scarcity detected and we have expanded terms, do a post-expansion SmartFetch
-        // Also run if candidates don't match expanded terms (even if count is high)
+        // ALWAYS run post-expansion SmartFetch when we have expanded terms (for thoroughness, cost not a concern)
+        // This ensures we find all relevant products using expanded synonyms, regional variants, etc.
         // SKIP in bundle mode: bundle retrieval already handles per-item fetching
-        if (scarcitySignal && expandedHardTermsList.length > 0 && accessToken && !likelyBundle) {
-          const scarcityReason = currentCandidateCount < minNeededForExpansion 
-            ? `count_low (${currentCandidateCount} < ${minNeededForExpansion})` 
-            : `mismatch_expanded_terms (${currentCandidateCount} candidates don't match expanded terms)`;
-          console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${scarcityReason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
+        if (expandedHardTermsList.length > 0 && accessToken && !likelyBundle) {
+          const reason = scarcitySignal 
+            ? (currentCandidateCount < minNeededForExpansion 
+                ? `count_low (${currentCandidateCount} < ${minNeededForExpansion})` 
+                : `mismatch_expanded_terms (${currentCandidateCount} candidates don't match expanded terms)`)
+            : `thoroughness (always run with expanded terms for comprehensive results)`;
+          console.log(`[SmartFetch] post_expansion strategy=${fieldStrategy.strategy} reason=${reason} currentCount=${currentCandidateCount} minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
           
           try {
-            // Limit to 10 terms for post-expansion to avoid query truncation (500 char limit)
+            // Increased to 20 terms for post-expansion for thoroughness (was 10)
             // Each term creates ~60-80 chars: (title:term OR product_type:term OR tag:term OR vendor:term)
-            // 10 terms = ~600-800 chars, but we'll prioritize most relevant terms
-            const postExpansionTerms = expandedHardTermsList.slice(0, 10);
+            // 20 terms = ~1200-1600 chars, but Shopify may truncate - we'll prioritize most relevant terms
+            const postExpansionTerms = expandedHardTermsList.slice(0, 20);
             const postExpansionSignals = {
               keywords: postExpansionTerms,
               selections: [], // Don't use selections for post-expansion (already expanded)
@@ -5548,60 +5653,67 @@ async function processSessionInBackground({
               console.log(`[SmartFetch] post_expansion fetched=0 (no new products) existing_handles=${existingHandles.size} query_may_have_returned_duplicates=true`);
             }
             
-            // DEEP ATTRIBUTE SEARCH FOR POST-EXPANSION: If broad_text strategy, also search descriptions
+            // DEEP ATTRIBUTE SEARCH FOR POST-EXPANSION: Always run for thoroughness (cost not a concern)
             // This finds products where expanded terms appear in descriptions/metafields (industry-agnostic)
-            if (fieldStrategy.strategy === "broad_text" && expandedHardTermsList.length > 0 && accessToken && allNewProducts.length === 0) {
-              // Only run if initial query returned 0, to avoid redundant fetches
-              console.log(`[SmartFetch] post_expansion_deep_search strategy=broad_text expanded_terms=[${expandedHardTermsList.slice(0, 10).join(", ")}...]`);
-              
-              try {
-                // Fetch a broader set of products using primary terms (not all expanded terms to avoid query bloat)
-                const primaryTerms = expandedHardTermsList.slice(0, 5); // Use first 5 expanded terms
-                const deepSearchQuery = buildShopifySearchQuery({
-                  keywords: primaryTerms,
-                  selections: [],
-                  hasMeaningfulSignals: true
-                }, 500, "field_restricted");
+            // Run even if we got some products from initial query, to find more products with expanded terms in descriptions
+            if (expandedHardTermsList.length > 0 && accessToken) {
+              // Always run deep search for thoroughness
+              const shouldRunDeepSearch = allNewProducts.length === 0 || currentCandidateCount < minNeededForExpansion;
+              if (shouldRunDeepSearch) {
+                console.log(`[SmartFetch] post_expansion_deep_search strategy=${fieldStrategy.strategy} expanded_terms=[${expandedHardTermsList.slice(0, 15).join(", ")}...] reason=${allNewProducts.length === 0 ? 'no_initial_results' : 'insufficient_count'}`);
                 
-                if (deepSearchQuery) {
-                  console.log(`[SmartFetch] post_expansion_deep_search query="${deepSearchQuery.substring(0, 200)}${deepSearchQuery.length > 200 ? "..." : ""}" primary_terms=[${primaryTerms.join(", ")}]`);
+                try {
+                  // Industry-agnostic: Use original primary term (before expansion) to fetch a broader set
+                  // This avoids query bloat and finds products that might have expanded terms in descriptions
+                  // Get the original primary term from hardTerms (before expansion) or use first expanded term
+                  const originalPrimaryTerm = hardTerms.length > 0 ? hardTerms[0] : expandedHardTermsList[0];
+                  const primaryTerms = [originalPrimaryTerm]; // Use just the primary term for broader search
+                  const deepSearchQuery = buildShopifySearchQuery({
+                    keywords: primaryTerms,
+                    selections: [],
+                    hasMeaningfulSignals: true
+                  }, 500, "field_restricted");
                   
-                  // Fetch products that might match in descriptions
-                  const deepFetch = await fetchProductsByQueryPaginated(
-                    shopDomain,
-                    accessToken,
-                    deepSearchQuery,
-                    Math.min(minNeededForExpansion - currentCandidateCount, 250),
-                    200
-                  );
-                  
-                  console.log(`[SmartFetch] post_expansion_deep_search shopify_returned=${deepFetch.products.length} existing_handles=${existingHandles.size}`);
-                  
-                  if (deepFetch.products.length > 0) {
-                    // Filter out products already in pool before fetching descriptions (save API calls)
-                    const newProductsForDeepSearch = deepFetch.products.filter(p => !existingHandles.has(p.handle));
-                    console.log(`[SmartFetch] post_expansion_deep_search new_products=${newProductsForDeepSearch.length} (after dedupe, before description check)`);
+                  if (deepSearchQuery) {
+                    console.log(`[SmartFetch] post_expansion_deep_search query="${deepSearchQuery.substring(0, 200)}${deepSearchQuery.length > 200 ? "..." : ""}" primary_terms=[${primaryTerms.join(", ")}]`);
                     
-                    if (newProductsForDeepSearch.length > 0) {
-                      // Fetch descriptions for these products
-                      const deepFetchHandles = newProductsForDeepSearch.map((p: any) => p.handle);
-                      const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
-                        shopDomain,
-                        accessToken,
-                        handles: deepFetchHandles,
-                      });
+                    // Fetch more products for thoroughness (increased from 250 to 500)
+                    const deepFetch = await fetchProductsByQueryPaginated(
+                      shopDomain,
+                      accessToken,
+                      deepSearchQuery,
+                      Math.min(minNeededForExpansion - currentCandidateCount, 500), // Increased for thoroughness
+                      200
+                    );
+                    
+                    console.log(`[SmartFetch] post_expansion_deep_search shopify_returned=${deepFetch.products.length} existing_handles=${existingHandles.size}`);
+                    
+                    if (deepFetch.products.length > 0) {
+                      // Filter out products already in pool before fetching descriptions
+                      const newProductsForDeepSearch = deepFetch.products.filter(p => !existingHandles.has(p.handle));
+                      console.log(`[SmartFetch] post_expansion_deep_search new_products=${newProductsForDeepSearch.length} (after dedupe, before description check)`);
                       
-                      // Filter products that match expanded terms in description
-                      const deepSearchProducts: any[] = [];
-                      const deepSearchHandles = new Set<string>();
-                      
-                      for (const product of newProductsForDeepSearch) {
-                        const description = descriptionMap.get(product.handle) || null;
-                        const descPlain = cleanDescription(description);
-                        const descLower = descPlain.toLowerCase();
+                      if (newProductsForDeepSearch.length > 0) {
+                        // Fetch descriptions for these products
+                        const deepFetchHandles = newProductsForDeepSearch.map((p: any) => p.handle);
+                        const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                          shopDomain,
+                          accessToken,
+                          handles: deepFetchHandles,
+                        });
                         
-                        // Check if any expanded term appears in description (industry-agnostic)
-                        const matchesExpandedTerm = expandedHardTermsList.slice(0, 20).some(term => {
+                        // Filter products that match expanded terms in description
+                        const deepSearchProducts: any[] = [];
+                        const deepSearchHandles = new Set<string>();
+                        
+                        for (const product of newProductsForDeepSearch) {
+                          const description = descriptionMap.get(product.handle) || null;
+                          const descPlain = cleanDescription(description);
+                          const descLower = descPlain.toLowerCase();
+                          
+                          // Check if any expanded term appears in description (industry-agnostic)
+                          // Increased from 20 to 30 terms for thoroughness
+                          const matchesExpandedTerm = expandedHardTermsList.slice(0, 30).some(term => {
                           const termLower = term.toLowerCase();
                           // For multi-word phrases, require full phrase match
                           if (term.includes(" ")) {
@@ -5678,12 +5790,17 @@ async function processSessionInBackground({
               } catch (error) {
                 console.error(`[SmartFetch] post_expansion_deep_search error:`, error);
               }
+              }
             }
           } catch (error) {
             console.error(`[SmartFetch] post_expansion error:`, error);
           }
-        } else if (!scarcitySignal) {
-          console.log(`[SmartFetch] post_expansion skipped reason=no_scarcity currentCount=${currentCandidateCount} >= minNeeded=${minNeededForExpansion} matchesExpanded=${candidatesMatchExpandedTerms}`);
+        } else if (expandedHardTermsList.length === 0) {
+          console.log(`[SmartFetch] post_expansion skipped reason=no_expanded_terms`);
+        } else if (likelyBundle) {
+          console.log(`[SmartFetch] post_expansion skipped reason=bundle_mode (per-item fetching handles this)`);
+        } else if (!accessToken) {
+          console.log(`[SmartFetch] post_expansion skipped reason=no_access_token`);
         }
         
         // Merge LLM-extracted facets with variant constraints from answers
@@ -10947,139 +11064,194 @@ async function processSessionInBackground({
                 remainingCandidates = filteredCandidates;
                 console.log(`[DeepSearch] post_ai_topup filtered to ${remainingCandidates.length} candidates matching primary constraint terms [${primaryConstraintTerms.join(", ")}] (from ${totalRemainingBeforeFilter} total remaining)`);
               } else {
-                // CRITICAL: If no candidates match primary constraint terms in existing pool, search for similar products
-                // Industry-agnostic: Search for products matching constraint terms, then filter to those with terms in descriptions
-                console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}] in existing pool, searching for products with constraint terms in descriptions`);
+                // CRITICAL: If no candidates match primary constraint terms in title/tags/handle, check ALL existing candidates' descriptions
+                // Industry-agnostic: Check descriptions of all candidates (already fetched) for constraint terms
+                console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}] in title/tags/handle, checking ALL existing candidates' descriptions`);
                 
-                // Build a targeted search query for products matching constraint terms
-                // Industry-agnostic: Use primary constraint terms to find products in same category
-                const searchTerms = primaryConstraintTerms.slice(0, 3); // Use top 3 constraint terms
-                const searchQuery = buildShopifySearchQuery({
-                  keywords: searchTerms,
-                  selections: [],
-                  hasMeaningfulSignals: true
-                }, 500, "broad_text", searchTerms); // Pass searchTerms as expandedTerms
+                // Check ALL existing candidates (not just remaining) for constraint terms in descriptions
+                // We already fetched descriptions for all 214 candidates earlier
+                const candidatesWithConstraintInDescription: EnrichedCandidate[] = [];
                 
-                if (searchQuery && accessToken) {
-                  try {
-                    // Fetch products matching constraint terms (may find products with terms in descriptions)
-                    const targetedFetch = await fetchProductsByQueryPaginated(
-                      shopDomain,
-                      accessToken,
-                      searchQuery,
-                      250, // Fetch up to 250 products
-                      200
-                    );
-                    
-                    console.log(`[DeepSearch] post_ai_topup targeted_search fetched=${targetedFetch.products.length} products matching constraint terms`);
-                    
-                    if (targetedFetch.products.length > 0) {
-                      // Filter out products we already have
-                      const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
-                      const newProducts = targetedFetch.products.filter((p: any) => 
-                        !existingHandles.has(p.handle) && 
-                        !constraintMatchedHandles.includes(p.handle) && 
-                        !used.has(p.handle)
+                for (const candidate of allCandidatesEnriched) {
+                  // Skip if already matched or used
+                  if (constraintMatchedHandles.includes(candidate.handle) || used.has(candidate.handle)) {
+                    continue;
+                  }
+                  
+                  // Get full description (already fetched)
+                  let descText = "";
+                  if (candidate.descPlain) {
+                    descText = candidate.descPlain;
+                  } else if (candidate.desc1000) {
+                    descText = candidate.desc1000;
+                  } else if (candidate.description) {
+                    descText = cleanDescription(candidate.description);
+                  }
+                  
+                  // Also check title/tags/productType/vendor
+                  const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
+                  const combinedText = `${searchText.toLowerCase()} ${descText.toLowerCase()}`;
+                  
+                  // Check if any primary constraint term matches in title OR description
+                  const matchesConstraint = primaryConstraintTerms.some(term => {
+                    const termLower = term.toLowerCase();
+                    if (term.includes(" ")) {
+                      return combinedText.includes(termLower);
+                    }
+                    const wordBoundaryRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    return wordBoundaryRegex.test(combinedText);
+                  });
+                  
+                  if (matchesConstraint) {
+                    candidatesWithConstraintInDescription.push(candidate);
+                  }
+                }
+                
+                console.log(`[DeepSearch] post_ai_topup found=${candidatesWithConstraintInDescription.length} existing candidates with constraint terms in descriptions (from ${allCandidatesEnriched.length} total candidates)`);
+                
+                if (candidatesWithConstraintInDescription.length > 0) {
+                  // Use these candidates for top-up
+                  remainingCandidates = candidatesWithConstraintInDescription;
+                  console.log(`[DeepSearch] post_ai_topup using ${remainingCandidates.length} candidates with constraint terms in descriptions for top-up`);
+                } else {
+                  // No candidates match in descriptions either - try targeted search for new products
+                  console.log(`[DeepSearch] post_ai_topup no existing candidates match constraint terms in descriptions, searching for new products`);
+                  
+                  // Build a targeted search query for products matching constraint terms
+                  // Industry-agnostic: Use primary constraint terms to find products
+                  const searchTerms = primaryConstraintTerms.slice(0, 3); // Use top 3 constraint terms
+                  const searchQuery = buildShopifySearchQuery({
+                    keywords: searchTerms,
+                    selections: [],
+                    hasMeaningfulSignals: true
+                  }, 500, "broad_text", searchTerms);
+                  
+                  if (searchQuery && accessToken) {
+                    try {
+                      // Fetch products matching constraint terms
+                      const targetedFetch = await fetchProductsByQueryPaginated(
+                        shopDomain,
+                        accessToken,
+                        searchQuery,
+                        250, // Fetch up to 250 products
+                        200
                       );
                       
-                      if (newProducts.length > 0) {
-                        // Fetch descriptions for new products
-                        const newHandles = newProducts.map((p: any) => p.handle);
-                        const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
-                          shopDomain,
-                          accessToken,
-                          handles: newHandles,
-                        });
+                      console.log(`[DeepSearch] post_ai_topup targeted_search fetched=${targetedFetch.products.length} products matching constraint terms`);
+                      
+                      if (targetedFetch.products.length > 0) {
+                        // Filter out products we already have
+                        const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+                        const newProducts = targetedFetch.products.filter((p: any) => 
+                          !existingHandles.has(p.handle) && 
+                          !constraintMatchedHandles.includes(p.handle) && 
+                          !used.has(p.handle)
+                        );
                         
-                        // Filter to products that match constraint terms in title OR description
-                        const matchingProducts: any[] = [];
-                        for (const product of newProducts) {
-                          const description = descriptionMap.get(product.handle) || null;
-                          const descPlain = cleanDescription(description);
-                          const descLower = descPlain.toLowerCase();
-                          
-                          // Check title/tags/productType/vendor
-                          const titleText = [
-                            product.title || "",
-                            product.productType || "",
-                            (product.tags || []).join(" "),
-                            product.vendor || "",
-                          ].join(" ").toLowerCase();
-                          
-                          const combinedText = `${titleText} ${descLower}`;
-                          
-                          // Check if any constraint term matches in title OR description
-                          const matchesConstraint = primaryConstraintTerms.some(term => {
-                            const termLower = term.toLowerCase();
-                            if (term.includes(" ")) {
-                              return combinedText.includes(termLower);
-                            }
-                            const wordBoundaryRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                            return wordBoundaryRegex.test(combinedText);
+                        if (newProducts.length > 0) {
+                          // Fetch descriptions for new products
+                          const newHandles = newProducts.map((p: any) => p.handle);
+                          const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                            shopDomain,
+                            accessToken,
+                            handles: newHandles,
                           });
                           
-                          if (matchesConstraint) {
-                            matchingProducts.push(product);
-                          }
-                        }
-                        
-                        console.log(`[DeepSearch] post_ai_topup targeted_search matched=${matchingProducts.length} products with constraint terms in title/description (from ${newProducts.length} new products)`);
-                        
-                        if (matchingProducts.length > 0) {
-                          // Enrich and add matching products to remainingCandidates
-                          const enrichedNewProducts: EnrichedCandidate[] = matchingProducts.map((p: any) => {
-                            const description = descriptionMap.get(p.handle) || null;
+                          // Filter to products that match constraint terms in title OR description
+                          const matchingProducts: any[] = [];
+                          for (const product of newProducts) {
+                            const description = descriptionMap.get(product.handle) || null;
                             const descPlain = cleanDescription(description);
-                            const desc1000 = descPlain.substring(0, 1000);
+                            const descLower = descPlain.toLowerCase();
                             
-                            return {
-                              handle: p.handle,
-                              title: p.title,
-                              productType: p.productType || null,
-                              productCategory: null,
-                              taxonomy: null,
-                              collections: p.collections || null,
-                              variants: p.variants || null,
-                              tags: p.tags || [],
-                              vendor: p.vendor || null,
-                              price: p.priceAmount || p.price || null,
-                              priceMinAmount: null,
-                              priceMaxAmount: null,
-                              priceCurrency: p.currencyCode || null,
-                              description: description,
-                              descPlain: descPlain,
-                              desc1000: desc1000,
-                              available: p.available,
-                              sizes: Array.isArray(p.sizes) ? p.sizes : [],
-                              colors: Array.isArray(p.colors) ? p.colors : [],
-                              materials: Array.isArray(p.materials) ? p.materials : [],
-                              optionValues: p.optionValues ?? {},
-                              metafields: p.metafields || null,
-                              searchText: extractSearchText({
-                                ...p,
+                            // Check title/tags/productType/vendor
+                            const titleText = [
+                              product.title || "",
+                              product.productType || "",
+                              (product.tags || []).join(" "),
+                              product.vendor || "",
+                            ].join(" ").toLowerCase();
+                            
+                            const combinedText = `${titleText} ${descLower}`;
+                            
+                            // Check if any constraint term matches in title OR description
+                            const matchesConstraint = primaryConstraintTerms.some(term => {
+                              const termLower = term.toLowerCase();
+                              if (term.includes(" ")) {
+                                return combinedText.includes(termLower);
+                              }
+                              const wordBoundaryRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                              return wordBoundaryRegex.test(combinedText);
+                            });
+                            
+                            if (matchesConstraint) {
+                              matchingProducts.push(product);
+                            }
+                          }
+                          
+                          console.log(`[DeepSearch] post_ai_topup targeted_search matched=${matchingProducts.length} new products with constraint terms in title/description (from ${newProducts.length} new products)`);
+                          
+                          if (matchingProducts.length > 0) {
+                            // Enrich and add matching products to remainingCandidates
+                            const enrichedNewProducts: EnrichedCandidate[] = matchingProducts.map((p: any) => {
+                              const description = descriptionMap.get(p.handle) || null;
+                              const descPlain = cleanDescription(description);
+                              const desc1000 = descPlain.substring(0, 1000);
+                              
+                              return {
+                                handle: p.handle,
+                                title: p.title,
+                                productType: p.productType || null,
+                                productCategory: null,
+                                taxonomy: null,
+                                collections: p.collections || null,
+                                variants: p.variants || null,
+                                tags: p.tags || [],
+                                vendor: p.vendor || null,
+                                price: p.priceAmount || p.price || null,
+                                priceMinAmount: null,
+                                priceMaxAmount: null,
+                                priceCurrency: p.currencyCode || null,
                                 description: description,
                                 descPlain: descPlain,
                                 desc1000: desc1000,
-                              }, indexMetafields),
-                            } as EnrichedCandidate;
-                          });
-                          
-                          // Add to remainingCandidates and allCandidatesEnriched
-                          remainingCandidates = enrichedNewProducts;
-                          allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedNewProducts];
-                          
-                          console.log(`[DeepSearch] post_ai_topup targeted_search added=${enrichedNewProducts.length} relevant products with constraint terms in descriptions`);
+                                available: p.available,
+                                sizes: Array.isArray(p.sizes) ? p.sizes : [],
+                                colors: Array.isArray(p.colors) ? p.colors : [],
+                                materials: Array.isArray(p.materials) ? p.materials : [],
+                                optionValues: p.optionValues ?? {},
+                                metafields: p.metafields || null,
+                                searchText: extractSearchText({
+                                  ...p,
+                                  description: description,
+                                  descPlain: descPlain,
+                                  desc1000: desc1000,
+                                }, indexMetafields),
+                              } as EnrichedCandidate;
+                            });
+                            
+                            // Add to remainingCandidates and allCandidatesEnriched
+                            remainingCandidates = enrichedNewProducts;
+                            allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedNewProducts];
+                            
+                            console.log(`[DeepSearch] post_ai_topup targeted_search added=${enrichedNewProducts.length} new products with constraint terms in descriptions`);
+                          } else {
+                            remainingCandidates = [];
+                          }
+                        } else {
+                          console.log(`[DeepSearch] post_ai_topup targeted_search all fetched products were duplicates`);
+                          remainingCandidates = [];
                         }
+                      } else {
+                        remainingCandidates = [];
                       }
+                    } catch (error) {
+                      console.error(`[DeepSearch] post_ai_topup targeted_search error:`, error);
+                      remainingCandidates = [];
                     }
-                  } catch (error) {
-                    console.error(`[DeepSearch] post_ai_topup targeted_search error:`, error);
-                    // Continue with empty remainingCandidates if search fails
+                  } else {
                     remainingCandidates = [];
                   }
-                } else {
-                  // No search query or access token - stop
-                  remainingCandidates = [];
                 }
               }
             }
@@ -12220,15 +12392,24 @@ async function processSessionInBackground({
       ) {
         const have = new Set(ranked);
         const out = ranked.slice();
+        
+        let checkedCount = 0;
+        let skippedUnavailable = 0;
+        let skippedNoHardTermMatch = 0;
+        let skippedConstraintMismatch = 0;
+        let skippedConstraintConflict = 0;
+        let addedCount = 0;
 
         for (const p of pool) {
           if (out.length >= target) break;
           if (!p?.handle) continue;
           if (have.has(p.handle)) continue;
+          checkedCount++;
           
           // CRITICAL: Check availability (validation filters out unavailable products)
           // Industry-agnostic: All products have availability status
           if (!(p as any).available) {
+            skippedUnavailable++;
             continue; // Skip unavailable products
           }
           
@@ -12249,6 +12430,7 @@ async function processSessionInBackground({
               const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
               
               if (!hasHardTermMatch) {
+                skippedNoHardTermMatch++;
                 continue; // Skip this candidate - doesn't match hard terms
               }
             }
@@ -12274,6 +12456,7 @@ async function processSessionInBackground({
             });
             
             if (!matchesConstraint) {
+              skippedConstraintMismatch++;
               continue; // Skip this candidate - doesn't match constraint terms
             }
           }
@@ -12293,6 +12476,7 @@ async function processSessionInBackground({
                 if (constraintResult.conflict) {
                   console.log(`[TopUp] skip_conflict facet=${constraintResult.conflict.facet} expected=${constraintResult.conflict.expected} actual=${constraintResult.conflict.actual} source=${constraintResult.conflict.source} handle=${p.handle}`);
                 }
+                skippedConstraintConflict++;
                 continue; // Skip this candidate due to constraint conflict
               }
             }
@@ -12300,7 +12484,11 @@ async function processSessionInBackground({
           
           have.add(p.handle);
           out.push(p.handle);
+          addedCount++;
         }
+        
+        // Log top-up results for debugging
+        console.log(`[TopUp] pool=${pool.length} ranked=${ranked.length} target=${target} checked=${checkedCount} added=${addedCount} skipped_unavailable=${skippedUnavailable} skipped_no_hard_term=${skippedNoHardTermMatch} skipped_constraint_mismatch=${skippedConstraintMismatch} skipped_constraint_conflict=${skippedConstraintConflict} final=${out.length}`);
 
         return out.slice(0, target);
       }
