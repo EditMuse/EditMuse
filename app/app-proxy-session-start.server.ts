@@ -10924,7 +10924,7 @@ async function processSessionInBackground({
             );
             
             // CRITICAL: Filter to only check candidates that match at least one primary constraint term in title/tags/handle
-            // This avoids checking irrelevant products (e.g., pet food) that won't have the constraint term in description
+            // Industry-agnostic: This avoids checking irrelevant products that don't match the query terms
             // Use primary terms (first 5 unique constraint terms) to filter
             const primaryConstraintTerms = uniqueConstraintTerms.slice(0, 5).map(t => t.toLowerCase());
             const totalRemainingBeforeFilter = remainingCandidates.length;
@@ -10942,12 +10942,145 @@ async function processSessionInBackground({
                 });
               });
               
-              // If we have filtered candidates, use them; otherwise fall back to all remaining
+              // If we have filtered candidates, use them; otherwise STOP (don't check irrelevant products)
               if (filteredCandidates.length > 0) {
                 remainingCandidates = filteredCandidates;
                 console.log(`[DeepSearch] post_ai_topup filtered to ${remainingCandidates.length} candidates matching primary constraint terms [${primaryConstraintTerms.join(", ")}] (from ${totalRemainingBeforeFilter} total remaining)`);
               } else {
-                console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}], checking all ${totalRemainingBeforeFilter} remaining`);
+                // CRITICAL: If no candidates match primary constraint terms in existing pool, search for similar products
+                // Industry-agnostic: Search for products matching constraint terms, then filter to those with terms in descriptions
+                console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}] in existing pool, searching for products with constraint terms in descriptions`);
+                
+                // Build a targeted search query for products matching constraint terms
+                // Industry-agnostic: Use primary constraint terms to find products in same category
+                const searchTerms = primaryConstraintTerms.slice(0, 3); // Use top 3 constraint terms
+                const searchQuery = buildShopifySearchQuery({
+                  keywords: searchTerms,
+                  selections: [],
+                  hasMeaningfulSignals: true
+                }, 500, "broad_text", searchTerms); // Pass searchTerms as expandedTerms
+                
+                if (searchQuery && accessToken) {
+                  try {
+                    // Fetch products matching constraint terms (may find products with terms in descriptions)
+                    const targetedFetch = await fetchProductsByQueryPaginated(
+                      shopDomain,
+                      accessToken,
+                      searchQuery,
+                      250, // Fetch up to 250 products
+                      200
+                    );
+                    
+                    console.log(`[DeepSearch] post_ai_topup targeted_search fetched=${targetedFetch.products.length} products matching constraint terms`);
+                    
+                    if (targetedFetch.products.length > 0) {
+                      // Filter out products we already have
+                      const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+                      const newProducts = targetedFetch.products.filter((p: any) => 
+                        !existingHandles.has(p.handle) && 
+                        !constraintMatchedHandles.includes(p.handle) && 
+                        !used.has(p.handle)
+                      );
+                      
+                      if (newProducts.length > 0) {
+                        // Fetch descriptions for new products
+                        const newHandles = newProducts.map((p: any) => p.handle);
+                        const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                          shopDomain,
+                          accessToken,
+                          handles: newHandles,
+                        });
+                        
+                        // Filter to products that match constraint terms in title OR description
+                        const matchingProducts: any[] = [];
+                        for (const product of newProducts) {
+                          const description = descriptionMap.get(product.handle) || null;
+                          const descPlain = cleanDescription(description);
+                          const descLower = descPlain.toLowerCase();
+                          
+                          // Check title/tags/productType/vendor
+                          const titleText = [
+                            product.title || "",
+                            product.productType || "",
+                            (product.tags || []).join(" "),
+                            product.vendor || "",
+                          ].join(" ").toLowerCase();
+                          
+                          const combinedText = `${titleText} ${descLower}`;
+                          
+                          // Check if any constraint term matches in title OR description
+                          const matchesConstraint = primaryConstraintTerms.some(term => {
+                            const termLower = term.toLowerCase();
+                            if (term.includes(" ")) {
+                              return combinedText.includes(termLower);
+                            }
+                            const wordBoundaryRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                            return wordBoundaryRegex.test(combinedText);
+                          });
+                          
+                          if (matchesConstraint) {
+                            matchingProducts.push(product);
+                          }
+                        }
+                        
+                        console.log(`[DeepSearch] post_ai_topup targeted_search matched=${matchingProducts.length} products with constraint terms in title/description (from ${newProducts.length} new products)`);
+                        
+                        if (matchingProducts.length > 0) {
+                          // Enrich and add matching products to remainingCandidates
+                          const enrichedNewProducts: EnrichedCandidate[] = matchingProducts.map((p: any) => {
+                            const description = descriptionMap.get(p.handle) || null;
+                            const descPlain = cleanDescription(description);
+                            const desc1000 = descPlain.substring(0, 1000);
+                            
+                            return {
+                              handle: p.handle,
+                              title: p.title,
+                              productType: p.productType || null,
+                              productCategory: null,
+                              taxonomy: null,
+                              collections: p.collections || null,
+                              variants: p.variants || null,
+                              tags: p.tags || [],
+                              vendor: p.vendor || null,
+                              price: p.priceAmount || p.price || null,
+                              priceMinAmount: null,
+                              priceMaxAmount: null,
+                              priceCurrency: p.currencyCode || null,
+                              description: description,
+                              descPlain: descPlain,
+                              desc1000: desc1000,
+                              available: p.available,
+                              sizes: Array.isArray(p.sizes) ? p.sizes : [],
+                              colors: Array.isArray(p.colors) ? p.colors : [],
+                              materials: Array.isArray(p.materials) ? p.materials : [],
+                              optionValues: p.optionValues ?? {},
+                              metafields: p.metafields || null,
+                              searchText: extractSearchText({
+                                ...p,
+                                description: description,
+                                descPlain: descPlain,
+                                desc1000: desc1000,
+                              }, indexMetafields),
+                            } as EnrichedCandidate;
+                          });
+                          
+                          // Add to remainingCandidates and allCandidatesEnriched
+                          remainingCandidates = enrichedNewProducts;
+                          allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedNewProducts];
+                          
+                          console.log(`[DeepSearch] post_ai_topup targeted_search added=${enrichedNewProducts.length} relevant products with constraint terms in descriptions`);
+                        }
+                      }
+                    }
+                  } catch (error) {
+                    console.error(`[DeepSearch] post_ai_topup targeted_search error:`, error);
+                    // Continue with empty remainingCandidates if search fails
+                    remainingCandidates = [];
+                  }
+                } else {
+                  // No search query or access token - stop
+                  remainingCandidates = [];
+                }
               }
             }
             
@@ -12083,7 +12216,7 @@ async function processSessionInBackground({
         target: number,
         constraints?: Array<{ key: string; value: string }>,
         facetVocabulary?: { optionNames: Set<string>; optionNameToValues: Map<string, Set<string>> },
-        constraintTerms?: string[] // Industry-agnostic: constraint terms like "salicylic acid"
+        constraintTerms?: string[] // Industry-agnostic: constraint terms extracted from query (e.g., ingredient names, material specifications)
       ) {
         const have = new Set(ranked);
         const out = ranked.slice();
@@ -12093,7 +12226,35 @@ async function processSessionInBackground({
           if (!p?.handle) continue;
           if (have.has(p.handle)) continue;
           
-          // Check constraint terms if provided (industry-agnostic: e.g., "salicylic acid", "zinc oxide")
+          // CRITICAL: Check availability (validation filters out unavailable products)
+          // Industry-agnostic: All products have availability status
+          if (!(p as any).available) {
+            continue; // Skip unavailable products
+          }
+          
+          // CRITICAL: For queries without constraint terms, ensure products match hard terms
+          // Industry-agnostic: Prevents adding products from unrelated categories that don't match query terms
+          if (!constraintTerms || constraintTerms.length === 0) {
+            if (hardTerms.length > 0) {
+              const searchText = (p as any).searchText || extractSearchText(p as EnrichedCandidate, indexMetafields);
+              const haystack = [
+                (p as any).title || "",
+                (p as any).productType || "",
+                ((p as any).tags || []).join(" "),
+                (p as any).vendor || "",
+                searchText || "",
+              ].join(" ");
+              
+              // Check if product matches at least one hard term (using word-boundary matching)
+              const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+              
+              if (!hasHardTermMatch) {
+                continue; // Skip this candidate - doesn't match hard terms
+              }
+            }
+          }
+          
+          // Check constraint terms if provided (industry-agnostic: ingredient names, material specs, etc.)
           if (constraintTerms && constraintTerms.length > 0) {
             const searchText = (p as any).searchText || extractSearchText(p as EnrichedCandidate, indexMetafields);
             const searchTextLower = searchText.toLowerCase();
