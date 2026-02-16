@@ -10847,9 +10847,9 @@ async function processSessionInBackground({
           console.log(`[DeepSearch] post_ai_enforcement constraint_terms=[${uniqueConstraintTerms.join(", ")}] before=${finalHandlesBeforeConstraint.length}`);
           
           // Fetch descriptions for AI-selected handles if not already available
-          // Check both sortedCandidates and gatedCandidates (fallback)
+          // Check sortedCandidates, gatedCandidates, and allCandidatesEnriched (fallback)
           const handlesNeedingDescriptions = finalHandlesBeforeConstraint.filter(handle => {
-            const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle);
+            const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle) || allCandidatesEnriched.find(c => c.handle === handle);
             return candidate && !candidate.description && !candidate.descPlain;
           });
           
@@ -10860,9 +10860,9 @@ async function processSessionInBackground({
               handles: handlesNeedingDescriptions,
             });
             
-            // Enrich candidates with descriptions (update in both pools if present)
+            // Enrich candidates with descriptions (update in all pools if present)
             for (const handle of handlesNeedingDescriptions) {
-              const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle);
+              const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle) || allCandidatesEnriched.find(c => c.handle === handle);
               if (candidate) {
                 const description = descriptionMap.get(handle) || null;
                 const descPlain = cleanDescription(description);
@@ -10880,7 +10880,7 @@ async function processSessionInBackground({
           // Industry-agnostic: checks both searchText (title/tags/vendor/productType) AND description explicitly
           const constraintMatchedHandles: string[] = [];
           for (const handle of finalHandlesBeforeConstraint) {
-            const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle);
+            const candidate = sortedCandidates.find(c => c.handle === handle) || gatedCandidates.find(c => c.handle === handle) || allCandidatesEnriched.find(c => c.handle === handle);
             if (!candidate) continue;
             
             // Build search text (includes title, tags, vendor, productType, description if available)
@@ -10916,9 +10916,9 @@ async function processSessionInBackground({
           
           // If fewer than requested remain, top-up from remaining candidates that match
           // Industry-agnostic: aggressively search remaining candidates, including fetching descriptions if needed
-          // Use gatedCandidates (all candidates with descriptions) instead of sortedCandidates (only top AI window)
+          // Use allCandidatesEnriched (all candidates with descriptions) instead of gatedCandidates (only gated ones) or sortedCandidates (only top AI window)
           if (constraintMatchedHandles.length < finalResultCount) {
-            const remainingCandidates = gatedCandidates.filter(c => 
+            const remainingCandidates = allCandidatesEnriched.filter(c => 
               !constraintMatchedHandles.includes(c.handle) && 
               !used.has(c.handle)
             );
