@@ -488,7 +488,7 @@ export default function UsagePage() {
             {/* Export CSV Button */}
             <div style={{ display: "flex", alignItems: "flex-end" }}>
               <a
-                href={`/app/usage.export-csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
+                href={`/app/usage/export-csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
                 style={{
                   padding: "0.625rem 1.25rem",
                   background: "#7C3AED",
