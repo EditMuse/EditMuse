@@ -4496,6 +4496,19 @@ async function processSessionInBackground({
                     if (hasTokenInNegativeContext) {
                       return false;
                     }
+                    
+                    // For phrase queries, if product doesn't match the phrase, require ALL tokens to match
+                    // This filters out products that only match one token (e.g., "food" in "Hair Food" when searching "pet food")
+                    const allTokensMatch = keywords.every(keyword => {
+                      const keywordLower = keyword.toLowerCase();
+                      const keywordPattern = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                      return keywordPattern.test(searchableText);
+                    });
+                    
+                    // Only keep if all tokens match (not just one)
+                    if (!allTokensMatch) {
+                      return false;
+                    }
                   }
                   
                   return true;
@@ -6744,46 +6757,72 @@ async function processSessionInBackground({
                   console.log(`[DeepSearch] broader_fetch fetched=${broaderFetch.products.length} with_base_terms`);
                   
                   if (broaderFetch.products.length > 0) {
-                    // Filter out products we already have
+                    // Separate new products from existing ones
                     const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
                     const newBroaderProducts = broaderFetch.products.filter((p: any) => !existingHandles.has(p.handle));
+                    const existingBroaderProducts = broaderFetch.products.filter((p: any) => existingHandles.has(p.handle));
                     
-                    if (newBroaderProducts.length > 0) {
-                      // Fetch descriptions for these products
-                      const broaderHandles = newBroaderProducts.map((p: any) => p.handle);
-                      const broaderDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
-                        shopDomain,
-                        accessToken,
-                        handles: broaderHandles,
+                    // Fetch descriptions for ALL products (new and existing) to check if they match constraint terms
+                    const allBroaderHandles = broaderFetch.products.map((p: any) => p.handle);
+                    const broaderDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                      shopDomain,
+                      accessToken,
+                      handles: allBroaderHandles,
+                    });
+                    
+                    // Check new products
+                    let newMatches = 0;
+                    for (const product of newBroaderProducts) {
+                      const description = broaderDescriptionMap.get(product.handle) || null;
+                      const descPlain = cleanDescription(description);
+                      const descLower = descPlain.toLowerCase();
+                      
+                      // Check if any constraint term appears in description (word-boundary matching for phrases)
+                      const matchesConstraint = uniqueConstraintTerms.some(term => {
+                        const termLower = term.toLowerCase();
+                        if (term.includes(" ")) {
+                          // Multi-word phrase: check for exact phrase match
+                          return descLower.includes(termLower);
+                        } else {
+                          // Single word: use word-boundary matching
+                          const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                          return regex.test(descLower);
+                        }
                       });
                       
-                      // Filter products that match constraint terms in description
-                      for (const product of newBroaderProducts) {
-                        const description = broaderDescriptionMap.get(product.handle) || null;
-                        const descPlain = cleanDescription(description);
-                        const descLower = descPlain.toLowerCase();
-                        
-                        // Check if any constraint term appears in description (word-boundary matching for phrases)
-                        const matchesConstraint = uniqueConstraintTerms.some(term => {
-                          const termLower = term.toLowerCase();
-                          if (term.includes(" ")) {
-                            // Multi-word phrase: check for exact phrase match
-                            return descLower.includes(termLower);
-                          } else {
-                            // Single word: use word-boundary matching
-                            const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                            return regex.test(descLower);
-                          }
-                        });
-                        
-                        if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
-                          deepSearchHandles.add(product.handle);
-                          deepSearchProducts.push(product);
-                        }
+                      if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                        deepSearchHandles.add(product.handle);
+                        deepSearchProducts.push(product);
+                        newMatches++;
                       }
-                      
-                      console.log(`[DeepSearch] broader_fetch matched_in_description=${deepSearchProducts.length} after_filtering`);
                     }
+                    
+                    // Check existing products (they might have constraint terms in descriptions even if not in title)
+                    let existingMatches = 0;
+                    for (const product of existingBroaderProducts) {
+                      const description = broaderDescriptionMap.get(product.handle) || null;
+                      const descPlain = cleanDescription(description);
+                      const descLower = descPlain.toLowerCase();
+                      
+                      // Check if any constraint term appears in description
+                      const matchesConstraint = uniqueConstraintTerms.some(term => {
+                        const termLower = term.toLowerCase();
+                        if (term.includes(" ")) {
+                          return descLower.includes(termLower);
+                        } else {
+                          const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                          return regex.test(descLower);
+                        }
+                      });
+                      
+                      if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                        deepSearchHandles.add(product.handle);
+                        deepSearchProducts.push(product);
+                        existingMatches++;
+                      }
+                    }
+                    
+                    console.log(`[DeepSearch] broader_fetch matched_in_description=${deepSearchProducts.length} after_filtering (new=${newMatches} existing=${existingMatches} total_checked=${broaderFetch.products.length})`);
                   }
                 }
               }
@@ -6824,44 +6863,74 @@ async function processSessionInBackground({
                         200
                       );
                       
-                      // Filter out products we already have
+                      // Separate new products from existing ones
                       const existingHandles = new Set([
                         ...allCandidatesEnriched.map(c => c.handle),
                         ...deepSearchProducts.map(p => p.handle)
                       ]);
                       const newProductTypeProducts = productTypeFetch.products.filter((p: any) => !existingHandles.has(p.handle));
+                      const existingProductTypeProducts = productTypeFetch.products.filter((p: any) => existingHandles.has(p.handle));
                       
-                      if (newProductTypeProducts.length > 0) {
-                        // Fetch descriptions for these products
-                        const productTypeHandles = newProductTypeProducts.map((p: any) => p.handle);
-                        const productTypeDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
-                          shopDomain,
-                          accessToken,
-                          handles: productTypeHandles,
+                      // Fetch descriptions for ALL products (new and existing) to check if they match constraint terms
+                      const allProductTypeHandles = productTypeFetch.products.map((p: any) => p.handle);
+                      const productTypeDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                        shopDomain,
+                        accessToken,
+                        handles: allProductTypeHandles,
+                      });
+                      
+                      // Check new products
+                      let newMatches = 0;
+                      for (const product of newProductTypeProducts) {
+                        const description = productTypeDescriptionMap.get(product.handle) || null;
+                        const descPlain = cleanDescription(description);
+                        const descLower = descPlain.toLowerCase();
+                        
+                        // Check if any constraint term appears in description
+                        const matchesConstraint = uniqueConstraintTerms.some(term => {
+                          const termLower = term.toLowerCase();
+                          if (term.includes(" ")) {
+                            return descLower.includes(termLower);
+                          } else {
+                            const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                            return regex.test(descLower);
+                          }
                         });
                         
-                        // Filter products that match constraint terms in description
-                        for (const product of newProductTypeProducts) {
-                          const description = productTypeDescriptionMap.get(product.handle) || null;
-                          const descPlain = cleanDescription(description);
-                          const descLower = descPlain.toLowerCase();
-                          
-                          // Check if any constraint term appears in description
-                          const matchesConstraint = uniqueConstraintTerms.some(term => {
-                            const termLower = term.toLowerCase();
-                            if (term.includes(" ")) {
-                              return descLower.includes(termLower);
-                            } else {
-                              const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                              return regex.test(descLower);
-                            }
-                          });
-                          
-                          if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
-                            deepSearchHandles.add(product.handle);
-                            deepSearchProducts.push(product);
-                          }
+                        if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                          deepSearchHandles.add(product.handle);
+                          deepSearchProducts.push(product);
+                          newMatches++;
                         }
+                      }
+                      
+                      // Check existing products (they might have constraint terms in descriptions even if not in title)
+                      let existingMatches = 0;
+                      for (const product of existingProductTypeProducts) {
+                        const description = productTypeDescriptionMap.get(product.handle) || null;
+                        const descPlain = cleanDescription(description);
+                        const descLower = descPlain.toLowerCase();
+                        
+                        // Check if any constraint term appears in description
+                        const matchesConstraint = uniqueConstraintTerms.some(term => {
+                          const termLower = term.toLowerCase();
+                          if (term.includes(" ")) {
+                            return descLower.includes(termLower);
+                          } else {
+                            const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                            return regex.test(descLower);
+                          }
+                        });
+                        
+                        if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                          deepSearchHandles.add(product.handle);
+                          deepSearchProducts.push(product);
+                          existingMatches++;
+                        }
+                      }
+                      
+                      if (productTypeFetch.products.length > 0) {
+                        console.log(`[DeepSearch] broader_fetch_product_type="${productType}" checked=${productTypeFetch.products.length} new_matches=${newMatches} existing_matches=${existingMatches}`);
                       }
                     }
                   }
