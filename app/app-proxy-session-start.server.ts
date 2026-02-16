@@ -3593,15 +3593,16 @@ export async function proxySessionStartAction(
   }
 
   // Calculate dynamic AI window - SMALL-FIRST approach
-  // Single-item: 20 candidates for first AI attempt (was 40)
-  // Bundle: 15 per item for first AI attempt (was 25)
+  // Use candidateCap from plan, but apply reasonable defaults for small-first approach
+  // Single-item: 20 candidates for first AI attempt, but can go up to candidateCap for top-up
+  // Bundle: 15 per item for first AI attempt, but can go up to candidateCap/items for top-up
   // Pre-AI gating/ranking still uses larger pools for quality
   // No hard terms: max 30 candidates (was 60)
-  const singleItemWindow = 40; // For top-up and other uses
-  const SINGLE_ITEM_AI_WINDOW = 20; // Small-first: first AI attempt only
+  const singleItemWindow = Math.min(entitlements.candidateCap, 40); // For top-up and other uses, respect candidateCap
+  const SINGLE_ITEM_AI_WINDOW = Math.min(entitlements.candidateCap, 20); // Small-first: first AI attempt only, respect candidateCap
   const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
-  const MAX_BUNDLE_AI_PER_ITEM = 15; // Small-first: first AI attempt only (was 25)
-  const noHardTermsWindow = 30;
+  const MAX_BUNDLE_AI_PER_ITEM = Math.min(Math.floor(entitlements.candidateCap / 4), 15); // Small-first: first AI attempt only, scale with candidateCap
+  const noHardTermsWindow = Math.min(entitlements.candidateCap, 30); // Respect candidateCap
   const baseAiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
   
   // Parse intent early to check for hardTerms (before actual parsing, we'll adjust after intent parsing)
@@ -3722,7 +3723,7 @@ export async function proxySessionStartAction(
         excludedTags: JSON.parse(experience.excludedTags || "[]") as string[],
         entitlements,
         modeUsed,
-        baseAiWindow: Math.min(entitlements.candidateCap, 40), // Single-item window
+        baseAiWindow: Math.min(entitlements.candidateCap, 40), // Single-item window, respect candidateCap
       });
       
       const durationMs = Date.now() - startTime;
@@ -7269,11 +7270,11 @@ async function processSessionInBackground({
       // Bundle: 15 per item for first AI attempt (was 25)
       // Pre-AI gating/ranking still uses larger pools for quality
       // No hard terms: max 30 candidates (was 60)
-      const singleItemWindow = 40; // For top-up and other uses
-      const SINGLE_ITEM_AI_WINDOW = 20; // Small-first: first AI attempt only
+      const singleItemWindow = Math.min(entitlements.candidateCap, 40); // For top-up and other uses, respect candidateCap
+      const SINGLE_ITEM_AI_WINDOW = Math.min(entitlements.candidateCap, 20); // Small-first: first AI attempt only, respect candidateCap
       const MAX_BUNDLE_PRE_AI_PER_ITEM = 60; // Max candidates per item for bundle mode pre-AI gating/ranking
-      const MAX_BUNDLE_AI_PER_ITEM = 15; // Small-first: first AI attempt only (was 25)
-      const noHardTermsWindow = 30;
+      const MAX_BUNDLE_AI_PER_ITEM = Math.min(Math.floor(entitlements.candidateCap / 4), 15); // Small-first: first AI attempt only, scale with candidateCap
+      const noHardTermsWindow = Math.min(entitlements.candidateCap, 30); // Respect candidateCap
       let aiWindow = Math.min(entitlements.candidateCap, singleItemWindow);
       
       // For bundle/hard-term queries that require AI ranking, process asynchronously to avoid timeouts
