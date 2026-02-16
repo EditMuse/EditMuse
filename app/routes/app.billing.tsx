@@ -17,9 +17,7 @@ import {
   getBillingCycleKey,
   applyAddonToSubscription,
   setRecurringExperiencePack,
-  setRecurringAdvancedReporting,
   disableRecurringExperiencePack,
-  disableRecurringAdvancedReporting,
   getOrCreateSubscription,
   chargeRecurringAddonsMonthly,
   markSubscriptionAsCancelled,
@@ -195,13 +193,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   // Add-on purchase actions
   // ONE-TIME: credits_2000, credits_5000 (reset each cycle)
-  // RECURRING: exp_3, exp_10, advanced_reporting (persist across cycles, charge monthly)
+  // RECURRING: exp_3, exp_10 (persist across cycles, charge monthly)
   const addonActions: Record<string, { price: number; key: string; type: "one-time" | "recurring" }> = {
     buy_addon_credits_2000: { price: 49, key: "credits_2000", type: "one-time" },
     buy_addon_credits_5000: { price: 99, key: "credits_5000", type: "one-time" },
     buy_addon_exp_3: { price: 15, key: "exp_3", type: "recurring" },
     buy_addon_exp_10: { price: 39, key: "exp_10", type: "recurring" },
-    buy_addon_advanced_reporting: { price: 29, key: "advanced_reporting", type: "recurring" },
   };
 
   if (addonActions[actionType]) {
@@ -400,7 +397,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         
         const result = await chargeRecurringAddonForCycle({
           shopDomain: session.shop,
-          addonKey: addon.key as "exp_3" | "exp_10" | "advanced_reporting",
+          addonKey: addon.key as "exp_3" | "exp_10",
           priceUsd: addon.price,
           cycleKey,
           opts: { admin },
@@ -443,8 +440,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_3" });
               } else if (addon.key === "exp_10") {
                 await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_10" });
-              } else if (addon.key === "advanced_reporting") {
-                await setRecurringAdvancedReporting({ shopId: shop.id, enabled: true });
               }
             }
           } else {
@@ -453,8 +448,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_3" });
             } else if (addon.key === "exp_10") {
               await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_10" });
-            } else if (addon.key === "advanced_reporting") {
-              await setRecurringAdvancedReporting({ shopId: shop.id, enabled: true });
             }
           }
         } catch (queryError) {
@@ -464,8 +457,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_3" });
           } else if (addon.key === "exp_10") {
             await setRecurringExperiencePack({ shopId: shop.id, pack: "EXP_10" });
-          } else if (addon.key === "advanced_reporting") {
-            await setRecurringAdvancedReporting({ shopId: shop.id, enabled: true });
           }
         }
       }
@@ -518,7 +509,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       // Apply add-on to subscription
       await applyAddonToSubscription({
         shopId: shop.id,
-        addonKey: addonKey as "credits_2000" | "credits_5000" | "exp_3" | "exp_10" | "advanced_reporting",
+        addonKey: addonKey as "credits_2000" | "credits_5000" | "exp_3" | "exp_10",
       });
 
       return json({ addonPurchased: true, usageRecordId: result.usageRecordId });
@@ -543,17 +534,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  if (actionType === "disable_advanced_reporting") {
-    try {
-      await disableRecurringAdvancedReporting(shop.id);
-      return json({ ok: true, disabled: "advanced_reporting" });
-    } catch (error) {
-      console.error("[Billing] Error disabling advanced reporting:", error);
-      return json({ 
-        error: error instanceof Error ? error.message : "Failed to disable advanced reporting" 
-      });
-    }
-  }
 
   // Cancel subscription
   if (actionType === "cancel_subscription") {
@@ -609,7 +589,6 @@ export default function Billing() {
   
   // Derive recurring add-on state
   const expPackActive = subscription?.experiencesAddon === 3 ? "EXP_3" : subscription?.experiencesAddon === 10 ? "EXP_10" : "NONE";
-  const advancedReportingActive = subscription?.advancedReportingAddon === true;
   
   // Confirmation modal state
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -719,9 +698,7 @@ export default function Billing() {
           boxShadow: "0 4px 12px rgba(245, 158, 11, 0.2)"
         }}>
           <s-text>
-            {addonDisabled === "exp_pack" 
-              ? "Experience add-on disabled. You won't be charged next month." 
-              : "Advanced Reporting disabled. You won't be charged next month."}
+            Experience add-on disabled. You won't be charged next month.
           </s-text>
         </div>
       )}
@@ -820,7 +797,7 @@ export default function Billing() {
                 )}
               </div>
               <div style={{ marginTop: "0.25rem", color: "#666", fontSize: "0.875rem" }}>
-                Candidate cap: {currentPlan.candidateCap}
+                Max products analyzed: {currentPlan.candidateCap}
               </div>
               {currentPlan.price && (
                 <div style={{ marginTop: "0.5rem", fontSize: "1.25rem", fontWeight: "bold" }}>
@@ -1057,7 +1034,12 @@ export default function Billing() {
                 ))}
               </tr>
               <tr style={{ backgroundColor: "#F9FAFB" }}>
-                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Candidate Cap</td>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                  <div>Max Products Analyzed</div>
+                  <div style={{ fontSize: "0.75rem", color: "#666", fontWeight: "normal", marginTop: "0.25rem" }}>
+                    Maximum products analyzed per search
+                  </div>
+                </td>
                 {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.candidateCap}
@@ -1105,7 +1087,7 @@ export default function Billing() {
                     {plan.experiences === null ? "Unlimited" : plan.experiences} experience{plan.experiences === 1 ? "" : "s"}
                   </div>
                   <div style={{ marginBottom: "0.5rem", color: "#666", fontSize: "0.875rem" }}>
-                    Candidate cap: {plan.candidateCap}
+                    Max products analyzed: {plan.candidateCap}
                   </div>
                   <div style={{ marginBottom: "0.5rem", color: "#666", fontSize: "0.875rem" }}>
                     Overage: ${plan.overageRate.toFixed(2)}/credit
@@ -1288,7 +1270,8 @@ export default function Billing() {
             </button>
           </div>
 
-          {/* RECURRING: Experience Packs */}
+          {/* RECURRING: Experience Packs - Hidden for PRO plan (unlimited experiences) */}
+          {(currentPlan.tier as string) !== "PRO" && (
           <div style={{
             padding: "1.5rem",
             border: "1px solid #ddd",
@@ -1361,7 +1344,9 @@ export default function Billing() {
               </button>
             )}
           </div>
+          )}
 
+          {(currentPlan.tier as string) !== "PRO" && (
           <div style={{
             padding: "1.5rem",
             border: "1px solid #ddd",
@@ -1434,101 +1419,7 @@ export default function Billing() {
               </button>
             )}
           </div>
-
-          {/* RECURRING: Advanced Reporting */}
-          <div style={{
-            padding: "1.5rem",
-            border: "1px solid #ddd",
-            borderRadius: "8px",
-            backgroundColor: "#fff"
-          }}>
-            <h4 style={{ margin: 0, marginBottom: "0.5rem" }}>Advanced Reporting</h4>
-            <div style={{ fontSize: "0.75rem", color: "#666", marginBottom: "0.25rem" }}>
-              Recurring monthly
-            </div>
-            <div style={{ fontSize: "1.25rem", fontWeight: "bold", marginBottom: "1rem" }}>
-              $29<span style={{ fontSize: "0.875rem", fontWeight: "normal" }}>/mo</span>
-            </div>
-            {currentPlan.tier === "PRO" ? (
-              // PRO plan: Advanced Reporting is included, show "Included" (not Disable)
-              <button
-                type="button"
-                disabled
-                  style={{
-                    width: "100%",
-                    padding: "0.75rem",
-                    backgroundColor: "#F3F4F6",
-                    color: "rgba(11,11,15,0.62)",
-                    border: "2px solid rgba(11,11,15,0.12)",
-                    borderRadius: "12px",
-                    cursor: "not-allowed",
-                    fontSize: "0.875rem",
-                    fontWeight: "500"
-                  }}
-                >
-                  Included
-                </button>
-            ) : advancedReportingActive ? (
-              // Not PRO, but add-on is active: allow Disable (only for Lite/Growth/Scale with add-on)
-              <Form method="post">
-                <input type="hidden" name="actionType" value="disable_advanced_reporting" />
-                <button
-                  type="submit"
-                  style={{
-                    width: "100%",
-                    padding: "0.75rem",
-                    backgroundColor: "#EF4444",
-                    color: "white",
-                    border: "none",
-                    borderRadius: "12px",
-                    cursor: "pointer",
-                    fontSize: "0.875rem",
-                    fontWeight: "500",
-                    boxShadow: "0 4px 12px rgba(239, 68, 68, 0.3)",
-                    transition: "all 0.2s ease"
-                  }}
-                >
-                  Disable
-                </button>
-              </Form>
-            ) : (
-              // Not PRO, add-on not active: show Enable
-              <button
-                type="button"
-                onClick={() => {
-                  if (subscription?.status === "cancelled") {
-                    alert("Your subscription has been cancelled. Please subscribe to a paid plan first to purchase add-ons.");
-                    return;
-                  }
-                  openConfirm({
-                    actionType: "buy_addon_advanced_reporting",
-                    label: "Advanced Reporting",
-                    priceText: "$29/month",
-                    note: "Renews monthly until disabled. Charged as usage billing."
-                  });
-                }}
-                disabled={subscription?.status === "cancelled"}
-                style={{
-                  width: "100%",
-                  padding: "0.75rem",
-                  background: subscription?.status === "cancelled"
-                    ? "rgba(11,11,15,0.2)"
-                    : "linear-gradient(135deg, #7C3AED, #06B6D4)",
-                  color: "white",
-                  border: "none",
-                  borderRadius: "12px",
-                  cursor: subscription?.status === "cancelled" ? "not-allowed" : "pointer",
-                  fontSize: "0.875rem",
-                  fontWeight: "500",
-                  boxShadow: subscription?.status === "cancelled" ? "none" : "0 4px 12px rgba(124, 58, 237, 0.3)",
-                  transition: "all 0.2s ease",
-                  opacity: subscription?.status === "cancelled" ? 0.6 : 1
-                }}
-              >
-                {subscription?.status === "cancelled" ? "Subscribe to Enable" : "Enable"}
-              </button>
-            )}
-          </div>
+          )}
         </div>
       </s-section>
 

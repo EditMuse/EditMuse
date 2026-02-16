@@ -461,7 +461,6 @@ export async function updateSubscriptionFromCharge(
   // Check if resubscribing within grace period (30 days) and restore preserved credits and recurring add-ons
   let restoredCreditsAddonX2 = 0;
   let restoredExperiencesAddon = 0;
-  let restoredAdvancedReporting = false;
   
   if (currentSubscription?.cancelledAt) {
     const cancelledAt = currentSubscription.cancelledAt;
@@ -474,13 +473,11 @@ export async function updateSubscriptionFromCharge(
       restoredCreditsAddonX2 = currentSubscription.preservedCreditsAddonX2 || 0;
       // Restore preserved recurring add-ons
       restoredExperiencesAddon = currentSubscription.preservedExperiencesAddon || 0;
-      restoredAdvancedReporting = currentSubscription.preservedAdvancedReporting || false;
       
       console.log("[Billing] Restoring preserved add-ons within grace period", {
         shop: shopDomain,
         preservedCredits: restoredCreditsAddonX2 / 2, // Convert X2 to actual credits for logging
         preservedExperiencesAddon: restoredExperiencesAddon,
-        preservedAdvancedReporting: restoredAdvancedReporting,
         daysSinceCancellation: Math.floor(daysSinceCancellation),
       });
     } else {
@@ -510,15 +507,11 @@ export async function updateSubscriptionFromCharge(
       ...(currentSubscription?.cancelledAt && {
         creditsAddonX2: restoredCreditsAddonX2,
         experiencesAddon: restoredExperiencesAddon,
-        advancedReportingAddon: restoredAdvancedReporting,
         // Restore enable dates for monthly billing from enable date
         experiencesAddonEnabledAt: currentSubscription.preservedExperiencesAddonEnabledAt,
-        advancedReportingEnabledAt: currentSubscription.preservedAdvancedReportingEnabledAt,
         preservedCreditsAddonX2: 0, // Clear preserved credits after restoration
         preservedExperiencesAddon: 0, // Clear preserved experiences addon after restoration
-        preservedAdvancedReporting: false, // Clear preserved advanced reporting after restoration
         preservedExperiencesAddonEnabledAt: null, // Clear preserved enable date after restoration
-        preservedAdvancedReportingEnabledAt: null, // Clear preserved enable date after restoration
         cancelledAt: null, // Clear cancellation date
       }),
       // Update plan-specific fields when tier changes
@@ -542,7 +535,6 @@ export async function updateSubscriptionFromCharge(
     experiencesIncluded: planTierChanged ? newExperiencesIncluded : undefined,
     restoredCreditsAddonX2: restoredCreditsAddonX2 > 0 ? restoredCreditsAddonX2 : undefined,
     restoredExperiencesAddon: restoredExperiencesAddon > 0 ? restoredExperiencesAddon : undefined,
-    restoredAdvancedReporting: restoredAdvancedReporting ? true : undefined,
   });
 }
 
@@ -821,11 +813,11 @@ export async function purchaseAddonUsageCharge(params: {
 
 /**
  * Charge recurring add-on for a billing cycle (once per cycle)
- * Used for recurring monthly add-ons: experience packs and advanced reporting
+ * Used for recurring monthly add-ons: experience packs
  */
 export async function chargeRecurringAddonForCycle(params: {
   shopDomain: string;
-  addonKey: "exp_3" | "exp_10" | "advanced_reporting";
+  addonKey: "exp_3" | "exp_10";
   priceUsd: number;
   cycleKey: string;
   opts?: { admin?: any; accessToken?: string };
@@ -875,7 +867,6 @@ export async function purchaseAddon(params: {
     credits_5000: { price: 99, description: "5,000 Credits Pack", type: "credits", amount: 5000 },
     exp_3: { price: 15, description: "+3 Experiences Pack", type: "experiences", amount: 3 },
     exp_10: { price: 39, description: "+10 Experiences Pack", type: "experiences", amount: 10 },
-    advanced_reporting: { price: 29, description: "Advanced Reporting Add-on", type: "reporting" },
   };
 
   const addon = addons[addonKey];
@@ -908,8 +899,6 @@ export async function purchaseAddon(params: {
     updateData.creditsAddonX2 = (subscription.creditsAddonX2 || 0) + creditsX2;
   } else if (addon.type === "experiences" && addon.amount) {
     updateData.experiencesAddon = (subscription.experiencesAddon || 0) + addon.amount;
-  } else if (addon.type === "reporting") {
-    updateData.advancedReportingAddon = true;
   }
 
   await prisma.subscription.update({

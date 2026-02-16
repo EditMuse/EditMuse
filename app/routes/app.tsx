@@ -1,5 +1,5 @@
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
-import { Outlet, useLoaderData, useRouteError } from "react-router";
+import { Outlet, useLoaderData, useRouteError, Link } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 
@@ -8,14 +8,16 @@ import { authenticate } from "~/shopify.server";
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
 
+  const url = new URL(request.url);
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  return { apiKey: process.env.SHOPIFY_API_KEY || "", pathname: url.pathname };
 };
 
 // Breadcrumb component
 function Breadcrumbs() {
-  const location = useLocation();
-  const pathname = location.pathname;
+  // Get pathname from loader data (SSR-safe)
+  const loaderData = useLoaderData<typeof loader>();
+  const pathname = loaderData.pathname || "";
 
   const breadcrumbMap: Record<string, { label: string; path: string }[]> = {
     "/app/dashboard": [{ label: "Dashboard", path: "/app/dashboard" }],

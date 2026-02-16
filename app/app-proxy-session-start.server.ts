@@ -3510,7 +3510,6 @@ export async function proxySessionStartAction(
       candidateCap: 100,
       canBasicReporting: true,
       canMidReporting: false,
-      canAdvancedReporting: false,
       overageRatePerCredit: 0.12,
       showTrialBadge: true,
     };

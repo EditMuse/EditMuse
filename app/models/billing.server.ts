@@ -288,7 +288,6 @@ export async function getOrCreateSubscription(shopId: string) {
           creditsIncludedX2: newCreditsIncludedX2, // Reset to plan amount
           creditsAddonX2: newCreditsAddonX2, // Adjust to remaining add-on credits
           // experiencesAddon is NOT reset (recurring add-on persists across cycles)
-          // advancedReportingAddon is NOT reset (recurring add-on persists across cycles)
           currentPeriodStart: newPeriodStart,
           currentPeriodEnd: newPeriodEnd,
           billingIntervalAnchor: newPeriodStart, // Update anchor
@@ -298,7 +297,7 @@ export async function getOrCreateSubscription(shopId: string) {
       subscription.creditsUsedX2 = 0;
       subscription.creditsIncludedX2 = newCreditsIncludedX2;
       subscription.creditsAddonX2 = newCreditsAddonX2;
-      // experiencesAddon and advancedReportingAddon persist (recurring)
+      // experiencesAddon persists (recurring)
       subscription.currentPeriodStart = newPeriodStart;
       subscription.currentPeriodEnd = newPeriodEnd;
       subscription.billingIntervalAnchor = newPeriodStart;
@@ -379,7 +378,6 @@ export async function getEntitlements(shopId: string) {
       candidateCap: 0,
       canBasicReporting: false,
       canMidReporting: false,
-      canAdvancedReporting: false,
       overageRatePerCredit: 0,
       showTrialBadge: false,
     };
@@ -403,10 +401,9 @@ export async function getEntitlements(shopId: string) {
         remainingX2: 0,
         experiencesLimit: 0,
         candidateCap: 0,
-        canBasicReporting: false,
-        canMidReporting: false,
-        canAdvancedReporting: false,
-        overageRatePerCredit: 0,
+      canBasicReporting: false,
+      canMidReporting: false,
+      overageRatePerCredit: 0,
         showTrialBadge: false,
       };
     }
@@ -426,7 +423,6 @@ export async function getEntitlements(shopId: string) {
   // Reporting flags
   const canBasicReporting = true; // All plans have basic reporting
   const canMidReporting = subscription.planTier === PLAN_TIER.SCALE || subscription.planTier === PLAN_TIER.PRO;
-  const canAdvancedReporting = subscription.planTier === PLAN_TIER.PRO || subscription.advancedReportingAddon === true;
 
   const overageRatePerCredit = plan.overageRate;
   const showTrialBadge = plan.badge || false;
@@ -442,7 +438,6 @@ export async function getEntitlements(shopId: string) {
     candidateCap,
     canBasicReporting,
     canMidReporting,
-    canAdvancedReporting,
     overageRatePerCredit,
     showTrialBadge,
   };
@@ -700,7 +695,7 @@ export async function chargeConciergeSessionOnce(params: {
  */
 export async function applyAddonToSubscription(params: {
   shopId: string;
-  addonKey: "credits_2000" | "credits_5000" | "exp_3" | "exp_10" | "advanced_reporting";
+  addonKey: "credits_2000" | "credits_5000" | "exp_3" | "exp_10";
 }): Promise<{ ok: true }> {
   const { shopId, addonKey } = params;
 
@@ -733,10 +728,6 @@ export async function applyAddonToSubscription(params: {
         break;
       case "exp_10":
         updateData.experiencesAddon = 10; // Set to pack size (not additive)
-        break;
-      // RECURRING advanced reporting (persist across cycles)
-      case "advanced_reporting":
-        updateData.advancedReportingAddon = true;
         break;
       default:
         throw new Error(`Unknown add-on key: ${addonKey}`);
@@ -775,28 +766,6 @@ export async function setRecurringExperiencePack(params: {
 }
 
 /**
- * Set recurring advanced reporting add-on (recurring monthly)
- */
-export async function setRecurringAdvancedReporting(params: {
-  shopId: string;
-  enabled: boolean;
-}): Promise<{ ok: true }> {
-  const { shopId, enabled } = params;
-
-  const now = new Date();
-  await prisma.subscription.update({
-    where: { shopId },
-    data: {
-      advancedReportingAddon: enabled,
-      // Store enable date for monthly billing from enable date (not cycle rollover)
-      advancedReportingEnabledAt: enabled ? now : null,
-    },
-  });
-
-  return { ok: true };
-}
-
-/**
  * Disable recurring experience pack (sets experiencesAddon to 0)
  */
 export async function disableRecurringExperiencePack(shopId: string): Promise<{ ok: true }> {
@@ -811,20 +780,6 @@ export async function disableRecurringExperiencePack(shopId: string): Promise<{ 
   return { ok: true };
 }
 
-/**
- * Disable recurring advanced reporting add-on
- */
-export async function disableRecurringAdvancedReporting(shopId: string): Promise<{ ok: true }> {
-  await prisma.subscription.update({
-    where: { shopId },
-    data: { 
-      advancedReportingAddon: false,
-      advancedReportingEnabledAt: null, // Clear enable date when disabled
-    },
-  });
-
-  return { ok: true };
-}
 
 /**
  * Mark subscription as cancelled - blocks access until they subscribe again
@@ -858,9 +813,7 @@ export async function markSubscriptionAsCancelled(shopId: string): Promise<{ ok:
 
   // Preserve recurring add-on state and enable dates for grace period restoration
   const preservedExperiencesAddon = subscription.experiencesAddon || 0;
-  const preservedAdvancedReporting = subscription.advancedReportingAddon || false;
   const preservedExperiencesAddonEnabledAt = subscription.experiencesAddonEnabledAt;
-  const preservedAdvancedReportingEnabledAt = subscription.advancedReportingEnabledAt;
 
   // Mark subscription as cancelled - keep planTier but set status to cancelled
   // This blocks all access until they subscribe again
@@ -871,16 +824,12 @@ export async function markSubscriptionAsCancelled(shopId: string): Promise<{ ok:
       creditsAddonX2: 0, // Reset add-on credits (will be restored if resubscribe within grace period)
       creditsUsedX2: 0, // Reset usage
       experiencesAddon: 0, // Disable recurring experience packs (will be restored if resubscribe within grace period)
-      advancedReportingAddon: false, // Disable advanced reporting (will be restored if resubscribe within grace period)
       // Preserve unused add-on credits and recurring add-on state for grace period restoration
       preservedCreditsAddonX2: unusedAddonCreditsX2,
       preservedExperiencesAddon: preservedExperiencesAddon,
-      preservedAdvancedReporting: preservedAdvancedReporting,
       // Preserve enable dates so we can restore monthly billing from enable date
       preservedExperiencesAddonEnabledAt: preservedExperiencesAddonEnabledAt,
-      preservedAdvancedReportingEnabledAt: preservedAdvancedReportingEnabledAt,
       experiencesAddonEnabledAt: null, // Clear on cancellation (will be restored from preserved state)
-      advancedReportingEnabledAt: null, // Clear on cancellation (will be restored from preserved state)
       cancelledAt: new Date(), // Store cancellation timestamp
       // Clear Shopify subscription IDs (subscription is cancelled)
       shopifySubscriptionGid: null,
@@ -896,7 +845,6 @@ export async function markSubscriptionAsCancelled(shopId: string): Promise<{ ok:
     shopId,
     preservedCredits: unusedAddonCreditsX2 / 2, // Convert X2 to actual credits for logging
     preservedExperiencesAddon: preservedExperiencesAddon,
-    preservedAdvancedReporting: preservedAdvancedReporting,
     note: "Access blocked - must subscribe to continue. Unused add-on credits and recurring add-ons preserved for 30-day grace period.",
   });
 
@@ -1012,28 +960,6 @@ export async function chargeRecurringAddonsMonthly(shopId: string): Promise<bool
         });
       } catch (error) {
         console.error("[Billing] Error charging recurring exp_10 on monthly anniversary:", error);
-      }
-    }
-  }
-
-  // Charge recurring advanced reporting if enabled and monthly anniversary has passed
-  if (subscription.advancedReportingAddon === true && subscription.advancedReportingEnabledAt) {
-    if (isMonthlyAnniversary(subscription.advancedReportingEnabledAt)) {
-      try {
-        const cycleKey = getMonthlyCycleKey(subscription.advancedReportingEnabledAt);
-        await chargeRecurringAddonForCycle({
-          shopDomain: shop.domain,
-          addonKey: "advanced_reporting",
-          priceUsd: 29,
-          cycleKey,
-        });
-        charged = true;
-        console.log("[Billing] Charged recurring advanced_reporting on monthly anniversary", {
-          shop: shop.domain,
-          enabledAt: subscription.advancedReportingEnabledAt,
-        });
-      } catch (error) {
-        console.error("[Billing] Error charging recurring advanced_reporting on monthly anniversary:", error);
       }
     }
   }
