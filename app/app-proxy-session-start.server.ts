@@ -10918,10 +10918,38 @@ async function processSessionInBackground({
           // Industry-agnostic: aggressively search remaining candidates, including fetching descriptions if needed
           // Use allCandidatesEnriched (all candidates with descriptions) instead of gatedCandidates (only gated ones) or sortedCandidates (only top AI window)
           if (constraintMatchedHandles.length < finalResultCount) {
-            const remainingCandidates = allCandidatesEnriched.filter(c => 
+            let remainingCandidates = allCandidatesEnriched.filter(c => 
               !constraintMatchedHandles.includes(c.handle) && 
               !used.has(c.handle)
             );
+            
+            // CRITICAL: Filter to only check candidates that match at least one primary constraint term in title/tags/handle
+            // This avoids checking irrelevant products (e.g., pet food) that won't have the constraint term in description
+            // Use primary terms (first 5 unique constraint terms) to filter
+            const primaryConstraintTerms = uniqueConstraintTerms.slice(0, 5).map(t => t.toLowerCase());
+            const totalRemainingBeforeFilter = remainingCandidates.length;
+            if (primaryConstraintTerms.length > 0) {
+              const filteredCandidates = remainingCandidates.filter(c => {
+                const searchText = c.searchText || extractSearchText(c, indexMetafields);
+                const searchTextLower = searchText.toLowerCase();
+                // Check if any primary constraint term appears in title/tags/handle
+                return primaryConstraintTerms.some(term => {
+                  if (term.includes(" ")) {
+                    return searchTextLower.includes(term);
+                  }
+                  const wordBoundaryRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                  return wordBoundaryRegex.test(searchTextLower);
+                });
+              });
+              
+              // If we have filtered candidates, use them; otherwise fall back to all remaining
+              if (filteredCandidates.length > 0) {
+                remainingCandidates = filteredCandidates;
+                console.log(`[DeepSearch] post_ai_topup filtered to ${remainingCandidates.length} candidates matching primary constraint terms [${primaryConstraintTerms.join(", ")}] (from ${totalRemainingBeforeFilter} total remaining)`);
+              } else {
+                console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}], checking all ${totalRemainingBeforeFilter} remaining`);
+              }
+            }
             
             // Count how many remaining candidates have descriptions
             const remainingWithDescriptions = remainingCandidates.filter(c => c.descPlain || c.description).length;
@@ -10953,7 +10981,56 @@ async function processSessionInBackground({
               }
             }
             
-            // Check remaining candidates for constraint matches (now with descriptions if fetched)
+            // CRITICAL: Rank remaining candidates by BM25 relevance BEFORE checking descriptions
+            // This ensures we check the most relevant products first, not just random ones
+            // Use hardTerms (which should already be expanded if term expansion was applied)
+            const rankingQueryTokens = hardTerms.flatMap(term => tokenize(term.toLowerCase()));
+            
+            if (remainingCandidates.length > 0 && rankingQueryTokens.length > 0) {
+              // Build BM25 index for remaining candidates
+              const remainingDocs = remainingCandidates.map(c => {
+                const searchText = c.searchText || extractSearchText(c, indexMetafields);
+                return {
+                  candidate: c,
+                  tokens: tokenize(searchText.toLowerCase()),
+                };
+              });
+              
+              // Calculate IDF and average document length for BM25
+              const remainingIdf = calculateIDF(remainingDocs.map(d => ({ tokens: d.tokens })));
+              const remainingAvgDocLen = remainingDocs.reduce((sum, d) => sum + d.tokens.length, 0) / remainingDocs.length || 1;
+              
+              // Calculate BM25 scores for each candidate
+              const rankedRemaining = remainingDocs.map(d => {
+                const docTokenFreq = new Map<string, number>();
+                for (const token of d.tokens) {
+                  docTokenFreq.set(token, (docTokenFreq.get(token) || 0) + 1);
+                }
+                
+                let score = bm25Score(rankingQueryTokens, d.tokens, docTokenFreq, d.tokens.length, remainingAvgDocLen, remainingIdf);
+                
+                // Boost for primary constraint terms (multi-word phrases get higher boost)
+                for (const term of uniqueConstraintTerms.slice(0, 3)) {
+                  const termLower = term.toLowerCase();
+                  const searchText = d.candidate.searchText || extractSearchText(d.candidate, indexMetafields);
+                  if (searchText.toLowerCase().includes(termLower)) {
+                    score += term.includes(" ") ? 2.0 : 1.0; // Higher boost for phrases
+                  }
+                }
+                
+                return { candidate: d.candidate, score };
+              });
+              
+              // Sort by BM25 score descending (most relevant first)
+              rankedRemaining.sort((a, b) => b.score - a.score);
+              
+              // Update remainingCandidates to be sorted by relevance
+              remainingCandidates = rankedRemaining.map(r => r.candidate);
+              
+              console.log(`[DeepSearch] post_ai_topup ranked ${remainingCandidates.length} candidates by BM25 relevance (top 5 scores: ${rankedRemaining.slice(0, 5).map(r => r.score.toFixed(2)).join(", ")})`);
+            }
+            
+            // Check remaining candidates for constraint matches (now sorted by BM25 relevance)
             // CRITICAL: Rebuild searchText to ensure it includes descriptions that were fetched earlier
             let checkedCount = 0;
             let matchedCount = 0;
@@ -10966,9 +11043,18 @@ async function processSessionInBackground({
               candidate.searchText = extractSearchText(candidate, indexMetafields);
               const searchTextLower = candidate.searchText.toLowerCase();
               
-              // Also check description explicitly (in case it's not in searchText yet)
-              const descText = (candidate.descPlain || candidate.description || "").toLowerCase();
-              const combinedText = `${searchTextLower} ${descText}`;
+              // Also check description explicitly (use full description, not just snippet)
+              // Use descPlain (full), desc1000 (1000 chars), or description (raw), in that order
+              let descText = "";
+              if (candidate.descPlain) {
+                descText = candidate.descPlain;
+              } else if (candidate.desc1000) {
+                descText = candidate.desc1000;
+              } else if (candidate.description) {
+                descText = cleanDescription(candidate.description);
+              }
+              const descTextLower = descText.toLowerCase();
+              const combinedText = `${searchTextLower} ${descTextLower}`;
               
               const matchesConstraint = uniqueConstraintTerms.some(term => {
                 const termLower = term.toLowerCase();
