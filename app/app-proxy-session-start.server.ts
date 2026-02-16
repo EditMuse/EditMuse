@@ -4441,21 +4441,27 @@ async function processSessionInBackground({
                     p.title || "",
                     p.productType || "",
                     (p.tags || []).join(" "),
-                    p.vendor || ""
+                    p.vendor || "",
+                    p.handle || "" // Include handle to catch patterns like "0-perfume" in URL
                   ].join(" ").toLowerCase();
                   
-                  // Check for negative patterns with keywords (with space and hyphen support)
+                  // Check for negative patterns with keywords (with space, hyphen, and percentage support)
                   const hasNegativeMatch = meaningfulKeywords.some(keyword => {
                     const keywordLower = keyword.toLowerCase();
                     // Pattern 1a: negative indicator + keyword with space (e.g., "no perfume", "sans parfum")
                     const pattern1a = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
                     // Pattern 1b: negative indicator + keyword with hyphen (e.g., "no-perfume", "0-perfume")
                     const pattern1b = new RegExp(`\\b(?:${negativeIndicators.join("|")})[-_]${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 1c: negative indicator + % + keyword (e.g., "0% perfume", "zero% perfume")
+                    const pattern1c = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s*%\\s*${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
                     // Pattern 2a: keyword + negative indicator with space (e.g., "perfume free", "parfum sans")
                     const pattern2a = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
                     // Pattern 2b: keyword + negative indicator with hyphen (e.g., "perfume-free", "parfum-sans")
                     const pattern2b = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_](?:${negativeIndicators.join("|")})\\b`, 'i');
-                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
+                    // Pattern 2c: keyword + % + negative indicator (e.g., "perfume 0%", "parfum zero%")
+                    const pattern2c = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+%\\s*(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern1c.test(searchableText) ||
+                           pattern2a.test(searchableText) || pattern2b.test(searchableText) || pattern2c.test(searchableText);
                   });
                   
                   if (hasNegativeMatch) return false;
@@ -6411,43 +6417,53 @@ async function processSessionInBackground({
                 console.log(`[SmartFetch] fetched=${itemFetch.products.length} sample_titles=[${sampleTitlesItem.join(", ")}]`);
                 
                 // Filter out negative matches (industry-agnostic)
-                // Exclude products that mention the itemType in negative contexts (e.g., "perfume free", "no perfume", "0-perfume")
+                // Exclude products that mention the itemType in negative contexts (e.g., "perfume free", "no perfume", "0-perfume", "0% perfume")
                 const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "0", "ohne", "sin"];
                 const itemTypeLower = itemType.toLowerCase();
                 const meaningfulTermsForNegative = meaningfulTerms.filter(term => term.length >= 4); // Only meaningful terms for negative check
                 
                 const filteredProducts = itemFetch.products.filter((p: any) => {
-                  // Build searchable text from product
+                  // Build searchable text from product (include handle for patterns like "0-perfume")
                   const searchableText = [
                     p.title || "",
                     p.productType || "",
                     (p.tags || []).join(" "),
-                    p.vendor || ""
+                    p.vendor || "",
+                    p.handle || "" // Include handle to catch patterns like "0-perfume" in URL
                   ].join(" ").toLowerCase();
                   
                   // Check for negative patterns (industry-agnostic)
+                  // Support percentage signs (e.g., "0% perfume") and various separators
                   const hasNegativeMatch = meaningfulTermsForNegative.some(term => {
                     const termLower = term.toLowerCase();
-                    // Pattern 1: negative indicator + term with space (e.g., "no perfume", "sans parfum")
+                    // Pattern 1a: negative indicator + term with space (e.g., "no perfume", "sans parfum")
                     const pattern1a = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s+${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    // Pattern 1b: negative indicator + term with hyphen (e.g., "no-perfume", "0-perfume")
+                    // Pattern 1b: negative indicator + term with hyphen/underscore (e.g., "no-perfume", "0-perfume")
                     const pattern1b = new RegExp(`\\b(?:${negativeIndicators.join("|")})[-_]${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    // Pattern 2: term + negative indicator with space (e.g., "perfume free", "parfum sans")
+                    // Pattern 1c: negative indicator + % + term (e.g., "0% perfume", "zero% perfume")
+                    const pattern1c = new RegExp(`\\b(?:${negativeIndicators.join("|")})\\s*%\\s*${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2a: term + negative indicator with space (e.g., "perfume free", "parfum sans")
                     const pattern2a = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:${negativeIndicators.join("|")})\\b`, 'i');
-                    // Pattern 2b: term + negative indicator with hyphen (e.g., "perfume-free", "parfum-sans")
+                    // Pattern 2b: term + negative indicator with hyphen/underscore (e.g., "perfume-free", "parfum-sans")
                     const pattern2b = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_](?:${negativeIndicators.join("|")})\\b`, 'i');
-                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
+                    // Pattern 2c: term + % + negative indicator (e.g., "perfume 0%", "parfum zero%")
+                    const pattern2c = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+%\\s*(?:${negativeIndicators.join("|")})\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern1c.test(searchableText) || 
+                           pattern2a.test(searchableText) || pattern2b.test(searchableText) || pattern2c.test(searchableText);
                   });
                   
-                  // Also check itemType itself for negative patterns
+                  // Also check itemType itself for negative patterns (with percentage support)
                   const itemTypeNegative = negativeIndicators.some(indicator => {
-                    // Pattern 1: negative indicator + itemType with space or hyphen
+                    // Pattern 1: negative indicator + itemType with space, hyphen, or percentage
                     const pattern1a = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
                     const pattern1b = new RegExp(`\\b${indicator}[-_]${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    // Pattern 2: itemType + negative indicator with space or hyphen
+                    const pattern1c = new RegExp(`\\b${indicator}\\s*%\\s*${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    // Pattern 2: itemType + negative indicator with space, hyphen, or percentage
                     const pattern2a = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
                     const pattern2b = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]${indicator}\\b`, 'i');
-                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
+                    const pattern2c = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+%\\s*${indicator}\\b`, 'i');
+                    return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern1c.test(searchableText) ||
+                           pattern2a.test(searchableText) || pattern2b.test(searchableText) || pattern2c.test(searchableText);
                   });
                   
                   return !hasNegativeMatch && !itemTypeNegative;
@@ -6495,21 +6511,26 @@ async function processSessionInBackground({
                     console.log(`[SmartFetch] fetched=${fallbackFetch.products.length} sample_titles=[${sampleTitlesFallback.join(", ")}]`);
                     
                     // Filter out negative matches in fallback fetch too (industry-agnostic)
+                    // Support percentage signs (e.g., "0% perfume") and include handle
                     const fallbackFiltered = fallbackFetch.products.filter((p: any) => {
                       const searchableText = [
                         p.title || "",
                         p.productType || "",
                         (p.tags || []).join(" "),
-                        p.vendor || ""
+                        p.vendor || "",
+                        p.handle || "" // Include handle to catch patterns like "0-perfume" in URL
                       ].join(" ").toLowerCase();
                       
-                      // Check itemType for negative patterns (with space and hyphen support)
+                      // Check itemType for negative patterns (with space, hyphen, and percentage support)
                       const itemTypeNegative = negativeIndicators.some(indicator => {
                         const pattern1a = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
                         const pattern1b = new RegExp(`\\b${indicator}[-_]${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        const pattern1c = new RegExp(`\\b${indicator}\\s*%\\s*${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
                         const pattern2a = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
                         const pattern2b = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]${indicator}\\b`, 'i');
-                        return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern2a.test(searchableText) || pattern2b.test(searchableText);
+                        const pattern2c = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+%\\s*${indicator}\\b`, 'i');
+                        return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern1c.test(searchableText) ||
+                               pattern2a.test(searchableText) || pattern2b.test(searchableText) || pattern2c.test(searchableText);
                       });
                       
                       return !itemTypeNegative;
@@ -11069,12 +11090,14 @@ async function processSessionInBackground({
                 console.log(`[DeepSearch] post_ai_topup no candidates match primary constraint terms [${primaryConstraintTerms.join(", ")}] in title/tags/handle, checking ALL existing candidates' descriptions`);
                 
                 // Check ALL existing candidates (not just remaining) for constraint terms in descriptions
-                // We already fetched descriptions for all 214 candidates earlier
+                // We already fetched descriptions for all candidates earlier
+                // CRITICAL: Only skip candidates already in constraintMatchedHandles - check ALL others even if in 'used'
+                // The 'used' set tracks AI-selected handles, but we should still check their descriptions
                 const candidatesWithConstraintInDescription: EnrichedCandidate[] = [];
                 
                 for (const candidate of allCandidatesEnriched) {
-                  // Skip if already matched or used
-                  if (constraintMatchedHandles.includes(candidate.handle) || used.has(candidate.handle)) {
+                  // Only skip if already matched - don't skip just because it's in 'used' (we want to check descriptions)
+                  if (constraintMatchedHandles.includes(candidate.handle)) {
                     continue;
                   }
                   
@@ -11107,7 +11130,7 @@ async function processSessionInBackground({
                   }
                 }
                 
-                console.log(`[DeepSearch] post_ai_topup found=${candidatesWithConstraintInDescription.length} existing candidates with constraint terms in descriptions (from ${allCandidatesEnriched.length} total candidates)`);
+                console.log(`[DeepSearch] post_ai_topup found=${candidatesWithConstraintInDescription.length} existing candidates with constraint terms in descriptions (from ${allCandidatesEnriched.length} total candidates, constraintMatched=${constraintMatchedHandles.length}, used=${used.size})`);
                 
                 if (candidatesWithConstraintInDescription.length > 0) {
                   // Use these candidates for top-up
@@ -11831,8 +11854,11 @@ async function processSessionInBackground({
         // BUNDLE VALIDATION: Three separate validation stages
         
         // Helper function for robust bundle item matching
-        // Accepts plural forms, prefers canonicalType, uses token-based or substring matching
+        // Industry-agnostic: Prefers productType matching, filters out products where item type is a modifier/ingredient
         function matchesBundleItem(candidate: EnrichedCandidate, bundleItem: { hardTerms: string[]; canonicalType?: string }): boolean {
+          const title = (candidate.title || "").toLowerCase();
+          const productType = (candidate.productType || "").toLowerCase();
+          const tags = ((candidate.tags || []).join(" ") || "").toLowerCase();
           const haystack = [
             candidate.title || "",
             candidate.productType || "",
@@ -11852,54 +11878,89 @@ async function processSessionInBackground({
             "shirts": ["shirt", "shirts"],
             "coat": ["coats", "coat"],
             "coats": ["coat", "coats"],
+            "perfume": ["perfumes", "perfume"],
+            "perfumes": ["perfume", "perfumes"],
           };
+          
+          // Industry-agnostic: Filter out products where item type appears as a modifier/ingredient
+          // Common patterns: "perfume talc", "perfume soap", "perfume-free", etc.
+          // If productType contains other product types (talc, soap, etc.), it's likely not the item type
+          const commonOtherTypes = ["talc", "soap", "shampoo", "lotion", "cream", "gel", "powder", "wipes", "tissue"];
+          const productTypeLower = productType.toLowerCase();
+          const hasOtherTypeInProductType = commonOtherTypes.some(otherType => {
+            const otherTypeRegex = new RegExp(`\\b${otherType}\\b`, 'i');
+            return otherTypeRegex.test(productTypeLower);
+          });
           
           // Prefer matching by canonicalType if available
           if (bundleItem.canonicalType) {
             const normalizedCanonical = normalizeText(bundleItem.canonicalType);
-            // Check exact match or substring match
-            if (normalizedHaystack.includes(normalizedCanonical) || normalizedCanonical.includes(normalizedHaystack.split(/\s+/)[0])) {
-              return true;
+            
+            // STRICT: If productType contains the canonical type, it's a strong match
+            if (productTypeLower.includes(normalizedCanonical) || normalizedCanonical.includes(productTypeLower.split(/\s+/)[0])) {
+              // But exclude if productType also contains other product types (e.g., "perfume talc" where productType="Talc")
+              if (!hasOtherTypeInProductType || productTypeLower.includes(normalizedCanonical)) {
+                return true;
+              }
             }
+            
+            // Check title for canonical type (word-boundary matching for single words)
+            if (!normalizedCanonical.includes(" ")) {
+              const canonicalRegex = new RegExp(`\\b${normalizedCanonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+              if (canonicalRegex.test(title) && !hasOtherTypeInProductType) {
+                return true;
+              }
+            } else {
+              // Multi-word: check if canonical appears in title
+              if (title.includes(normalizedCanonical) && !hasOtherTypeInProductType) {
+                return true;
+              }
+            }
+            
             // Check plural forms
             const canonicalPlurals = pluralForms[normalizedCanonical] || [];
             for (const plural of canonicalPlurals) {
-              if (normalizedHaystack.includes(normalizeText(plural))) {
+              const normalizedPlural = normalizeText(plural);
+              if (productTypeLower.includes(normalizedPlural) || (title.includes(normalizedPlural) && !hasOtherTypeInProductType)) {
                 return true;
               }
             }
           }
           
-          // Match any of the item hardTerms using token-based or substring matching
+          // Match any of the item hardTerms (stricter matching)
           for (const term of bundleItem.hardTerms) {
             const normalizedTerm = normalizeText(term);
             
-            // Token-based matching: check if any token from term appears in haystack
-            const termTokens = normalizedTerm.split(/\s+/).filter(t => t.length > 2); // Filter out short tokens
-            if (termTokens.length > 0) {
-              const allTokensMatch = termTokens.every(token => normalizedHaystack.includes(token));
-              if (allTokensMatch) {
+            // STRICT: Prefer productType match (stronger signal)
+            if (!normalizedTerm.includes(" ")) {
+              // Single-word term: use word-boundary matching in productType
+              const termRegex = new RegExp(`\\b${normalizedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+              if (termRegex.test(productTypeLower)) {
+                // Exclude if productType also contains other product types
+                if (!hasOtherTypeInProductType) {
+                  return true;
+                }
+              }
+              
+              // Also check title with word-boundary (but exclude if productType has other types)
+              if (termRegex.test(title) && !hasOtherTypeInProductType) {
                 return true;
               }
-            }
-            
-            // Substring matching (not strict word-boundary only)
-            if (normalizedHaystack.includes(normalizedTerm) || normalizedTerm.includes(normalizedHaystack.split(/\s+/)[0])) {
-              return true;
+            } else {
+              // Multi-word term: check if it appears in productType or title
+              if (productTypeLower.includes(normalizedTerm) && !hasOtherTypeInProductType) {
+                return true;
+              }
+              if (title.includes(normalizedTerm) && !hasOtherTypeInProductType) {
+                return true;
+              }
             }
             
             // Check plural forms
             const termPlurals = pluralForms[normalizedTerm] || [];
             for (const plural of termPlurals) {
-              if (normalizedHaystack.includes(normalizeText(plural))) {
-                return true;
-              }
-            }
-            
-            // Fallback to word-boundary matching for single-word terms
-            if (!normalizedTerm.includes(" ")) {
-              const regex = new RegExp(`\\b${normalizedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-              if (regex.test(normalizedHaystack)) {
+              const normalizedPlural = normalizeText(plural);
+              if (productTypeLower.includes(normalizedPlural) || (title.includes(normalizedPlural) && !hasOtherTypeInProductType)) {
                 return true;
               }
             }
@@ -11977,13 +12038,81 @@ async function processSessionInBackground({
           console.warn(`[Bundle Validation] (a) handle_existence FAILED: 0 handles exist - treating as NO_MATCH (DO NOT bypass even if source=ai)`);
           validatedHandles = [];
         } else {
+          // (a.5) Negative filtering and item type validation: Filter out products with negative matches or incorrect product types
+          // Industry-agnostic: Catch products that slipped through earlier filtering
+          const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "0", "ohne", "sin"];
+          const commonOtherTypes = ["talc", "soap", "shampoo", "lotion", "cream", "gel", "powder", "wipes", "tissue"];
+          
+          const handleExistenceAndTypeValid = handleExistenceValid.filter(handle => {
+            const candidate = candidateMap.get(handle);
+            if (!candidate) return false;
+            
+            // Find which bundle item this handle is assigned to (will be assigned later, but we can check all items)
+            for (let itemIdx = 0; itemIdx < bundleIntent.items.length; itemIdx++) {
+              const bundleItem = bundleIntent.items[itemIdx];
+              const itemType = (bundleItem as any).canonicalType || bundleItem.hardTerms[0] || "";
+              if (!itemType) continue;
+              
+              const itemTypeLower = itemType.toLowerCase();
+              const searchableText = [
+                candidate.title || "",
+                candidate.productType || "",
+                (candidate.tags || []).join(" "),
+                candidate.vendor || "",
+                candidate.handle || ""
+              ].join(" ").toLowerCase();
+              
+              // Check for negative patterns (with percentage support)
+              const hasNegativeMatch = negativeIndicators.some(indicator => {
+                const pattern1a = new RegExp(`\\b${indicator}\\s+${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                const pattern1b = new RegExp(`\\b${indicator}[-_]${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                const pattern1c = new RegExp(`\\b${indicator}\\s*%\\s*${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                const pattern2a = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+${indicator}\\b`, 'i');
+                const pattern2b = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]${indicator}\\b`, 'i');
+                const pattern2c = new RegExp(`\\b${itemTypeLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+%\\s*${indicator}\\b`, 'i');
+                return pattern1a.test(searchableText) || pattern1b.test(searchableText) || pattern1c.test(searchableText) ||
+                       pattern2a.test(searchableText) || pattern2b.test(searchableText) || pattern2c.test(searchableText);
+              });
+              
+              if (hasNegativeMatch) {
+                console.log(`[Bundle Validation] (a.5) negative_match filtered handle=${handle} itemType=${itemType} reason=negative_pattern`);
+                return false;
+              }
+              
+              // Check if productType contains other product types (e.g., "talc" when looking for "perfume")
+              const productTypeLower = (candidate.productType || "").toLowerCase();
+              const hasOtherTypeInProductType = commonOtherTypes.some(otherType => {
+                if (otherType === itemTypeLower) return false; // Don't filter if it's the same type
+                const otherTypeRegex = new RegExp(`\\b${otherType}\\b`, 'i');
+                return otherTypeRegex.test(productTypeLower);
+              });
+              
+              // If productType contains other types AND doesn't contain the item type, it's likely wrong
+              if (hasOtherTypeInProductType && !productTypeLower.includes(itemTypeLower)) {
+                // Check if title contains item type (might be a modifier)
+                const titleLower = (candidate.title || "").toLowerCase();
+                if (!titleLower.includes(itemTypeLower)) {
+                  console.log(`[Bundle Validation] (a.5) wrong_type filtered handle=${handle} itemType=${itemType} productType=${candidate.productType} reason=other_type_in_productType`);
+                  return false;
+                }
+              }
+            }
+            
+            return true;
+          });
+          
+          const filteredByNegativeAndType = handleExistenceValid.length - handleExistenceAndTypeValid.length;
+          if (filteredByNegativeAndType > 0) {
+            console.log(`[Bundle Validation] (a.5) negative_and_type_filter: filtered=${filteredByNegativeAndType} remaining=${handleExistenceAndTypeValid.length}`);
+          }
+          
           // (b) Per-item constraint validation: Validate each handle against its item's merged constraints using satisfiesConstraintsStructuredOrTags()
           // Group handles by itemIndex using AI's mapping (if available) or scored assignment
           const handlesByItemIndex = new Map<number, string[]>();
           let assignedCount = 0;
           let unassignedCount = 0;
           
-          for (const handle of handleExistenceValid) {
+          for (const handle of handleExistenceAndTypeValid) {
             // Use AI itemIndex mapping if available (preferred), otherwise use scored assignment
             let itemIdx: number | null = null;
             if (aiItemIndexMap && aiItemIndexMap.has(handle)) {
@@ -12026,7 +12155,7 @@ async function processSessionInBackground({
             }
           }
           
-          console.log(`[BundleMapping] assigned=${assignedCount} unassigned=${unassignedCount} total=${handleExistenceValid.length}`);
+          console.log(`[BundleMapping] assigned=${assignedCount} unassigned=${unassignedCount} total=${handleExistenceAndTypeValid.length}`);
           
           // First pass: Check if ANY item has constraints (size/color/material)
           let hasAnyConstraints = false;
@@ -12186,10 +12315,10 @@ async function processSessionInBackground({
             
             // REQUIREMENT 2: If constraint validation returns 0, keep AI handles if source=ai
           if (constraintValid.length === 0) {
-              if (finalSource === "ai" && handleExistenceValid.length > 0) {
-                // Keep AI handles (existence + inStock filtered) - treat as suspicious
+              if (finalSource === "ai" && handleExistenceAndTypeValid.length > 0) {
+                // Keep AI handles (existence + negative/type filtered + inStock filtered) - treat as suspicious
                 console.warn(`[Bundle Validation] (b) constraint_validation FAILED: 0 handles pass constraints BUT source=ai - keeping AI handles (validation_suspicious=true)`);
-                const aiHandlesKept = handleExistenceValid.filter(handle => {
+                const aiHandlesKept = handleExistenceAndTypeValid.filter(handle => {
                   const candidate = candidateMap.get(handle);
                   if (!candidate) return false;
                   if (experience.inStockOnly && !candidate.available) return false;
