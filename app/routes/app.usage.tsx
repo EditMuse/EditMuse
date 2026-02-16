@@ -18,6 +18,15 @@ type LoaderData = {
   creditsUsagePercent: number;
   nextPlanTier?: string;
   nextPlanName?: string;
+  creditsForecast: {
+    dailyBurnRate: number;
+    daysUntilExhaustion: number | null;
+    projectedMonthlyBurn: number;
+  };
+  usageTrends: {
+    dailyBurn: Array<{ date: string; credits: number }>;
+    hourlyPeak: { hour: number; credits: number };
+  };
 };
 
 function safeJson(s: string | null) {
@@ -479,7 +488,7 @@ export default function UsagePage() {
             {/* Export CSV Button */}
             <div style={{ display: "flex", alignItems: "flex-end" }}>
               <a
-                href={`/app/usage.csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
+                href={`/app/usage.export-csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
                 style={{
                   padding: "0.625rem 1.25rem",
                   background: "#7C3AED",
@@ -695,7 +704,7 @@ export default function UsagePage() {
               padding: "1rem",
               backgroundColor: "#FFFFFF",
               border: "1px solid rgba(11,11,15,0.12)",
-              borderRadius: "12px",
+            borderRadius: "12px",
               boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
             }}
           >
@@ -766,7 +775,7 @@ export default function UsagePage() {
                 padding: "1rem",
                 backgroundColor: "#FFFFFF",
                 border: "1px solid rgba(11,11,15,0.12)",
-                borderRadius: "12px",
+            borderRadius: "12px",
                 boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
               }}
             >
@@ -781,8 +790,8 @@ export default function UsagePage() {
                 Daily Credits Burn
               </div>
               <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", height: "120px", overflowX: "auto" }}>
-                {data.usageTrends.dailyBurn.map((day, idx) => {
-                  const maxCredits = Math.max(...data.usageTrends.dailyBurn.map(d => d.credits), 1);
+                {data.usageTrends.dailyBurn.map((day: { date: string; credits: number }, idx: number) => {
+                  const maxCredits = Math.max(...data.usageTrends.dailyBurn.map((d: { date: string; credits: number }) => d.credits), 1);
                   const heightPercent = (day.credits / maxCredits) * 100;
                   return (
                     <div
@@ -964,13 +973,13 @@ export default function UsagePage() {
                       <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", whiteSpace: "nowrap", color: "rgba(11,11,15,0.62)", fontSize: "0.875rem" }}>
                         {new Date(e.createdAt).toLocaleString()}
                       </td>
-                      <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F" }}>{e.eventType}</td>
+                  <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F" }}>{e.eventType}</td>
                       <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", maxWidth: "300px", overflow: "hidden", textOverflow: "ellipsis" }}>
                         <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.75rem", color: "rgba(11,11,15,0.62)", maxHeight: selectedEvent === idx ? "none" : "3rem", overflow: selectedEvent === idx ? "visible" : "hidden" }}>
                           {JSON.stringify(e.metadata, null, 2)}
                         </pre>
-                      </td>
-                      <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", textAlign: "right", fontWeight: "500", color: "#7C3AED" }}>{e.creditsBurned.toFixed(2)}</td>
+                  </td>
+                  <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", textAlign: "right", fontWeight: "500", color: "#7C3AED" }}>{e.creditsBurned.toFixed(2)}</td>
                       <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", textAlign: "center" }}>
                         <button
                           style={{
@@ -986,7 +995,7 @@ export default function UsagePage() {
                           {selectedEvent === idx ? "Hide" : "View"}
                         </button>
                       </td>
-                    </tr>
+                </tr>
                   ))
                 );
               })()}
