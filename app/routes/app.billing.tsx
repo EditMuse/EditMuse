@@ -24,6 +24,7 @@ import {
   chargeRecurringAddonsMonthly,
   markSubscriptionAsCancelled,
   PLANS,
+  type PlanInfo,
   creditsToX2
 } from "~/models/billing.server";
 import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, cancelSubscription, isDevelopmentStore } from "~/models/shopify-billing.server";
@@ -93,9 +94,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   // Calculate available plans in the loader (server-side)
   // If cancelled, show all paid plans. Otherwise, show plans above current tier
+  const allPlansList: PlanInfo[] = Object.values(PLANS);
   const availablePlans = subscription?.status === "cancelled"
-    ? Object.values(PLANS).filter((plan) => plan.tier !== "TRIAL")
-    : Object.values(PLANS).filter(
+    ? allPlansList.filter((plan) => plan.tier !== "TRIAL")
+    : allPlansList.filter(
         (plan) => plan.tier !== "TRIAL" && plan.tier !== currentPlan.tier
       );
 
@@ -117,6 +119,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     usageBalanceUsedUsd,
     usageCapAmountUsd,
     currentPeriodEnd: activeCharge?.currentPeriodEnd ?? null,
+    allPlans: allPlansList satisfies PlanInfo[], // Pass PLANS through loader to avoid client-side import
   };
 };
 
@@ -595,7 +598,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Billing() {
-  const { currentPlan, inTrial, usage, entitlements, subscription, experienceCount, shopDomain, availablePlans, approved: loaderApproved, errorParam, usageBalanceUsedUsd, usageCapAmountUsd, currentPeriodEnd } = useLoaderData<typeof loader>();
+  const loaderData = useLoaderData<typeof loader>();
+  const { currentPlan, inTrial, usage, entitlements, subscription, experienceCount, shopDomain, availablePlans, approved: loaderApproved, errorParam, usageBalanceUsedUsd, usageCapAmountUsd, currentPeriodEnd, allPlans } = loaderData;
+  
+  // Type assertion for allPlans to ensure TypeScript knows it's PlanInfo[]
+  const typedAllPlans: PlanInfo[] = allPlans as PlanInfo[];
   const actionData = useActionData<typeof action>() as { approved?: boolean; addonPurchased?: boolean; usageRecordId?: string; disabled?: string; error?: string; ok?: boolean; confirmationUrl?: string; cancelled?: boolean; message?: string } | undefined;
   const navigation = useNavigation();
   const app = useAppBridge();
@@ -1006,7 +1013,7 @@ export default function Billing() {
             <thead>
               <tr style={{ backgroundColor: "#F9FAFB" }}>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>Feature</th>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <th
                     key={plan.tier}
                     style={{
@@ -1027,7 +1034,7 @@ export default function Billing() {
             <tbody>
               <tr style={{ backgroundColor: "#FFFFFF" }}>
                 <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Monthly Price</td>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.price ? `$${plan.price.toFixed(2)}` : "—"}
                   </td>
@@ -1035,7 +1042,7 @@ export default function Billing() {
               </tr>
               <tr style={{ backgroundColor: "#F9FAFB" }}>
                 <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Credits Included</td>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.includedCredits.toLocaleString()}
                   </td>
@@ -1043,7 +1050,7 @@ export default function Billing() {
               </tr>
               <tr style={{ backgroundColor: "#FFFFFF" }}>
                 <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Experiences</td>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.experiences === null ? "Unlimited" : plan.experiences}
                   </td>
@@ -1051,7 +1058,7 @@ export default function Billing() {
               </tr>
               <tr style={{ backgroundColor: "#F9FAFB" }}>
                 <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Candidate Cap</td>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.candidateCap}
                   </td>
@@ -1059,7 +1066,7 @@ export default function Billing() {
               </tr>
               <tr style={{ backgroundColor: "#FFFFFF" }}>
                 <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Overage Rate</td>
-                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     ${plan.overageRate.toFixed(2)}/credit
                   </td>
