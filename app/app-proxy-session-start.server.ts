@@ -10923,6 +10923,10 @@ async function processSessionInBackground({
               !used.has(c.handle)
             );
             
+            // Count how many remaining candidates have descriptions
+            const remainingWithDescriptions = remainingCandidates.filter(c => c.descPlain || c.description).length;
+            console.log(`[DeepSearch] post_ai_topup starting remainingCandidates=${remainingCandidates.length} allCandidatesEnriched=${allCandidatesEnriched.length} constraintMatched=${constraintMatchedHandles.length} used=${used.size} remainingWithDescriptions=${remainingWithDescriptions}`);
+            
             // Fetch descriptions for remaining candidates that don't have them yet (for better matching)
             const remainingNeedingDescriptions = remainingCandidates
               .filter(c => !c.description && !c.descPlain)
@@ -10950,13 +10954,19 @@ async function processSessionInBackground({
             }
             
             // Check remaining candidates for constraint matches (now with descriptions if fetched)
+            // CRITICAL: Rebuild searchText to ensure it includes descriptions that were fetched earlier
+            let checkedCount = 0;
+            let matchedCount = 0;
             for (const candidate of remainingCandidates) {
               if (constraintMatchedHandles.length >= finalResultCount) break;
+              checkedCount++;
               
-              const searchText = candidate.searchText || extractSearchText(candidate, indexMetafields);
-              const searchTextLower = searchText.toLowerCase();
+              // Rebuild searchText to ensure it includes any descriptions that were added
+              // This is important because searchText might have been built before descriptions were fetched
+              candidate.searchText = extractSearchText(candidate, indexMetafields);
+              const searchTextLower = candidate.searchText.toLowerCase();
               
-              // Also check description explicitly
+              // Also check description explicitly (in case it's not in searchText yet)
               const descText = (candidate.descPlain || candidate.description || "").toLowerCase();
               const combinedText = `${searchTextLower} ${descText}`;
               
@@ -10974,10 +10984,18 @@ async function processSessionInBackground({
               if (matchesConstraint) {
                 constraintMatchedHandles.push(candidate.handle);
                 used.add(candidate.handle);
+                matchedCount++;
               }
             }
             
-            console.log(`[DeepSearch] post_ai_topup after_topup=${constraintMatchedHandles.length} requested=${finalResultCount} descriptions_fetched=${remainingNeedingDescriptions.length}`);
+            // Log sample of candidates checked (first 5)
+            const sampleChecked = remainingCandidates.slice(0, Math.min(5, checkedCount)).map(c => ({
+              handle: c.handle,
+              title: c.title?.substring(0, 50),
+              hasDesc: !!(c.descPlain || c.description),
+              descLength: (c.descPlain || c.description || "").length
+            }));
+            console.log(`[DeepSearch] post_ai_topup after_topup=${constraintMatchedHandles.length} requested=${finalResultCount} descriptions_fetched=${remainingNeedingDescriptions.length} checked=${checkedCount} matched=${matchedCount} remainingCandidates=${remainingCandidates.length} sample=${JSON.stringify(sampleChecked)}`);
           }
           
           finalHandles = constraintMatchedHandles;
