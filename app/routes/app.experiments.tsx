@@ -102,30 +102,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             return meta?.sessionId && exposedSessionIds.has(meta.sessionId);
           }).length;
 
-          // Count order attributions for sessions from these exposures
-          const orderAttributions = await prisma.orderAttribution.findMany({
-            where: { shopId: shop.id },
-          });
-
-          const ordersForVariant = orderAttributions.filter((oa) => {
-            return oa.sessionId && exposedSessionIds.has(oa.sessionId);
-          });
-
-          const ordersCount = ordersForVariant.length;
-          const revenue = ordersForVariant.reduce((sum, oa) => {
-            return sum + parseFloat(oa.totalPrice || "0");
-          }, 0);
-
+          // Note: Order attribution removed for PCD Level 0 compliance
           const atcRate = exposures > 0 ? (atcForVariant / exposures) * 100 : 0;
-          const orderRate = exposures > 0 ? (ordersCount / exposures) * 100 : 0;
-          const revenuePerExposure = exposures > 0 ? revenue / exposures : 0;
 
           return {
             variantName,
             exposures,
             atcRate: parseFloat(atcRate.toFixed(2)),
-            orderRate: parseFloat(orderRate.toFixed(2)),
-            revenuePerExposure: parseFloat(revenuePerExposure.toFixed(2)),
+            orderRate: 0, // Removed for PCD Level 0 compliance
+            revenuePerExposure: 0, // Removed for PCD Level 0 compliance
           };
         })
       );
@@ -439,8 +424,7 @@ export default function ExperimentsPage() {
                   <th style={{ padding: "1rem", textAlign: "left", fontWeight: "600" }}>Variant</th>
                   <th style={{ padding: "1rem", textAlign: "right", fontWeight: "600" }}>Exposures</th>
                   <th style={{ padding: "1rem", textAlign: "right", fontWeight: "600" }}>ATC Rate</th>
-                  <th style={{ padding: "1rem", textAlign: "right", fontWeight: "600" }}>Order Rate</th>
-                  <th style={{ padding: "1rem", textAlign: "right", fontWeight: "600" }}>Revenue/Exposure</th>
+                  {/* Order Rate and Revenue/Exposure columns removed for PCD Level 0 compliance */}
                   <th style={{ padding: "1rem", textAlign: "left", fontWeight: "600" }}>Actions</th>
                 </tr>
               </thead>
@@ -463,7 +447,7 @@ export default function ExperimentsPage() {
                               {exp.isActive ? "Active" : "Inactive"}
                             </span>
                           </td>
-                          <td style={{ padding: "1rem" }} colSpan={5}>No data</td>
+                          <td style={{ padding: "1rem" }} colSpan={3}>No data</td>
                           <td style={{ padding: "1rem" }}>
                             <div style={{ display: "flex", gap: "0.5rem" }}>
                               <button
@@ -542,8 +526,7 @@ export default function ExperimentsPage() {
                           <td style={{ padding: "1rem" }}>{result.variantName}</td>
                           <td style={{ padding: "1rem", textAlign: "right" }}>{result.exposures.toLocaleString()}</td>
                           <td style={{ padding: "1rem", textAlign: "right" }}>{result.atcRate.toFixed(2)}%</td>
-                          <td style={{ padding: "1rem", textAlign: "right" }}>{result.orderRate.toFixed(2)}%</td>
-                          <td style={{ padding: "1rem", textAlign: "right" }}>${result.revenuePerExposure.toFixed(2)}</td>
+                          {/* Order Rate and Revenue/Exposure cells removed for PCD Level 0 compliance */}
                           {idx === 0 && (
                             <td style={{ padding: "1rem" }} rowSpan={exp.results.length}>
                               <div style={{ display: "flex", gap: "0.5rem" }}>

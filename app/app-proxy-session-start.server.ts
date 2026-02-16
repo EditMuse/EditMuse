@@ -963,7 +963,7 @@ function extractSmartFetchSignals(
     // Generic product/constraint words that shouldn't be search keywords
     "products", "product", "items", "item", "goods", "merchandise",
     "contain", "contains", "containing", "with", "having", "includes", "including",
-    "that", "which", "who", "whose", "where", "when",
+    "that", "thats", "that's", "which", "who", "whose", "where", "when",
     // Generic placeholders that shouldn't be search keywords (industry-agnostic)
     "something", "anything", "everything", "nothing", "some", "any", "all"
   ]);
@@ -1125,7 +1125,7 @@ function buildShopifySearchQuery(
   const useFieldQualifiers = strategy === "field_restricted" || strategy === "two_pass";
   
   // First, add individual token clauses for all keywords (for >=2 keywords, this is the primary strategy)
-  for (const keyword of safeKeywords) {
+    for (const keyword of safeKeywords) {
     const normalized = keyword.trim().toLowerCase();
     if (normalized.length > 0 && !tokensSeen.has(normalized)) {
       tokensSeen.add(normalized);
@@ -1142,9 +1142,9 @@ function buildShopifySearchQuery(
         // But we can include more fields or use a broader search pattern
         // For now, use same field qualifiers as field_restricted (Shopify Admin API limitation)
         tokenClauses.push(
-          `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
-        );
-      }
+        `(title:${escaped} OR product_type:${escaped} OR tag:${escaped} OR vendor:${escaped})`
+      );
+    }
     }
   }
   
@@ -1935,22 +1935,22 @@ async function satisfiesConstraintsStructuredOrTags(
     // Size equivalences (only for size-related constraints)
     const isSizeConstraint = normalizedKey === "size" || normalizedKey === "sizing" || normalizedKey === "capacity";
     if (isSizeConstraint) {
-      const sizeEquivalences: Record<string, string[]> = {
-        "s": ["small", "s"],
-        "m": ["medium", "m"],
-        "l": ["large", "l"],
-        "xl": ["extra large", "x-large", "xl", "extra-large"],
-        "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
-      };
-      
-      if (sizeEquivalences[normalizedConstraint]) {
-        const aliases = sizeEquivalences[normalizedConstraint];
-        if (aliases.some(alias => normalizedProduct === alias)) return true;
-      }
-      
-      if (sizeEquivalences[normalizedProduct]) {
-        const aliases = sizeEquivalences[normalizedProduct];
-        if (aliases.some(alias => normalizedConstraint === alias)) return true;
+    const sizeEquivalences: Record<string, string[]> = {
+      "s": ["small", "s"],
+      "m": ["medium", "m"],
+      "l": ["large", "l"],
+      "xl": ["extra large", "x-large", "xl", "extra-large"],
+      "xxl": ["extra extra large", "xx-large", "xxl", "extra-extra-large"],
+    };
+    
+    if (sizeEquivalences[normalizedConstraint]) {
+      const aliases = sizeEquivalences[normalizedConstraint];
+      if (aliases.some(alias => normalizedProduct === alias)) return true;
+    }
+    
+    if (sizeEquivalences[normalizedProduct]) {
+      const aliases = sizeEquivalences[normalizedProduct];
+      if (aliases.some(alias => normalizedConstraint === alias)) return true;
       }
     }
     
@@ -4073,7 +4073,26 @@ async function processSessionInBackground({
       let detectedMax: number | null = null;
       let detectedCurrency: string | null = null;
       
-      // First, try to extract price ceiling using improved parsing
+      // First, check for minimum price patterns ("above", "over", "more than")
+      const answerLower = answerStr.toLowerCase().trim();
+      
+      // Handle "above $250", "over $250", "more than $250" (minimum price)
+      const abovePattern = /(?:above|over|more\s+than)\s+([£$€]?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/i;
+      const aboveMatch = answerStr.match(abovePattern);
+      if (aboveMatch) {
+        const currencySymbol = aboveMatch[1] || "";
+        const valueStr = aboveMatch[2] || "";
+        const cleanedValue = valueStr.replace(/,/g, "");
+        const parsed = parseFloat(cleanedValue);
+        if (!isNaN(parsed) && isFinite(parsed) && parsed > 0) {
+          detectedMin = parsed;
+          detectedCurrency = detectCurrencySymbol(answerStr);
+          detectedBudgets.push({ min: detectedMin, max: null, currency: detectedCurrency, source: answerStr });
+          continue; // Found minimum, move to next answer
+        }
+      }
+      
+      // Then, try to extract price ceiling using improved parsing
       const priceCeilingResult = parsePriceCeiling(answerStr);
       if (priceCeilingResult !== null) {
         detectedMax = priceCeilingResult.value;
@@ -4083,7 +4102,6 @@ async function processSessionInBackground({
       }
       
       // Fallback to legacy range parsing for backward compatibility
-      const answerLower = answerStr.toLowerCase().trim();
       
       // Handle "under-50" or "under 50" format (legacy)
       if (answerLower.startsWith("under")) {
@@ -4422,12 +4440,12 @@ async function processSessionInBackground({
         } else {
           // Step A: Build targeted query (using default field_restricted strategy)
           let query = buildShopifySearchQuery(fetchSignals, 500, "field_restricted");
-          
-          if (query) {
+        
+        if (query) {
             console.log(`[SmartFetch] keywords=[${fetchSignals.keywords.join(", ")}] query="${query}"`);
-            console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
-            
-            try {
+          console.log(`[SmartFetch] query_step=A query="${query.substring(0, 200)}${query.length > 200 ? "..." : ""}"`);
+          
+          try {
               // Helper function to filter negative matches and phrase mismatches (industry-agnostic)
               const filterNegativeMatches = (products: any[], keywords: string[], selections: string[] = []): any[] => {
                 const negativeIndicators = ["no", "sans", "free", "without", "not", "non", "zero", "0", "ohne", "sin"];
@@ -4497,17 +4515,41 @@ async function processSessionInBackground({
                       return false;
                     }
                     
-                    // For phrase queries, if product doesn't match the phrase, require ALL tokens to match
+                    // For phrase queries, if product doesn't match the phrase, require ALL meaningful tokens to match
                     // This filters out products that only match one token (e.g., "food" in "Hair Food" when searching "pet food")
-                    const allTokensMatch = keywords.every(keyword => {
-                      const keywordLower = keyword.toLowerCase();
-                      const keywordPattern = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                      return keywordPattern.test(searchableText);
+                    // CRITICAL: Filter out stopwords from the "all tokens match" check - stopwords shouldn't block matches
+                    const stopwordsForPhraseCheck = new Set(["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+                      "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does", "did",
+                      "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "thats", "that's", "these", "those",
+                      "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+                      "what", "which", "who", "whom", "where", "when", "why", "how", "if", "then", "else",
+                      "about", "above", "after", "before", "below", "between", "during", "through", "under", "over",
+                      "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
+                      "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "some", "such",
+                      "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
+                      "want", "looking", "for", "need", "prefer", "like", "add", "also", "less", "than", "below", "over", "between", "then",
+                      "products", "product", "items", "item", "goods", "merchandise",
+                      "contain", "contains", "containing", "with", "having", "includes", "including",
+                      "which", "who", "whose", "where", "when",
+                      "something", "anything", "everything", "nothing", "some", "any", "all"]);
+                    
+                    const meaningfulKeywords = keywords.filter(k => {
+                      const kLower = k.toLowerCase();
+                      return kLower.length >= 3 && !stopwordsForPhraseCheck.has(kLower);
                     });
                     
-                    // Only keep if all tokens match (not just one)
-                    if (!allTokensMatch) {
-                      return false;
+                    // Only require meaningful keywords to match (ignore stopwords)
+                    if (meaningfulKeywords.length > 0) {
+                      const allMeaningfulTokensMatch = meaningfulKeywords.every(keyword => {
+                        const keywordLower = keyword.toLowerCase();
+                        const keywordPattern = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                        return keywordPattern.test(searchableText);
+                      });
+                      
+                      // Only keep if all meaningful tokens match (not just one)
+                      if (!allMeaningfulTokensMatch) {
+                        return false;
+                      }
                     }
                   }
                   
@@ -4515,14 +4557,14 @@ async function processSessionInBackground({
                 });
               };
               
-              // Step A: Targeted fetch
-              const stepA = await fetchProductsByQueryPaginated(
-                shopDomain,
-                accessToken,
-                query,
-                SMART_FETCH_DESIRED_MIN,
-                200
-              );
+            // Step A: Targeted fetch
+            const stepA = await fetchProductsByQueryPaginated(
+              shopDomain,
+              accessToken,
+              query,
+              SMART_FETCH_DESIRED_MIN,
+              200
+            );
             
             // Filter negative matches from Step A
             const stepAFiltered = filterNegativeMatches(stepA.products, fetchSignals.keywords, fetchSignals.selections);
@@ -4602,19 +4644,19 @@ async function processSessionInBackground({
               console.log(`[SmartFetch] widen_step=2 fetchedTotal=${smartFetchProducts.length}`);
             }
             
-              if (smartFetchProducts.length > 0) {
-                usingSmartFetch = true;
-                console.log(`[SmartFetch] final candidates=${smartFetchProducts.length} usingSmartFetch=true`);
-              } else {
-                console.log(`[SmartFetch] fallback_to_pool=true reason=insufficient_candidates`);
-              }
-            } catch (error) {
-              console.error(`[SmartFetch] Error during smart fetch:`, error);
-              console.log(`[SmartFetch] fallback_to_pool=true reason=query_error`);
-              smartFetchProducts = [];
+            if (smartFetchProducts.length > 0) {
+              usingSmartFetch = true;
+              console.log(`[SmartFetch] final candidates=${smartFetchProducts.length} usingSmartFetch=true`);
+            } else {
+              console.log(`[SmartFetch] fallback_to_pool=true reason=insufficient_candidates`);
             }
-          } else {
-            console.log(`[SmartFetch] fallback_to_pool=true reason=no_keywords`);
+          } catch (error) {
+            console.error(`[SmartFetch] Error during smart fetch:`, error);
+            console.log(`[SmartFetch] fallback_to_pool=true reason=query_error`);
+            smartFetchProducts = [];
+          }
+        } else {
+          console.log(`[SmartFetch] fallback_to_pool=true reason=no_keywords`);
           }
         }
       } else {
@@ -4653,12 +4695,12 @@ async function processSessionInBackground({
             } catch (error) {
               console.error(`[App Proxy] Query-based fetch error, falling back to collection-based fetch:`, error);
               // Fall back to collection-based fetch if query fails
-              products = await fetchShopifyProducts({
-                shopDomain,
-                accessToken,
-                limit: PRODUCT_POOL_LIMIT_FIRST,
-                collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-              });
+        products = await fetchShopifyProducts({
+        shopDomain,
+        accessToken,
+        limit: PRODUCT_POOL_LIMIT_FIRST,
+        collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+      });
             }
           } else {
             // No query possible - use collection-based fetch (better than random)
@@ -4731,28 +4773,28 @@ async function processSessionInBackground({
             
             // Fetch products using query-based search (industry-agnostic)
             const fallbackFetch = await fetchProductsByQueryPaginated(
-              shopDomain,
-              accessToken,
+            shopDomain,
+            accessToken,
               fallbackQuery,
               Math.max(finalResultCount * 8 - products.length, 200), // Fetch enough to meet min_needed
               200
             );
-            
-            // Merge with existing products (avoid duplicates)
-            const existingHandles = new Set(products.map((p: any) => p.handle));
+          
+          // Merge with existing products (avoid duplicates)
+          const existingHandles = new Set(products.map((p: any) => p.handle));
             const newFallbackProducts = fallbackFetch.products.filter((p: any) => !existingHandles.has(p.handle));
-            
-            if (newFallbackProducts.length > 0) {
-              products = [...products, ...newFallbackProducts];
+          
+          if (newFallbackProducts.length > 0) {
+            products = [...products, ...newFallbackProducts];
               console.log(`[SmartFetch] single_item_fallback query_based_fetch=${fallbackFetch.products.length} new=${newFallbackProducts.length} merged_total=${products.length} BEFORE_filtering`);
-              
-              // Re-deduplicate after merge
-              const seenAfterFallback = new Set<string>();
-              products = products.filter(p => {
-                if (seenAfterFallback.has(p.handle)) return false;
-                seenAfterFallback.add(p.handle);
-                return true;
-              });
+            
+            // Re-deduplicate after merge
+            const seenAfterFallback = new Set<string>();
+            products = products.filter(p => {
+              if (seenAfterFallback.has(p.handle)) return false;
+              seenAfterFallback.add(p.handle);
+              return true;
+            });
             } else {
               console.log(`[SmartFetch] single_item_fallback query_based_fetch=${fallbackFetch.products.length} new=0 (all duplicates or no matches)`);
             }
@@ -4885,11 +4927,11 @@ async function processSessionInBackground({
               console.error(`[App Proxy] Stage 2 query-based fetch error, falling back to collection-based fetch:`, error);
               // Fall back to collection-based fetch if query fails
               allProducts = await fetchShopifyProducts({
-                shopDomain,
-                accessToken,
-                limit: PRODUCT_POOL_LIMIT_MAX,
-                collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
-              });
+          shopDomain,
+          accessToken,
+          limit: PRODUCT_POOL_LIMIT_MAX,
+          collectionIds: includedCollections.length > 0 ? includedCollections : undefined,
+        });
             }
           } else {
             // No query possible - use collection-based fetch (better than random)
@@ -12154,8 +12196,8 @@ async function processSessionInBackground({
             if (productTypeLower.includes(normalizedCanonical) || normalizedCanonical.includes(productTypeLower.split(/\s+/)[0])) {
               // But exclude if productType also contains other product types (e.g., "perfume talc" where productType="Talc")
               if (!hasOtherTypeInProductType || productTypeLower.includes(normalizedCanonical)) {
-                return true;
-              }
+              return true;
+            }
             }
             
             // Check title for canonical type (word-boundary matching for single words)
@@ -12192,13 +12234,13 @@ async function processSessionInBackground({
               if (termRegex.test(productTypeLower)) {
                 // Exclude if productType also contains other product types
                 if (!hasOtherTypeInProductType) {
-                  return true;
-                }
+                return true;
               }
-              
+            }
+            
               // Also check title with word-boundary (but exclude if productType has other types)
               if (termRegex.test(title) && !hasOtherTypeInProductType) {
-                return true;
+              return true;
               }
             } else {
               // Multi-word term: check if it appears in productType or title
@@ -14373,12 +14415,52 @@ async function processSessionInBackground({
           console.warn("[App Proxy] ⚠️  No handles to save - applying emergency fallback (NO BILLING)");
           
           // Still provide results but mark as unmatched
+          // Only use products that match at least one hard term (industry-agnostic)
           const emergencyCandidates = allCandidatesEnriched
-            .filter(c => c.available) // Prefer in-stock
+            .filter(c => {
+              // Must be available
+              if (!c.available) return false;
+              
+              // Must match at least one hard term (industry-agnostic)
+              if (hardTerms.length > 0) {
+                const haystack = [
+                  c.title || "",
+                  c.productType || "",
+                  (c.tags || []).join(" "),
+                  c.vendor || "",
+                  c.searchText || "",
+                ].join(" ");
+                const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (!hasHardTermMatch) return false;
+              }
+              
+              return true;
+            })
             .sort((a, b) => {
-              // Sort by: available first, then by handle for consistency
+              // Sort by: available first, then by BM25-like relevance (products with more hard term matches first)
               if (a.available !== b.available) return a.available ? -1 : 1;
-              return a.handle.localeCompare(b.handle);
+              
+              // Count hard term matches for relevance
+              const aHaystack = [
+                a.title || "",
+                a.productType || "",
+                (a.tags || []).join(" "),
+                a.vendor || "",
+                a.searchText || "",
+              ].join(" ");
+              const bHaystack = [
+                b.title || "",
+                b.productType || "",
+                (b.tags || []).join(" "),
+                b.vendor || "",
+                b.searchText || "",
+              ].join(" ");
+              
+              const aMatches = hardTerms.filter(term => matchesHardTermWithBoundary(aHaystack, term)).length;
+              const bMatches = hardTerms.filter(term => matchesHardTermWithBoundary(bHaystack, term)).length;
+              
+              if (aMatches !== bMatches) return bMatches - aMatches; // More matches = better
+              return a.handle.localeCompare(b.handle); // Tie-breaker: consistent ordering
             })
             .slice(0, Math.min(finalResultCount, 12)); // Cap at 12 for safety
           
@@ -14417,13 +14499,53 @@ async function processSessionInBackground({
           console.warn("[App Proxy] ⚠️  EMERGENCY FALLBACK: No handles after all processing - this should be rare");
           console.warn("[App Proxy] ⚠️  No handles to save - applying emergency fallback");
           
-          // Emergency fallback: use any available candidates, prioritizing in-stock items
+          // Emergency fallback: use candidates that match hard terms (industry-agnostic)
+          // Only use products that match at least one hard term to avoid random products
           const emergencyCandidates = allCandidatesEnriched
-            .filter(c => c.available) // Prefer in-stock
+            .filter(c => {
+              // Must be available
+              if (!c.available) return false;
+              
+              // Must match at least one hard term (industry-agnostic)
+              if (hardTerms.length > 0) {
+                const haystack = [
+                  c.title || "",
+                  c.productType || "",
+                  (c.tags || []).join(" "),
+                  c.vendor || "",
+                  c.searchText || "",
+                ].join(" ");
+                const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+                if (!hasHardTermMatch) return false;
+              }
+              
+              return true;
+            })
             .sort((a, b) => {
-              // Sort by: available first, then by handle for consistency
+              // Sort by: available first, then by BM25-like relevance (products with more hard term matches first)
               if (a.available !== b.available) return a.available ? -1 : 1;
-              return a.handle.localeCompare(b.handle);
+              
+              // Count hard term matches for relevance
+              const aHaystack = [
+                a.title || "",
+                a.productType || "",
+                (a.tags || []).join(" "),
+                a.vendor || "",
+                a.searchText || "",
+              ].join(" ");
+              const bHaystack = [
+                b.title || "",
+                b.productType || "",
+                (b.tags || []).join(" "),
+                b.vendor || "",
+                b.searchText || "",
+              ].join(" ");
+              
+              const aMatches = hardTerms.filter(term => matchesHardTermWithBoundary(aHaystack, term)).length;
+              const bMatches = hardTerms.filter(term => matchesHardTermWithBoundary(bHaystack, term)).length;
+              
+              if (aMatches !== bMatches) return bMatches - aMatches; // More matches = better
+              return a.handle.localeCompare(b.handle); // Tie-breaker: consistent ordering
             })
             .slice(0, Math.min(finalResultCount, 12)); // Cap at 12 for safety
           
@@ -14470,13 +14592,38 @@ async function processSessionInBackground({
         deliveredCount = validHandles.length;
       }
       
-      // ABSOLUTE FINAL CHECK: If still empty, use first available product (guaranteed result)
+      // ABSOLUTE FINAL CHECK: If still empty, use first available product that matches hard terms (guaranteed result)
       if (handlesToSave.length === 0 && allCandidatesEnriched.length > 0) {
-        const firstAvailable = allCandidatesEnriched.find(c => c.available) || allCandidatesEnriched[0];
+        // Only use products that match at least one hard term (industry-agnostic)
+        const matchingCandidates = allCandidatesEnriched.filter(c => {
+          if (!c.available) return false;
+          
+          // Must match at least one hard term
+          if (hardTerms.length > 0) {
+            const haystack = [
+              c.title || "",
+              c.productType || "",
+              (c.tags || []).join(" "),
+              c.vendor || "",
+              c.searchText || "",
+            ].join(" ");
+            const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
+            if (!hasHardTermMatch) return false;
+          }
+          
+          return true;
+        });
+        
+        const firstAvailable = matchingCandidates.length > 0 
+          ? matchingCandidates[0]
+          : (allCandidatesEnriched.find(c => c.available) || allCandidatesEnriched[0]);
+        
         handlesToSave = [firstAvailable.handle];
         deliveredCount = 1;
-        console.log(`[App Proxy] ✅ Absolute fallback: using single product ${firstAvailable.handle}`);
-        reasoning = "Showing the best available match for your request.";
+        console.log(`[App Proxy] ✅ Absolute fallback: using single product ${firstAvailable.handle} ${matchingCandidates.length > 0 ? "(matches hard terms)" : "(no matches found, using first available)"}`);
+        reasoning = matchingCandidates.length > 0 
+          ? "Showing the best available match for your request."
+          : "No exact matches found. Showing an available product.";
       }
       
       // CRITICAL FIX: Use authoritative final saved result count

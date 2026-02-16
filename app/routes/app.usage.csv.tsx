@@ -15,12 +15,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   if (!shop) throw new Response("Shop not found", { status: 404 });
 
   // Get entitlements for reporting gates
-  const entitlements = await getEntitlements(shop.id);
-  
-  // Advanced reporting: Pro plan or advanced add-on
-  const canAdvancedReporting = 
-    entitlements.planTier === PLAN_TIER.PRO || 
-    entitlements.canAdvancedReporting;
+  // Note: Advanced reporting with orderId/customerId removed for PCD Level 0 compliance
 
   const url = new URL(request.url);
   const from = url.searchParams.get("from");
@@ -35,19 +30,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   // Basic columns (always exported)
+  // Note: orderId, customerId removed for PCD Level 0 compliance
   const basicHeader = ["createdAt", "eventType", "creditsBurned", "metadata"];
-  
-  // Advanced attribution columns (only if canAdvancedReporting)
-  const advancedHeader = canAdvancedReporting 
-    ? ["orderId", "customerId", "sessionId", "productIds", "attributionData"]
-    : [];
 
-  const header = [...basicHeader, ...advancedHeader].join(",");
+  const header = basicHeader.join(",");
 
   const lines = rows.map(r => {
     const metadata = safeJson(r.metadata);
     
-    // Basic columns
+    // Basic columns only (orderId, customerId removed for PCD Level 0 compliance)
     const basicCols = [
       r.createdAt.toISOString(),
       r.eventType,
@@ -55,16 +46,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       JSON.stringify(metadata || null).replaceAll('"', '""') // CSV escape
     ];
 
-    // Advanced attribution columns (extract from metadata if available)
-    const advancedCols = canAdvancedReporting ? [
-      metadata?.orderId || metadata?.order_id || "",
-      metadata?.customerId || metadata?.customer_id || "",
-      metadata?.sessionId || metadata?.session_id || "",
-      metadata?.productIds ? JSON.stringify(metadata.productIds).replaceAll('"', '""') : "",
-      metadata?.attributionData ? JSON.stringify(metadata.attributionData).replaceAll('"', '""') : "",
-    ] : [];
-
-    return [...basicCols, ...advancedCols]
+    return basicCols
       .map(v => `"${v}"`)
       .join(",");
   });

@@ -23,11 +23,11 @@ api_version = "2026-01"
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 # Required scopes:
-# - read_products: Required to fetch products from Shopify Admin API (already used in app)
-# - write_products: Already used for product operations
+# - read_products: Required to fetch products from Shopify Admin API
+# - write_products: Required for product operations
 # - write_app_proxy: Required for app proxy to function correctly
-# - read_orders: Required for orders/create webhook
-scopes = "read_products,write_products,write_app_proxy,read_orders"
+# Note: No read_orders scope - app does not access customer/order data (Level 0 PCD compliance)
+scopes = "read_products,write_products,write_app_proxy"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 

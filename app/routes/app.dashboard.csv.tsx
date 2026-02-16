@@ -55,20 +55,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     orderBy: { createdAt: "desc" },
   });
 
-  // Fetch order attributions in date range
-  const orderAttributions = await prisma.orderAttribution.findMany({
-    where: {
-      shopId: shop.id,
-      createdAt: { gte: fromDate, lte: toDate },
-    },
-  });
-
-  // Build CSV rows
+  // Build CSV rows (engagement analytics only - no order/customer data)
   const rows: string[] = [];
 
   // Header
   rows.push(
-    "Date Range,From,To,Sessions,Results Generated,Product Clicks,Add to Cart Clicks,Checkout Started,Orders Attributed (Direct),Orders Attributed (Assisted),Revenue"
+    "Date Range,From,To,Sessions,Results Generated,Product Clicks,Add to Cart Clicks,Checkout Started"
   );
 
   // Metrics row
@@ -85,21 +77,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const checkoutStarted = events.filter(
     (e) => e.eventType === UsageEventType.CHECKOUT_STARTED
   ).length;
-  const ordersAttributedDirect = orderAttributions.filter(
-    (o) => o.attributionType === "direct"
-  ).length;
-  const ordersAttributedAssisted = orderAttributions.filter(
-    (o) => o.attributionType === "assisted"
-  ).length;
-  
-  // Calculate revenue from order attributions
-  let revenue = 0;
-  for (const order of orderAttributions) {
-    const price = parseFloat(order.totalPrice || "0");
-    if (!isNaN(price)) {
-      revenue += price;
-    }
-  }
 
   rows.push(
     [
@@ -111,9 +88,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       productClicked,
       addToCartClicked,
       checkoutStarted,
-      ordersAttributedDirect,
-      ordersAttributedAssisted,
-      revenue.toFixed(2),
     ].join(",")
   );
 
@@ -145,10 +119,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       step: "Add to Cart",
       count: addToCartClicked,
     },
-    {
-      step: "Checkout Started",
-      count: checkoutStarted,
-    },
+    // Note: Checkout Started and Order metrics removed for PCD Level 0 compliance
   ];
 
   funnelSteps.forEach((step, index) => {
@@ -160,28 +131,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     );
   });
 
-  // Build session ID to order attributions map for revenue/conversion tracking
-  const sessionOrdersMap = new Map<string, typeof orderAttributions>();
-  for (const order of orderAttributions) {
-    if (order.sessionId) {
-      if (!sessionOrdersMap.has(order.sessionId)) {
-        sessionOrdersMap.set(order.sessionId, []);
-      }
-      sessionOrdersMap.get(order.sessionId)!.push(order);
-    }
-  }
-
-  // Top Queries section
+  // Top Queries section (engagement analytics only)
   rows.push("");
-  rows.push("Top Queries,Query,Sessions,Revenue,Conversion %");
+  rows.push("Top Queries,Query,Sessions");
 
   // Build top queries from queryNormalized (grouping) and queryRaw (display)
+  // Note: Revenue and conversion tracking removed for PCD Level 0 compliance
   const queryMap = new Map<
     string,
     { 
       sessions: Set<string>; 
-      revenue: number; 
-      conversions: number;
       rawQueries: Map<string, number>; // Track most common raw form per normalized query
     }
   >();
@@ -220,8 +179,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       if (!queryMap.has(queryNormalized)) {
         queryMap.set(queryNormalized, {
           sessions: new Set(),
-          revenue: 0,
-          conversions: 0,
           rawQueries: new Map(),
         });
       }
@@ -232,18 +189,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       if (queryRaw) {
         const count = entry.rawQueries.get(queryRaw) || 0;
         entry.rawQueries.set(queryRaw, count + 1);
-      }
-      
-      // Calculate revenue and conversions from order attributions
-      const sessionOrders = sessionOrdersMap.get(session.id) || [];
-      for (const order of sessionOrders) {
-        const price = parseFloat(order.totalPrice || "0");
-        if (!isNaN(price)) {
-          entry.revenue += price;
-        }
-        if (order.attributionType === "direct") {
-          entry.conversions += 1;
-        }
       }
     }
   }
@@ -263,8 +208,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       return {
         query: mostCommonRaw.substring(0, 200).replace(/"/g, '""'), // CSV escape, use most common raw form
         sessions: data.sessions.size,
-        revenue: data.revenue,
-        conversionRate: data.sessions.size > 0 ? data.conversions / data.sessions.size : 0,
       };
     })
     .sort((a, b) => b.sessions - a.sessions)
@@ -272,14 +215,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   topQueries.forEach((q) => {
     rows.push(
-      `,"${q.query}",${q.sessions},${q.revenue.toFixed(2)},${(q.conversionRate * 100).toFixed(1)}%`
+      `,"${q.query}",${q.sessions}`
     );
   });
 
-  // Top Products section
+  // Top Products section (engagement analytics only)
   rows.push("");
   rows.push(
-    "Top Products,Product,Recommended,Clicks,Add to Cart,Direct Orders,Direct Revenue,Assisted Orders,Assisted Revenue,In Stock"
+    "Top Products,Product,Recommended,Clicks,Add to Cart,In Stock"
   );
 
   const productHandleMap = new Map<
@@ -288,10 +231,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       recommendedCount: number;
       clicks: number;
       addToCart: number;
-      directOrdersCount: number;
-      directRevenue: number;
-      assistedOrdersCount: number;
-      assistedRevenue: number;
     }
   >();
 
@@ -308,10 +247,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
                 recommendedCount: 0,
                 clicks: 0,
                 addToCart: 0,
-                directOrdersCount: 0,
-                directRevenue: 0,
-                assistedOrdersCount: 0,
-                assistedRevenue: 0,
               });
             }
             productHandleMap.get(handle)!.recommendedCount++;
@@ -332,10 +267,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           recommendedCount: 0,
           clicks: 0,
           addToCart: 0,
-          directOrdersCount: 0,
-          directRevenue: 0,
-          assistedOrdersCount: 0,
-          assistedRevenue: 0,
         });
       }
       const product = productHandleMap.get(handle)!;
@@ -348,52 +279,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  // Calculate assisted orders and revenue for products (session-level attribution only)
-  // Note: We cannot reliably map products to order line items, so we do NOT attribute direct product revenue
-  // Direct product attribution would require matching product handles/variants to order line items,
-  // which we don't have in the current OrderAttribution model.
-  const productSessionMap = new Map<string, Set<string>>(); // handle -> sessionIds that recommended it
-  for (const session of sessions) {
-    if (session.result) {
-      try {
-        const handles = Array.isArray(session.result.productHandles)
-          ? session.result.productHandles
-          : [];
-        for (const handle of handles) {
-          if (typeof handle === "string") {
-            if (!productSessionMap.has(handle)) {
-              productSessionMap.set(handle, new Set());
-            }
-            productSessionMap.get(handle)!.add(session.id);
-          }
-        }
-      } catch (e) {
-        // Skip invalid data
-      }
-    }
-  }
-
-  // Calculate assisted orders and revenue per product (session-level only)
-  // Direct metrics remain 0 since we cannot map products to order line items
-  for (const [handle, sessionIds] of productSessionMap.entries()) {
-    if (productHandleMap.has(handle)) {
-      const product = productHandleMap.get(handle)!;
-      for (const sessionId of sessionIds) {
-        const sessionOrders = sessionOrdersMap.get(sessionId) || [];
-        for (const order of sessionOrders) {
-          // Only count assisted metrics at session level
-          // Direct metrics require product -> order line item mapping which we don't have
-          if (order.attributionType === "assisted" || order.attributionType === "direct") {
-            product.assistedOrdersCount++;
-            const price = parseFloat(order.totalPrice || "0");
-            if (!isNaN(price)) {
-              product.assistedRevenue += price;
-            }
-          }
-        }
-      }
-    }
-  }
 
   const topProductHandles = Array.from(productHandleMap.entries())
     .sort((a, b) => b[1].recommendedCount - a[1].recommendedCount)
@@ -431,10 +316,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       recommendedCount: stats.recommendedCount,
       clicks: stats.clicks,
       addToCart: stats.addToCart,
-      directOrdersCount: stats.directOrdersCount, // Always 0 - we cannot map products to order line items
-      directRevenue: stats.directRevenue, // Always 0 - we cannot map products to order line items
-      assistedOrdersCount: stats.assistedOrdersCount,
-      assistedRevenue: stats.assistedRevenue,
       inStock: productDetailsMap.get(handle)?.inStock ?? true,
     }))
     .sort((a, b) => b.recommendedCount - a.recommendedCount)
@@ -442,7 +323,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   topProducts.forEach((p) => {
     rows.push(
-      `,"${p.title}",${p.recommendedCount},${p.clicks},${p.addToCart},${p.directOrdersCount},${p.directRevenue.toFixed(2)},${p.assistedOrdersCount},${p.assistedRevenue.toFixed(2)},${p.inStock ? "Yes" : "No"}`
+      `,"${p.title}",${p.recommendedCount},${p.clicks},${p.addToCart},${p.inStock ? "Yes" : "No"}`
     );
   });
 

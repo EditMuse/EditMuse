@@ -1,10 +1,11 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData } from "react-router";
+import { useLoaderData, useNavigate, useSearchParams } from "react-router";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { UsageEventType, ConciergeSessionStatus } from "@prisma/client";
 import { getOfflineAccessTokenForShop } from "~/shopify-admin.server";
 import { fetchShopifyProductsByHandlesGraphQL } from "~/shopify-admin.server";
+import { useState, useEffect } from "react";
 
 function safeJson(s: string | null): any {
   if (!s) return null;
@@ -18,19 +19,15 @@ function safeJson(s: string | null): any {
 type DashboardData = {
   from: string;
   to: string;
-  attributionBanner?: {
-    type: "warning" | "info";
-    message: string;
-  };
   metrics: {
     sessions: number;
     resultsGenerated: number;
     productClicked: number;
     addToCartClicked: number;
     checkoutStarted: number;
-    ordersAttributedDirect: number;
-    ordersAttributedAssisted: number;
-    revenue: number;
+    ordersAttributedDirect: number; // Always 0 - removed for PCD Level 0 compliance
+    ordersAttributedAssisted: number; // Always 0 - removed for PCD Level 0 compliance
+    revenue: number; // Always 0 - removed for PCD Level 0 compliance
   };
   funnel: Array<{
     step: string;
@@ -40,8 +37,6 @@ type DashboardData = {
   topQueries: Array<{
     query: string;
     sessions: number;
-    revenue: number;
-    conversionRate: number;
   }>;
   topProducts: Array<{
     handle: string;
@@ -49,10 +44,6 @@ type DashboardData = {
     recommendedCount: number;
     clicks: number;
     addToCart: number;
-    directOrdersCount: number;
-    directRevenue: number;
-    assistedOrdersCount: number;
-    assistedRevenue: number;
     inStock: boolean;
   }>;
 };
@@ -99,15 +90,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     orderBy: { createdAt: "desc" },
   });
 
-  // Fetch order attributions in date range
-  const orderAttributions = await prisma.orderAttribution.findMany({
-    where: {
-      shopId: shop.id,
-      createdAt: { gte: fromDate, lte: toDate },
-    },
-  });
-
-  // Calculate metrics
+  // Calculate metrics (engagement analytics only - no order/customer data)
   const sessionsCount = sessions.length;
   const resultsGenerated =
     events.filter((e) => e.eventType === UsageEventType.AI_RANKING_EXECUTED)
@@ -121,23 +104,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const checkoutStarted = events.filter(
     (e) => e.eventType === UsageEventType.CHECKOUT_STARTED
   ).length;
-  const ordersAttributedDirect = orderAttributions.filter(
-    (o) => o.attributionType === "direct"
-  ).length;
-  const ordersAttributedAssisted = orderAttributions.filter(
-    (o) => o.attributionType === "assisted"
-  ).length;
-  
-  // Calculate revenue from order attributions (sum of all attributed orders)
-  let revenue = 0;
-  for (const order of orderAttributions) {
-    const price = parseFloat(order.totalPrice || "0");
-    if (!isNaN(price)) {
-      revenue += price;
-    }
-  }
 
-  // Build funnel
+  // Build funnel (engagement analytics only - stops at Add to Cart)
   const funnelSteps = [
     {
       step: "Sessions Started",
@@ -162,10 +130,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       step: "Add to Cart",
       count: addToCartClicked,
     },
-    {
-      step: "Checkout Started",
-      count: checkoutStarted,
-    },
+    // Note: Checkout Started and Order metrics removed for PCD Level 0 compliance
   ];
 
   const funnel = funnelSteps.map((step, index) => {
@@ -178,24 +143,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   });
 
-  // Build session ID to order attributions map for revenue/conversion tracking
-  const sessionOrdersMap = new Map<string, typeof orderAttributions>();
-  for (const order of orderAttributions) {
-    if (order.sessionId) {
-      if (!sessionOrdersMap.has(order.sessionId)) {
-        sessionOrdersMap.set(order.sessionId, []);
-      }
-      sessionOrdersMap.get(order.sessionId)!.push(order);
-    }
-  }
-
   // Build top queries from queryNormalized (grouping) and queryRaw (display)
+  // Note: Revenue and conversion tracking removed for PCD Level 0 compliance
   const queryMap = new Map<
     string,
     { 
       sessions: Set<string>; 
-      revenue: number; 
-      conversions: number;
       rawQueries: Map<string, number>; // Track most common raw form per normalized query
     }
   >();
@@ -235,8 +188,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       if (!queryMap.has(queryNormalized)) {
         queryMap.set(queryNormalized, {
           sessions: new Set(),
-          revenue: 0,
-          conversions: 0,
           rawQueries: new Map(),
         });
       }
@@ -247,18 +198,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       if (queryRaw) {
         const count = entry.rawQueries.get(queryRaw) || 0;
         entry.rawQueries.set(queryRaw, count + 1);
-      }
-      
-      // Calculate revenue and conversions from order attributions
-      const sessionOrders = sessionOrdersMap.get(session.id) || [];
-      for (const order of sessionOrders) {
-        const price = parseFloat(order.totalPrice || "0");
-        if (!isNaN(price)) {
-          entry.revenue += price;
-        }
-        if (order.attributionType === "direct") {
-          entry.conversions += 1;
-        }
       }
     }
   }
@@ -278,22 +217,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       return {
         query: mostCommonRaw.substring(0, 100), // Limit length, use most common raw form
         sessions: data.sessions.size,
-        revenue: data.revenue,
-        conversionRate: data.sessions.size > 0 ? data.conversions / data.sessions.size : 0,
       };
     })
     .sort((a, b) => b.sessions - a.sessions)
     .slice(0, 20);
 
-  // Build top products from ConciergeResult and events
+  // Build top products from ConciergeResult and events (engagement analytics only)
   const productHandleMap = new Map<
     string,
     {
       recommendedCount: number;
       clicks: number;
       addToCart: number;
-      attributedOrders: number;
-      revenue: number;
     }
   >();
 
@@ -311,10 +246,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
                 recommendedCount: 0,
                 clicks: 0,
                 addToCart: 0,
-                directOrdersCount: 0,
-                directRevenue: 0,
-                assistedOrdersCount: 0,
-                assistedRevenue: 0,
               });
             }
             productHandleMap.get(handle)!.recommendedCount++;
@@ -326,7 +257,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  // Count clicks and ATC from events
+  // Count clicks and ATC from events (engagement analytics only)
   for (const event of events) {
     const metadata = safeJson(event.metadata);
     if (metadata?.handle && typeof metadata.handle === "string") {
@@ -336,10 +267,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           recommendedCount: 0,
           clicks: 0,
           addToCart: 0,
-          directOrdersCount: 0,
-          directRevenue: 0,
-          assistedOrdersCount: 0,
-          assistedRevenue: 0,
         });
       }
       const product = productHandleMap.get(handle)!;
@@ -348,53 +275,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         product.clicks++;
       } else if (event.eventType === UsageEventType.ADD_TO_CART_CLICKED) {
         product.addToCart++;
-      }
-    }
-  }
-
-  // Calculate assisted orders and revenue for products (session-level attribution only)
-  // Note: We cannot reliably map products to order line items, so we do NOT attribute direct product revenue
-  // Direct product attribution would require matching product handles/variants to order line items,
-  // which we don't have in the current OrderAttribution model.
-  const productSessionMap = new Map<string, Set<string>>(); // handle -> sessionIds that recommended it
-  for (const session of sessions) {
-    if (session.result) {
-      try {
-        const handles = Array.isArray(session.result.productHandles)
-          ? session.result.productHandles
-          : [];
-        for (const handle of handles) {
-          if (typeof handle === "string") {
-            if (!productSessionMap.has(handle)) {
-              productSessionMap.set(handle, new Set());
-            }
-            productSessionMap.get(handle)!.add(session.id);
-          }
-        }
-      } catch (e) {
-        // Skip invalid data
-      }
-    }
-  }
-
-  // Calculate assisted orders and revenue per product (session-level only)
-  // Direct metrics remain 0 since we cannot map products to order line items
-  for (const [handle, sessionIds] of productSessionMap.entries()) {
-    if (productHandleMap.has(handle)) {
-      const product = productHandleMap.get(handle)!;
-      for (const sessionId of sessionIds) {
-        const sessionOrders = sessionOrdersMap.get(sessionId) || [];
-        for (const order of sessionOrders) {
-          // Only count assisted metrics at session level
-          // Direct metrics require product -> order line item mapping which we don't have
-          if (order.attributionType === "assisted" || order.attributionType === "direct") {
-            product.assistedOrdersCount++;
-            const price = parseFloat(order.totalPrice || "0");
-            if (!isNaN(price)) {
-              product.assistedRevenue += price;
-            }
-          }
-        }
       }
     }
   }
@@ -439,44 +319,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       recommendedCount: stats.recommendedCount,
       clicks: stats.clicks,
       addToCart: stats.addToCart,
-      directOrdersCount: stats.directOrdersCount, // Always 0 - we cannot map products to order line items
-      directRevenue: stats.directRevenue, // Always 0 - we cannot map products to order line items
-      assistedOrdersCount: stats.assistedOrdersCount,
-      assistedRevenue: stats.assistedRevenue,
       inStock: productDetailsMap.get(handle)?.inStock ?? true,
     }))
     .sort((a, b) => b.recommendedCount - a.recommendedCount)
     .slice(0, 50);
 
-  // Attribution banner logic
-  const attributionEnabled = process.env.SHOPIFY_ORDERS_WEBHOOK_ENABLED === "true";
-  const attributionBanner = attributionEnabled
-    ? orderAttributions.length === 0
-      ? {
-          type: "info" as const,
-          message:
-            "Attribution enabled, but no attributed orders yet. Ensure checkout started events include tokens and the orders/create webhook is firing.",
-        }
-      : undefined
-    : {
-        type: "warning" as const,
-        message:
-          "Order attribution is disabled. Enable SHOPIFY_ORDERS_WEBHOOK_ENABLED to start attributing orders (may require Shopify approval).",
-      };
-
   const data: DashboardData = {
     from: fromDate.toISOString().slice(0, 10),
     to: toDate.toISOString().slice(0, 10),
-    ...(attributionBanner ? { attributionBanner } : {}),
     metrics: {
       sessions: sessionsCount,
       resultsGenerated,
       productClicked,
       addToCartClicked,
       checkoutStarted,
-      ordersAttributedDirect,
-      ordersAttributedAssisted,
-      revenue,
+      ordersAttributedDirect: 0, // Removed for PCD Level 0 compliance
+      ordersAttributedAssisted: 0, // Removed for PCD Level 0 compliance
+      revenue: 0, // Removed for PCD Level 0 compliance
     },
     funnel,
     topQueries,
@@ -488,6 +347,70 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export default function DashboardPage() {
   const data = useLoaderData<DashboardData>();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [fromDate, setFromDate] = useState(data.from);
+  const [toDate, setToDate] = useState(data.to);
+  const [preset, setPreset] = useState<string>("custom");
+
+  // Update dates when loader data changes
+  useEffect(() => {
+    setFromDate(data.from);
+    setToDate(data.to);
+  }, [data.from, data.to]);
+
+  // Check which preset matches current dates
+  useEffect(() => {
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+    const todayStr = today.toISOString().slice(0, 10);
+    
+    const from = new Date(data.from);
+    const to = new Date(data.to);
+    const daysDiff = Math.floor((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
+    
+    if (data.to === todayStr) {
+      if (daysDiff === 6) {
+        setPreset("7");
+      } else if (daysDiff === 29) {
+        setPreset("30");
+      } else if (daysDiff === 89) {
+        setPreset("90");
+      } else {
+        setPreset("custom");
+      }
+    } else {
+      setPreset("custom");
+    }
+  }, [data.from, data.to]);
+
+  const handlePresetChange = (days: number | "custom") => {
+    if (days === "custom") {
+      setPreset("custom");
+      return;
+    }
+
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+    const to = today.toISOString().slice(0, 10);
+    
+    const from = new Date(today);
+    from.setDate(from.getDate() - (days - 1));
+    from.setHours(0, 0, 0, 0);
+    const fromStr = from.toISOString().slice(0, 10);
+
+    setPreset(String(days));
+    setFromDate(fromStr);
+    setToDate(to);
+    
+    navigate(`/app/dashboard?from=${fromStr}&to=${to}`);
+  };
+
+  const handleDateChange = () => {
+    if (fromDate && toDate) {
+      navigate(`/app/dashboard?from=${fromDate}&to=${toDate}`);
+    }
+  };
 
   return (
     <s-page heading="Dashboard">
@@ -497,14 +420,256 @@ export default function DashboardPage() {
             style={{
               display: "flex",
               justifyContent: "space-between",
-              alignItems: "center",
+              alignItems: "flex-start",
               marginBottom: "1rem",
+              flexWrap: "wrap",
+              gap: "1rem",
             }}
           >
-            <p style={{ color: "rgba(11,11,15,0.62)", fontSize: "0.875rem" }}>
-              Range: <strong style={{ color: "#0B0B0F" }}>{data.from}</strong> →{" "}
-              <strong style={{ color: "#0B0B0F" }}>{data.to}</strong>
-            </p>
+            {/* Date Range Controls */}
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.75rem",
+                flex: "1",
+                minWidth: "300px",
+              }}
+            >
+              <div style={{ fontSize: "0.875rem", fontWeight: "500", color: "#0B0B0F", marginBottom: "0.25rem" }}>
+                Date Range
+              </div>
+              
+              {/* Quick Presets */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.5rem",
+                  flexWrap: "wrap",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => handlePresetChange(7)}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: preset === "7" ? "#7C3AED" : "#FFFFFF",
+                    color: preset === "7" ? "#FFFFFF" : "#0B0B0F",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    fontSize: "0.875rem",
+                    fontWeight: "500",
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (preset !== "7") {
+                      e.currentTarget.style.background = "#F9FAFB";
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (preset !== "7") {
+                      e.currentTarget.style.background = "#FFFFFF";
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                    }
+                  }}
+                >
+                  Last 7 days
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePresetChange(30)}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: preset === "30" ? "#7C3AED" : "#FFFFFF",
+                    color: preset === "30" ? "#FFFFFF" : "#0B0B0F",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    fontSize: "0.875rem",
+                    fontWeight: "500",
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (preset !== "30") {
+                      e.currentTarget.style.background = "#F9FAFB";
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (preset !== "30") {
+                      e.currentTarget.style.background = "#FFFFFF";
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                    }
+                  }}
+                >
+                  Last 30 days
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePresetChange(90)}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: preset === "90" ? "#7C3AED" : "#FFFFFF",
+                    color: preset === "90" ? "#FFFFFF" : "#0B0B0F",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    fontSize: "0.875rem",
+                    fontWeight: "500",
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (preset !== "90") {
+                      e.currentTarget.style.background = "#F9FAFB";
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (preset !== "90") {
+                      e.currentTarget.style.background = "#FFFFFF";
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                    }
+                  }}
+                >
+                  Last 90 days
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreset("custom")}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: preset === "custom" ? "#7C3AED" : "#FFFFFF",
+                    color: preset === "custom" ? "#FFFFFF" : "#0B0B0F",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    fontSize: "0.875rem",
+                    fontWeight: "500",
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (preset !== "custom") {
+                      e.currentTarget.style.background = "#F9FAFB";
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (preset !== "custom") {
+                      e.currentTarget.style.background = "#FFFFFF";
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                    }
+                  }}
+                >
+                  Custom
+                </button>
+              </div>
+
+              {/* Date Pickers */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.75rem",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem", flex: "1", minWidth: "140px" }}>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "rgba(11,11,15,0.62)",
+                      fontWeight: "500",
+                    }}
+                  >
+                    From
+                  </label>
+                  <input
+                    type="date"
+                    value={fromDate}
+                    onChange={(e) => {
+                      setFromDate(e.target.value);
+                      setPreset("custom");
+                    }}
+                    onBlur={(e) => {
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                      e.currentTarget.style.boxShadow = "none";
+                      handleDateChange();
+                    }}
+                    onFocus={(e) => {
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                      e.currentTarget.style.boxShadow = "0 0 0 3px rgba(124, 58, 237, 0.1)";
+                    }}
+                    max={toDate}
+                    style={{
+                      padding: "0.625rem 0.75rem",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "8px",
+                      fontSize: "0.875rem",
+                      fontFamily: "inherit",
+                      color: "#0B0B0F",
+                      backgroundColor: "#FFFFFF",
+                      cursor: "pointer",
+                      transition: "all 0.2s",
+                    }}
+                  />
+                </div>
+                <div
+                  style={{
+                    fontSize: "1.25rem",
+                    color: "rgba(11,11,15,0.62)",
+                    marginTop: "1.5rem",
+                  }}
+                >
+                  →
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem", flex: "1", minWidth: "140px" }}>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "rgba(11,11,15,0.62)",
+                      fontWeight: "500",
+                    }}
+                  >
+                    To
+                  </label>
+                  <input
+                    type="date"
+                    value={toDate}
+                    onChange={(e) => {
+                      setToDate(e.target.value);
+                      setPreset("custom");
+                    }}
+                    onBlur={(e) => {
+                      e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                      e.currentTarget.style.boxShadow = "none";
+                      handleDateChange();
+                    }}
+                    onFocus={(e) => {
+                      e.currentTarget.style.borderColor = "#7C3AED";
+                      e.currentTarget.style.boxShadow = "0 0 0 3px rgba(124, 58, 237, 0.1)";
+                    }}
+                    min={fromDate}
+                    max={new Date().toISOString().slice(0, 10)}
+                    style={{
+                      padding: "0.625rem 0.75rem",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "8px",
+                      fontSize: "0.875rem",
+                      fontFamily: "inherit",
+                      color: "#0B0B0F",
+                      backgroundColor: "#FFFFFF",
+                      cursor: "pointer",
+                      transition: "all 0.2s",
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Export CSV Button */}
+            <div style={{ display: "flex", alignItems: "flex-end" }}>
             <a
               href={`/app/dashboard.csv?from=${data.from}&to=${data.to}`}
               style={{
@@ -517,39 +682,23 @@ export default function DashboardPage() {
                 fontWeight: "500",
                 fontSize: "0.875rem",
                 display: "inline-block",
+                  transition: "all 0.2s",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "#6D28D9";
+                  e.currentTarget.style.transform = "translateY(-1px)";
+                  e.currentTarget.style.boxShadow = "0 4px 12px rgba(124, 58, 237, 0.3)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "#7C3AED";
+                  e.currentTarget.style.transform = "translateY(0)";
+                  e.currentTarget.style.boxShadow = "none";
               }}
             >
               Export CSV
             </a>
-          </div>
-
-          {/* Attribution Banner */}
-          {data.attributionBanner && (
-            <div
-              style={{
-                padding: "1rem 1.5rem",
-                background:
-                  data.attributionBanner.type === "warning"
-                    ? "linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(251, 191, 36, 0.1))"
-                    : "linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(96, 165, 250, 0.1))",
-                border:
-                  data.attributionBanner.type === "warning"
-                    ? "2px solid rgba(245, 158, 11, 0.3)"
-                    : "2px solid rgba(59, 130, 246, 0.3)",
-                borderRadius: "12px",
-                marginBottom: "1.5rem",
-                color: data.attributionBanner.type === "warning" ? "#D97706" : "#2563EB",
-                boxShadow:
-                  data.attributionBanner.type === "warning"
-                    ? "0 4px 12px rgba(245, 158, 11, 0.2)"
-                    : "0 4px 12px rgba(59, 130, 246, 0.2)",
-              }}
-            >
-              <div style={{ fontWeight: "600", fontSize: "0.875rem" }}>
-                {data.attributionBanner.message}
-              </div>
             </div>
-          )}
+          </div>
 
           {/* KPI Cards */}
           <div
@@ -670,34 +819,6 @@ export default function DashboardPage() {
                 }}
               >
                 {data.metrics.addToCartClicked.toLocaleString()}
-              </div>
-            </div>
-            <div
-              style={{
-                padding: "1rem",
-                backgroundColor: "#FFFFFF",
-                border: "1px solid rgba(11,11,15,0.12)",
-                borderRadius: "12px",
-                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "0.875rem",
-                  color: "rgba(11,11,15,0.62)",
-                  marginBottom: "0.25rem",
-                }}
-              >
-                Revenue
-              </div>
-              <div
-                style={{
-                  fontSize: "1.5rem",
-                  fontWeight: "bold",
-                  color: "#10B981",
-                }}
-              >
-                ${data.metrics.revenue.toFixed(2)}
               </div>
             </div>
           </div>
@@ -839,35 +960,13 @@ export default function DashboardPage() {
                   >
                     Sessions
                   </th>
-                  <th
-                    style={{
-                      textAlign: "right",
-                      borderBottom: "1px solid rgba(11,11,15,0.12)",
-                      padding: "0.75rem 1rem",
-                      fontWeight: "500",
-                      color: "#0B0B0F",
-                    }}
-                  >
-                    Revenue
-                  </th>
-                  <th
-                    style={{
-                      textAlign: "right",
-                      borderBottom: "1px solid rgba(11,11,15,0.12)",
-                      padding: "0.75rem 1rem",
-                      fontWeight: "500",
-                      color: "#0B0B0F",
-                    }}
-                  >
-                    Conversion %
-                  </th>
                 </tr>
               </thead>
               <tbody>
                 {data.topQueries.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={4}
+                      colSpan={2}
                       style={{
                         padding: "2rem",
                         textAlign: "center",
@@ -904,26 +1003,6 @@ export default function DashboardPage() {
                         }}
                       >
                         {query.sessions.toLocaleString()}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                          color: "#0B0B0F",
-                        }}
-                      >
-                        ${query.revenue.toFixed(2)}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                          color: "#0B0B0F",
-                        }}
-                      >
-                        {(query.conversionRate * 100).toFixed(1)}%
                       </td>
                     </tr>
                   ))
@@ -995,28 +1074,6 @@ export default function DashboardPage() {
                   </th>
                   <th
                     style={{
-                      textAlign: "right",
-                      borderBottom: "1px solid rgba(11,11,15,0.12)",
-                      padding: "0.75rem 1rem",
-                      fontWeight: "500",
-                      color: "#0B0B0F",
-                    }}
-                  >
-                    Assisted Orders
-                  </th>
-                  <th
-                    style={{
-                      textAlign: "right",
-                      borderBottom: "1px solid rgba(11,11,15,0.12)",
-                      padding: "0.75rem 1rem",
-                      fontWeight: "500",
-                      color: "#0B0B0F",
-                    }}
-                  >
-                    Assisted Revenue
-                  </th>
-                  <th
-                    style={{
                       textAlign: "center",
                       borderBottom: "1px solid rgba(11,11,15,0.12)",
                       padding: "0.75rem 1rem",
@@ -1032,7 +1089,7 @@ export default function DashboardPage() {
                 {data.topProducts.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={5}
                       style={{
                         padding: "2rem",
                         textAlign: "center",
@@ -1089,26 +1146,6 @@ export default function DashboardPage() {
                         }}
                       >
                         {product.addToCart.toLocaleString()}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                          color: "#0B0B0F",
-                        }}
-                      >
-                        {product.assistedOrdersCount.toLocaleString()}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                          color: "#0B0B0F",
-                        }}
-                      >
-                        ${product.assistedRevenue.toFixed(2)}
                       </td>
                       <td
                         style={{
