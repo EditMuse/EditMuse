@@ -6710,7 +6710,168 @@ async function processSessionInBackground({
             
             console.log(`[DeepSearch] fetched=${deepFetch.products.length} from_shopify_search`);
             
-            // Fetch descriptions for these products to check if they match constraint terms
+            // If Shopify search returned 0, try broader fetch strategies
+            if (deepFetch.products.length === 0) {
+              console.log(`[DeepSearch] shopify_returned_0 trying_broader_fetch strategies`);
+              
+              // Strategy 1: Extract base terms from constraint terms (e.g., "hydrochloric acid" -> "acid", "hydrochloric")
+              // Fetch products with base terms in title/tags (they might have full term in description)
+              const baseTerms: string[] = [];
+              for (const term of uniqueConstraintTerms) {
+                const words = term.toLowerCase().split(/\s+/).filter(w => w.length >= 3);
+                baseTerms.push(...words);
+              }
+              const uniqueBaseTerms = Array.from(new Set(baseTerms)).slice(0, 5); // Limit to 5 terms
+              
+              if (uniqueBaseTerms.length > 0) {
+                console.log(`[DeepSearch] broader_fetch_strategy=base_terms terms=[${uniqueBaseTerms.join(", ")}]`);
+                
+                const broaderQuery = buildShopifySearchQuery({
+                  keywords: uniqueBaseTerms,
+                  selections: [],
+                  hasMeaningfulSignals: true
+                }, 500, "broad_text", uniqueBaseTerms);
+                
+                if (broaderQuery) {
+                  const broaderFetch = await fetchProductsByQueryPaginated(
+                    shopDomain,
+                    accessToken,
+                    broaderQuery,
+                    500, // Fetch more products for broader search
+                    200
+                  );
+                  
+                  console.log(`[DeepSearch] broader_fetch fetched=${broaderFetch.products.length} with_base_terms`);
+                  
+                  if (broaderFetch.products.length > 0) {
+                    // Filter out products we already have
+                    const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+                    const newBroaderProducts = broaderFetch.products.filter((p: any) => !existingHandles.has(p.handle));
+                    
+                    if (newBroaderProducts.length > 0) {
+                      // Fetch descriptions for these products
+                      const broaderHandles = newBroaderProducts.map((p: any) => p.handle);
+                      const broaderDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                        shopDomain,
+                        accessToken,
+                        handles: broaderHandles,
+                      });
+                      
+                      // Filter products that match constraint terms in description
+                      for (const product of newBroaderProducts) {
+                        const description = broaderDescriptionMap.get(product.handle) || null;
+                        const descPlain = cleanDescription(description);
+                        const descLower = descPlain.toLowerCase();
+                        
+                        // Check if any constraint term appears in description (word-boundary matching for phrases)
+                        const matchesConstraint = uniqueConstraintTerms.some(term => {
+                          const termLower = term.toLowerCase();
+                          if (term.includes(" ")) {
+                            // Multi-word phrase: check for exact phrase match
+                            return descLower.includes(termLower);
+                          } else {
+                            // Single word: use word-boundary matching
+                            const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                            return regex.test(descLower);
+                          }
+                        });
+                        
+                        if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                          deepSearchHandles.add(product.handle);
+                          deepSearchProducts.push(product);
+                        }
+                      }
+                      
+                      console.log(`[DeepSearch] broader_fetch matched_in_description=${deepSearchProducts.length} after_filtering`);
+                    }
+                  }
+                }
+              }
+              
+              // Strategy 2: If still no results, fetch products from related product types found in initial candidates
+              if (deepSearchProducts.length === 0 && allCandidatesEnriched.length > 0) {
+                console.log(`[DeepSearch] broader_fetch_strategy=related_product_types`);
+                
+                // Extract product types from initial candidates
+                const productTypes = new Set<string>();
+                for (const candidate of allCandidatesEnriched.slice(0, 50)) { // Check first 50 candidates
+                  if (candidate.productType) {
+                    productTypes.add(candidate.productType);
+                  }
+                }
+                
+                const productTypeArray = Array.from(productTypes).slice(0, 3); // Limit to 3 product types
+                
+                if (productTypeArray.length > 0) {
+                  console.log(`[DeepSearch] broader_fetch product_types=[${productTypeArray.join(", ")}]`);
+                  
+                  // Fetch products with these product types
+                  for (const productType of productTypeArray) {
+                    if (deepSearchProducts.length >= 500) break; // Limit total fetch
+                    
+                    const productTypeQuery = buildShopifySearchQuery({
+                      keywords: [productType],
+                      selections: [],
+                      hasMeaningfulSignals: true
+                    }, 200, "field_restricted");
+                    
+                    if (productTypeQuery) {
+                      const productTypeFetch = await fetchProductsByQueryPaginated(
+                        shopDomain,
+                        accessToken,
+                        productTypeQuery,
+                        200,
+                        200
+                      );
+                      
+                      // Filter out products we already have
+                      const existingHandles = new Set([
+                        ...allCandidatesEnriched.map(c => c.handle),
+                        ...deepSearchProducts.map(p => p.handle)
+                      ]);
+                      const newProductTypeProducts = productTypeFetch.products.filter((p: any) => !existingHandles.has(p.handle));
+                      
+                      if (newProductTypeProducts.length > 0) {
+                        // Fetch descriptions for these products
+                        const productTypeHandles = newProductTypeProducts.map((p: any) => p.handle);
+                        const productTypeDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                          shopDomain,
+                          accessToken,
+                          handles: productTypeHandles,
+                        });
+                        
+                        // Filter products that match constraint terms in description
+                        for (const product of newProductTypeProducts) {
+                          const description = productTypeDescriptionMap.get(product.handle) || null;
+                          const descPlain = cleanDescription(description);
+                          const descLower = descPlain.toLowerCase();
+                          
+                          // Check if any constraint term appears in description
+                          const matchesConstraint = uniqueConstraintTerms.some(term => {
+                            const termLower = term.toLowerCase();
+                            if (term.includes(" ")) {
+                              return descLower.includes(termLower);
+                            } else {
+                              const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                              return regex.test(descLower);
+                            }
+                          });
+                          
+                          if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
+                            deepSearchHandles.add(product.handle);
+                            deepSearchProducts.push(product);
+                          }
+                        }
+                      }
+                    }
+                  }
+                  
+                  console.log(`[DeepSearch] broader_fetch_product_types matched_in_description=${deepSearchProducts.length} after_filtering`);
+                }
+              }
+            }
+            
+            // Fetch descriptions for products from initial Shopify search (if any)
             if (deepFetch.products.length > 0) {
               const deepFetchHandles = deepFetch.products.map((p: any) => p.handle);
               const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
@@ -6728,7 +6889,12 @@ async function processSessionInBackground({
                 // Check if any constraint term appears in description
                 const matchesConstraint = uniqueConstraintTerms.some(term => {
                   const termLower = term.toLowerCase();
-                  return descLower.includes(termLower);
+                  if (term.includes(" ")) {
+                    return descLower.includes(termLower);
+                  } else {
+                    const regex = new RegExp(`\\b${termLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                    return regex.test(descLower);
+                  }
                 });
                 
                 if (matchesConstraint && !deepSearchHandles.has(product.handle)) {
@@ -6736,18 +6902,39 @@ async function processSessionInBackground({
                   deepSearchProducts.push(product);
                 }
               }
+            }
+            
+            // Log final count
+            if (deepSearchProducts.length > 0) {
+              console.log(`[DeepSearch] matched_in_description=${deepSearchProducts.length} after_filtering (from initial=${deepFetch.products.length > 0 ? "yes" : "no"}, broader=${deepSearchProducts.length > (deepFetch.products.length > 0 ? deepFetch.products.filter(p => deepSearchHandles.has(p.handle)).length : 0) ? "yes" : "no"})`);
+            } else {
+              console.log(`[DeepSearch] matched_in_description=0 after_filtering`);
+            }
+            
+            // Merge deep search products into candidate pool (dedupe by handle)
+            const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
+            const newDeepProducts = deepSearchProducts.filter((p: any) => !existingHandles.has(p.handle));
+            
+            if (newDeepProducts.length > 0) {
+              // Fetch descriptions for products that don't have them (from broader fetch)
+              const productsNeedingDescriptions = newDeepProducts.filter(p => !p.description);
+              let allDescriptionMap = new Map<string, string | null>();
               
-              console.log(`[DeepSearch] matched_in_description=${deepSearchProducts.length} after_filtering`);
+              if (productsNeedingDescriptions.length > 0) {
+                const handlesNeedingDescriptions = productsNeedingDescriptions.map(p => p.handle);
+                allDescriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                  shopDomain,
+                  accessToken,
+                  handles: handlesNeedingDescriptions,
+                });
+              }
               
-              // Merge deep search products into candidate pool (dedupe by handle)
-              const existingHandles = new Set(allCandidatesEnriched.map(c => c.handle));
-              const newDeepProducts = deepSearchProducts.filter((p: any) => !existingHandles.has(p.handle));
-              
-              if (newDeepProducts.length > 0) {
-                // Enrich new products and add to candidate pool
-                const enrichedDeepProducts: EnrichedCandidate[] = newDeepProducts.map((p: any) => {
-                  const descPlain = cleanDescription(p.description || null);
-                  const desc1000 = descPlain.substring(0, 1000);
+              // Enrich new products and add to candidate pool
+              const enrichedDeepProducts: EnrichedCandidate[] = newDeepProducts.map((p: any) => {
+                // Get description from product or from description map
+                const description = p.description || allDescriptionMap.get(p.handle) || null;
+                const descPlain = cleanDescription(description);
+                const desc1000 = descPlain.substring(0, 1000);
                   
                   return {
                     handle: p.handle,
@@ -6763,7 +6950,7 @@ async function processSessionInBackground({
                     priceMinAmount: null,
                     priceMaxAmount: null,
                     priceCurrency: p.currencyCode || null,
-                    description: p.description || null,
+                    description: description,
                     descPlain: descPlain,
                     desc1000: desc1000,
                     available: p.available,
@@ -6774,18 +6961,16 @@ async function processSessionInBackground({
                     metafields: p.metafields || null,
                     searchText: extractSearchText({
                       ...p,
-                      description: p.description || null,
+                      description: description,
                       descPlain: descPlain,
                       desc1000: desc1000,
                     }, indexMetafields),
                   } as EnrichedCandidate;
                 });
                 
-                // Add to candidate pool
-                allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedDeepProducts];
-                console.log(`[DeepSearch] merged=${enrichedDeepProducts.length} total_candidates=${allCandidatesEnriched.length}`);
-                
-              }
+              // Add to candidate pool
+              allCandidatesEnriched = [...allCandidatesEnriched, ...enrichedDeepProducts];
+              console.log(`[DeepSearch] merged=${enrichedDeepProducts.length} total_candidates=${allCandidatesEnriched.length}`);
             }
           }
         } catch (error) {
