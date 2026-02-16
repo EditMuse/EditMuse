@@ -44,20 +44,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         return Response.json({ error: "Shop not found" }, { status: 404 });
       }
 
-      // Fetch active experiments
-      const experiments = await prisma.experiment.findMany({
-        where: {
-          shopId: shop.id,
-          isActive: true,
-        },
-        select: {
-          key: true,
-          variants: true,
-        },
-      });
-
+      // Experiments feature removed - return empty array
       // Return experiments as JSON
-      return Response.json({ experiments });
+      return Response.json({ experiments: [] });
     },
     request,
     "/apps/editmuse/experiments",

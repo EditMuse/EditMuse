@@ -857,24 +857,40 @@
       var action = form.action || '';
       if (action.indexOf('/cart/add') === -1) return;
 
-      // Get product handle from form if available
+      // Get product handle from current URL (if on product page) or form
       var productHandle = null;
       try {
-        var productInput = form.querySelector('input[name="id"], input[name="product_id"]');
-        if (productInput) {
-          // Try to get handle from data attributes or URL
-          var productLink = form.closest('form')?.querySelector('a[href*="/products/"]');
-          if (productLink) {
-            var match = productLink.href.match(/\/products\/([^\/\?#]+)/);
-            if (match) productHandle = match[1];
+        // First, try to extract from current page URL (most reliable on product pages)
+        var urlMatch = window.location.pathname.match(/\/products\/([^\/\?#]+)/);
+        if (urlMatch) {
+          productHandle = urlMatch[1];
+        } else {
+          // Fallback: try to get from form
+          var productInput = form.querySelector('input[name="id"], input[name="product_id"]');
+          if (productInput) {
+            // Try to get handle from data attributes or nearby links
+            var productLink = form.closest('form')?.querySelector('a[href*="/products/"]');
+            if (!productLink) {
+              // Try finding link in parent containers
+              var parent = form.parentElement;
+              while (parent && !productLink) {
+                productLink = parent.querySelector('a[href*="/products/"]');
+                parent = parent.parentElement;
+              }
+            }
+            if (productLink) {
+              var match = productLink.href.match(/\/products\/([^\/\?#]+)/);
+              if (match) productHandle = match[1];
+            }
           }
         }
       } catch (e) {}
 
-      // Send ADD_TO_CART_CLICKED event with sid
+      // Send ADD_TO_CART_CLICKED event with sid and handle
       sendEvent('ADD_TO_CART_CLICKED', sessionId, {
         handle: productHandle,
-        source: 'form_submit'
+        source: 'form_submit',
+        url: window.location.href
       });
 
       // Add sid as hidden input to form (if form supports properties)
@@ -898,8 +914,18 @@
         var options = arguments[1] || {};
         
         if (typeof url === 'string' && (url.indexOf('/cart/add') !== -1 || url.indexOf('/cart/add.js') !== -1)) {
-          // Send ADD_TO_CART_CLICKED event
+          // Extract product handle from current page URL (if on product page)
+          var productHandle = null;
+          try {
+            var urlMatch = window.location.pathname.match(/\/products\/([^\/\?#]+)/);
+            if (urlMatch) {
+              productHandle = urlMatch[1];
+            }
+          } catch (e) {}
+          
+          // Send ADD_TO_CART_CLICKED event with sid and handle
           sendEvent('ADD_TO_CART_CLICKED', sessionId, {
+            handle: productHandle,
             source: 'ajax',
             url: url
           });

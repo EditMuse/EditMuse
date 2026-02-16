@@ -883,6 +883,55 @@ export default function Billing() {
           marginBottom: "2rem",
           boxShadow: "0 4px 12px rgba(124, 58, 237, 0.15)"
         }}>
+          {/* Trial Countdown */}
+          {inTrial && subscription && (
+            <div style={{
+              padding: "1rem",
+              backgroundColor: "#FFFBEB",
+              border: "2px solid #FCD34D",
+              borderRadius: "12px",
+              marginBottom: "1rem",
+            }}>
+              <div style={{ fontSize: "0.875rem", color: "#92400E", fontWeight: "500", marginBottom: "0.5rem" }}>
+                Trial Period
+              </div>
+              <div style={{ fontSize: "1.25rem", fontWeight: "bold", color: "#92400E" }}>
+                Trial active - Upgrade to continue after trial ends
+              </div>
+            </div>
+          )}
+
+          {/* Credits Progress Bar */}
+          <div style={{ marginBottom: "1.5rem" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
+              <div style={{ fontSize: "0.875rem", color: "#666", fontWeight: "500" }}>Credits Usage</div>
+              <div style={{ fontSize: "0.875rem", color: "#666" }}>
+                {((entitlements.usedCreditsX2 / entitlements.totalCreditsX2) * 100).toFixed(1)}%
+              </div>
+            </div>
+            <div style={{
+              width: "100%",
+              height: "24px",
+              backgroundColor: "#F3F4F6",
+              borderRadius: "12px",
+              overflow: "hidden",
+              position: "relative",
+            }}>
+              <div style={{
+                width: `${Math.min((entitlements.usedCreditsX2 / entitlements.totalCreditsX2) * 100, 100)}%`,
+                height: "100%",
+                backgroundColor: (entitlements.usedCreditsX2 / entitlements.totalCreditsX2) > 0.8 ? "#EF4444" :
+                                 (entitlements.usedCreditsX2 / entitlements.totalCreditsX2) > 0.6 ? "#F59E0B" : "#10B981",
+                borderRadius: "12px",
+                transition: "all 0.3s ease",
+              }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: "0.5rem", fontSize: "0.75rem", color: "#999" }}>
+              <span>0</span>
+              <span>{(entitlements.totalCreditsX2 / 2).toFixed(0)} credits</span>
+            </div>
+          </div>
+
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "1rem", marginBottom: "1rem" }}>
             <div>
               <div style={{ fontSize: "0.875rem", color: "#666" }}>Credits Used</div>
@@ -903,6 +952,20 @@ export default function Billing() {
               <div style={{ fontSize: "1.5rem", fontWeight: "bold", marginTop: "0.25rem", color: entitlements.remainingX2 > 0 ? "#10B981" : "#EF4444" }}>
                 {(entitlements.remainingX2 / 2).toFixed(1)}
               </div>
+              {/* Usage Projection */}
+              {usage.aiRankingsExecuted > 0 && (
+                <div style={{ fontSize: "0.75rem", color: "#999", marginTop: "0.25rem" }}>
+                  {(() => {
+                    const dailyBurn = usage.aiRankingsExecuted / 30; // Approximate daily burn
+                    const daysRemaining = dailyBurn > 0 ? Math.floor((entitlements.remainingX2 / 2) / dailyBurn) : null;
+                    return daysRemaining !== null && daysRemaining < 60 ? (
+                      <span style={{ color: daysRemaining < 30 ? "#EF4444" : "#F59E0B" }}>
+                        ~{daysRemaining} days at current rate
+                      </span>
+                    ) : null;
+                  })()}
+                </div>
+              )}
             </div>
           </div>
           {entitlements.experiencesLimit !== null && (
@@ -927,6 +990,83 @@ export default function Billing() {
               </div>
             </div>
           </div>
+        </div>
+
+        {/* Plan Comparison Table */}
+        <h2 style={{ marginBottom: "1rem" }}>Plan Comparison</h2>
+        <div style={{
+          backgroundColor: "#FFFFFF",
+          border: "1px solid rgba(11,11,15,0.12)",
+          borderRadius: "12px",
+          overflow: "hidden",
+          marginBottom: "2rem",
+          boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)"
+        }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ backgroundColor: "#F9FAFB" }}>
+                <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>Feature</th>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <th
+                    key={plan.tier}
+                    style={{
+                      padding: "0.75rem 1rem",
+                      textAlign: "center",
+                      borderBottom: "1px solid rgba(11,11,15,0.12)",
+                      fontWeight: "500",
+                      color: currentPlan.tier === plan.tier ? "#7C3AED" : "#0B0B0F",
+                      backgroundColor: currentPlan.tier === plan.tier ? "rgba(124, 58, 237, 0.05)" : "transparent",
+                    }}
+                  >
+                    {plan.name}
+                    {currentPlan.tier === plan.tier && <div style={{ fontSize: "0.75rem", color: "#7C3AED", marginTop: "0.25rem" }}>(Current)</div>}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              <tr style={{ backgroundColor: "#FFFFFF" }}>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Monthly Price</td>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                    {plan.price ? `$${plan.price.toFixed(2)}` : "—"}
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ backgroundColor: "#F9FAFB" }}>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Credits Included</td>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                    {plan.includedCredits.toLocaleString()}
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ backgroundColor: "#FFFFFF" }}>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Experiences</td>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                    {plan.experiences === null ? "Unlimited" : plan.experiences}
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ backgroundColor: "#F9FAFB" }}>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Candidate Cap</td>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                    {plan.candidateCap}
+                  </td>
+                ))}
+              </tr>
+              <tr style={{ backgroundColor: "#FFFFFF" }}>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Overage Rate</td>
+                {Object.values(PLANS).filter(p => p.tier !== "TRIAL").map(plan => (
+                  <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                    ${plan.overageRate.toFixed(2)}/credit
+                  </td>
+                ))}
+              </tr>
+            </tbody>
+          </table>
         </div>
 
         {availablePlans.length > 0 && (

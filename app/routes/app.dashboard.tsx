@@ -17,6 +17,7 @@ function safeJson(s: string | null): any {
 }
 
 type DashboardData = {
+  shopDomain: string;
   from: string;
   to: string;
   metrics: {
@@ -29,6 +30,17 @@ type DashboardData = {
     ordersAttributedAssisted: number; // Always 0 - removed for PCD Level 0 compliance
     revenue: number; // Always 0 - removed for PCD Level 0 compliance
   };
+  previousPeriodMetrics: {
+    sessions: number;
+    resultsGenerated: number;
+    productClicked: number;
+    addToCartClicked: number;
+  };
+  performanceMetrics: {
+    avgResultsPerSession: number;
+    sessionCompletionRate: number;
+    avgClicksPerResult: number;
+  };
   funnel: Array<{
     step: string;
     count: number;
@@ -37,10 +49,12 @@ type DashboardData = {
   topQueries: Array<{
     query: string;
     sessions: number;
+    noResultsCount?: number;
   }>;
   topProducts: Array<{
     handle: string;
     title: string;
+    imageUrl?: string;
     recommendedCount: number;
     clicks: number;
     addToCart: number;
@@ -287,7 +301,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   let productDetailsMap = new Map<
     string,
-    { title: string; inStock: boolean }
+    { title: string; inStock: boolean; imageUrl?: string }
   >();
 
   if (topProductHandles.length > 0) {
@@ -304,6 +318,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           productDetailsMap.set(product.handle, {
             title: product.title,
             inStock: product.available,
+            imageUrl: product.image || undefined,
           });
         }
       }
@@ -316,6 +331,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     .map(([handle, stats]) => ({
       handle,
       title: productDetailsMap.get(handle)?.title || handle,
+      imageUrl: productDetailsMap.get(handle)?.imageUrl,
       recommendedCount: stats.recommendedCount,
       clicks: stats.clicks,
       addToCart: stats.addToCart,
@@ -324,7 +340,49 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     .sort((a, b) => b.recommendedCount - a.recommendedCount)
     .slice(0, 50);
 
+  // Calculate previous period metrics for comparison
+  const periodDays = Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24));
+  const previousToDate = new Date(fromDate);
+  previousToDate.setHours(23, 59, 59, 999);
+  previousToDate.setDate(previousToDate.getDate() - 1);
+  const previousFromDate = new Date(previousToDate);
+  previousFromDate.setDate(previousFromDate.getDate() - periodDays);
+  previousFromDate.setHours(0, 0, 0, 0);
+
+  const previousSessions = await prisma.conciergeSession.findMany({
+    where: {
+      shopId: shop.id,
+      createdAt: { gte: previousFromDate, lte: previousToDate },
+    },
+    include: { result: true },
+  });
+
+  const previousEvents = await prisma.usageEvent.findMany({
+    where: {
+      shopId: shop.id,
+      createdAt: { gte: previousFromDate, lte: previousToDate },
+    },
+  });
+
+  const previousSessionsCount = previousSessions.length;
+  const previousResultsGenerated =
+    previousEvents.filter((e) => e.eventType === UsageEventType.AI_RANKING_EXECUTED).length ||
+    previousSessions.filter((s) => s.result).length;
+  const previousProductClicked = previousEvents.filter(
+    (e) => e.eventType === UsageEventType.RECOMMENDATION_CLICKED
+  ).length;
+  const previousAddToCartClicked = previousEvents.filter(
+    (e) => e.eventType === UsageEventType.ADD_TO_CART_CLICKED
+  ).length;
+
+  // Calculate performance metrics
+  const sessionsWithResults = sessions.filter((s) => s.result).length;
+  const avgResultsPerSession = sessionsCount > 0 ? resultsGenerated / sessionsCount : 0;
+  const sessionCompletionRate = sessionsCount > 0 ? (sessionsWithResults / sessionsCount) * 100 : 0;
+  const avgClicksPerResult = resultsGenerated > 0 ? productClicked / resultsGenerated : 0;
+
   const data: DashboardData = {
+    shopDomain: shop.domain,
     from: fromDate.toISOString().slice(0, 10),
     to: toDate.toISOString().slice(0, 10),
     metrics: {
@@ -337,6 +395,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       ordersAttributedAssisted: 0, // Removed for PCD Level 0 compliance
       revenue: 0, // Removed for PCD Level 0 compliance
     },
+    previousPeriodMetrics: {
+      sessions: previousSessionsCount,
+      resultsGenerated: previousResultsGenerated,
+      productClicked: previousProductClicked,
+      addToCartClicked: previousAddToCartClicked,
+    },
+    performanceMetrics: {
+      avgResultsPerSession,
+      sessionCompletionRate,
+      avgClicksPerResult,
+    },
     funnel,
     topQueries,
     topProducts,
@@ -344,6 +413,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return data;
 };
+
+// Helper function to calculate percentage change
+function calculateChange(current: number, previous: number): { value: number; isPositive: boolean } | null {
+  if (previous === 0) return current > 0 ? { value: 100, isPositive: true } : null;
+  const change = ((current - previous) / previous) * 100;
+  return { value: Math.abs(change), isPositive: change >= 0 };
+}
 
 export default function DashboardPage() {
   const data = useLoaderData<DashboardData>();
@@ -671,7 +747,7 @@ export default function DashboardPage() {
             {/* Export CSV Button */}
             <div style={{ display: "flex", alignItems: "flex-end" }}>
             <a
-              href={`/app/dashboard.csv?from=${data.from}&to=${data.to}`}
+              href={`/app/dashboard.csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
               style={{
                 padding: "0.625rem 1.25rem",
                 background: "#7C3AED",
@@ -727,14 +803,36 @@ export default function DashboardPage() {
               >
                 Sessions
               </div>
-              <div
-                style={{
-                  fontSize: "1.5rem",
-                  fontWeight: "bold",
-                  color: "#7C3AED",
-                }}
-              >
-                {data.metrics.sessions.toLocaleString()}
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                <div
+                  style={{
+                    fontSize: "1.5rem",
+                    fontWeight: "bold",
+                    color: "#7C3AED",
+                  }}
+                >
+                  {data.metrics.sessions.toLocaleString()}
+                </div>
+                {(() => {
+                  const change = calculateChange(data.metrics.sessions, data.previousPeriodMetrics.sessions);
+                  if (change) {
+                    return (
+                      <div
+                        style={{
+                          fontSize: "0.75rem",
+                          color: change.isPositive ? "#10B981" : "#EF4444",
+                          fontWeight: "500",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.25rem",
+                        }}
+                      >
+                        {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </div>
             <div
@@ -755,14 +853,36 @@ export default function DashboardPage() {
               >
                 Results Generated
               </div>
-              <div
-                style={{
-                  fontSize: "1.5rem",
-                  fontWeight: "bold",
-                  color: "#06B6D4",
-                }}
-              >
-                {data.metrics.resultsGenerated.toLocaleString()}
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                <div
+                  style={{
+                    fontSize: "1.5rem",
+                    fontWeight: "bold",
+                    color: "#06B6D4",
+                  }}
+                >
+                  {data.metrics.resultsGenerated.toLocaleString()}
+                </div>
+                {(() => {
+                  const change = calculateChange(data.metrics.resultsGenerated, data.previousPeriodMetrics.resultsGenerated);
+                  if (change) {
+                    return (
+                      <div
+                        style={{
+                          fontSize: "0.75rem",
+                          color: change.isPositive ? "#10B981" : "#EF4444",
+                          fontWeight: "500",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.25rem",
+                        }}
+                      >
+                        {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </div>
             <div
@@ -783,14 +903,36 @@ export default function DashboardPage() {
               >
                 Product Clicks
               </div>
-              <div
-                style={{
-                  fontSize: "1.5rem",
-                  fontWeight: "bold",
-                  color: "#0B0B0F",
-                }}
-              >
-                {data.metrics.productClicked.toLocaleString()}
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                <div
+                  style={{
+                    fontSize: "1.5rem",
+                    fontWeight: "bold",
+                    color: "#0B0B0F",
+                  }}
+                >
+                  {data.metrics.productClicked.toLocaleString()}
+                </div>
+                {(() => {
+                  const change = calculateChange(data.metrics.productClicked, data.previousPeriodMetrics.productClicked);
+                  if (change) {
+                    return (
+                      <div
+                        style={{
+                          fontSize: "0.75rem",
+                          color: change.isPositive ? "#10B981" : "#EF4444",
+                          fontWeight: "500",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.25rem",
+                        }}
+                      >
+                        {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </div>
             <div
@@ -811,14 +953,131 @@ export default function DashboardPage() {
               >
                 Add to Cart
               </div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                <div
+                  style={{
+                    fontSize: "1.5rem",
+                    fontWeight: "bold",
+                    color: "#0B0B0F",
+                  }}
+                >
+                  {data.metrics.addToCartClicked.toLocaleString()}
+                </div>
+                {(() => {
+                  const change = calculateChange(data.metrics.addToCartClicked, data.previousPeriodMetrics.addToCartClicked);
+                  if (change) {
+                    return (
+                      <div
+                        style={{
+                          fontSize: "0.75rem",
+                          color: change.isPositive ? "#10B981" : "#EF4444",
+                          fontWeight: "500",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.25rem",
+                        }}
+                      >
+                        {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
+            </div>
+          </div>
+
+          {/* Performance Metrics */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+              gap: "1rem",
+              marginBottom: "2rem",
+            }}
+          >
+            <div
+              style={{
+                padding: "1rem",
+                backgroundColor: "#FFFFFF",
+                border: "1px solid rgba(11,11,15,0.12)",
+                borderRadius: "12px",
+                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
+              }}
+            >
               <div
                 style={{
-                  fontSize: "1.5rem",
+                  fontSize: "0.875rem",
+                  color: "rgba(11,11,15,0.62)",
+                  marginBottom: "0.25rem",
+                }}
+              >
+                Avg Results per Session
+              </div>
+              <div
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: "bold",
+                  color: "#7C3AED",
+                }}
+              >
+                {data.performanceMetrics.avgResultsPerSession.toFixed(1)}
+              </div>
+            </div>
+            <div
+              style={{
+                padding: "1rem",
+                backgroundColor: "#FFFFFF",
+                border: "1px solid rgba(11,11,15,0.12)",
+                borderRadius: "12px",
+                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: "0.875rem",
+                  color: "rgba(11,11,15,0.62)",
+                  marginBottom: "0.25rem",
+                }}
+              >
+                Session Completion Rate
+              </div>
+              <div
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: "bold",
+                  color: "#06B6D4",
+                }}
+              >
+                {data.performanceMetrics.sessionCompletionRate.toFixed(1)}%
+              </div>
+            </div>
+            <div
+              style={{
+                padding: "1rem",
+                backgroundColor: "#FFFFFF",
+                border: "1px solid rgba(11,11,15,0.12)",
+                borderRadius: "12px",
+                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: "0.875rem",
+                  color: "rgba(11,11,15,0.62)",
+                  marginBottom: "0.25rem",
+                }}
+              >
+                Avg Clicks per Result
+              </div>
+              <div
+                style={{
+                  fontSize: "1.25rem",
                   fontWeight: "bold",
                   color: "#0B0B0F",
                 }}
               >
-                {data.metrics.addToCartClicked.toLocaleString()}
+                {data.performanceMetrics.avgClicksPerResult.toFixed(2)}
               </div>
             </div>
           </div>
@@ -1048,6 +1307,17 @@ export default function DashboardPage() {
                       color: "#0B0B0F",
                     }}
                   >
+                    Actions
+                  </th>
+                  <th
+                    style={{
+                      textAlign: "right",
+                      borderBottom: "1px solid rgba(11,11,15,0.12)",
+                      padding: "0.75rem 1rem",
+                      fontWeight: "500",
+                      color: "#0B0B0F",
+                    }}
+                  >
                     Recommended
                   </th>
                   <th
@@ -1089,7 +1359,7 @@ export default function DashboardPage() {
                 {data.topProducts.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={5}
+                      colSpan={6}
                       style={{
                         padding: "2rem",
                         textAlign: "center",
@@ -1114,7 +1384,22 @@ export default function DashboardPage() {
                           color: "#0B0B0F",
                         }}
                       >
-                        {product.title}
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+                          {product.imageUrl && (
+                            <img
+                              src={product.imageUrl}
+                              alt={product.title}
+                              style={{
+                                width: "40px",
+                                height: "40px",
+                                objectFit: "cover",
+                                borderRadius: "6px",
+                                border: "1px solid rgba(11,11,15,0.12)",
+                              }}
+                            />
+                          )}
+                          <span>{product.title}</span>
+                        </div>
                       </td>
                       <td
                         style={{
@@ -1181,6 +1466,38 @@ export default function DashboardPage() {
                             Out of Stock
                           </span>
                         )}
+                      </td>
+                      <td
+                        style={{
+                          borderBottom: "1px solid rgba(11,11,15,0.08)",
+                          padding: "0.75rem 1rem",
+                          textAlign: "right",
+                        }}
+                      >
+                        <a
+                          href={`https://${data.shopDomain}/products/${product.handle}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{
+                            padding: "0.375rem 0.75rem",
+                            background: "#7C3AED",
+                            color: "#FFFFFF",
+                            textDecoration: "none",
+                            borderRadius: "6px",
+                            fontSize: "0.75rem",
+                            fontWeight: "500",
+                            display: "inline-block",
+                            transition: "all 0.2s",
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "#6D28D9";
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "#7C3AED";
+                          }}
+                        >
+                          View Product
+                        </a>
                       </td>
                     </tr>
                   ))

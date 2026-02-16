@@ -4140,11 +4140,31 @@
   // Add-to-Cart tracking
   function trackAddToCart(variantId, quantity, currentUrl) {
     try {
+      // Get session ID from URL or sessionStorage
+      var sessionId = null;
+      try {
+        var params = new URLSearchParams(window.location.search);
+        sessionId = params.get('sessionId') || params.get('sid') || params.get('editmuse_session');
+        if (!sessionId && typeof sessionStorage !== 'undefined') {
+          sessionId = sessionStorage.getItem('editmuse_sid');
+        }
+      } catch (e) {}
+      
+      // Extract product handle from current URL (if on product page)
+      var productHandle = null;
+      try {
+        var urlMatch = window.location.pathname.match(/\/products\/([^\/\?#]+)/);
+        if (urlMatch) {
+          productHandle = urlMatch[1];
+        }
+      } catch (e) {}
+      
       var eventUrl = '/apps/editmuse/event' + window.location.search;
       var payload = {
         eventType: 'ADD_TO_CART_CLICKED',
-        sid: null,
+        sid: sessionId || null,
         metadata: {
+          handle: productHandle,
           variantId: variantId || null,
           quantity: quantity || 1,
           url: currentUrl || window.location.href,

@@ -7,6 +7,7 @@ import prisma from "~/db.server";
 import { useState, useEffect } from "react";
 import { getEntitlements } from "~/models/billing.server";
 import { withQuery } from "~/utils/redirect.server";
+import { UsageEventType } from "@prisma/client";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
@@ -34,6 +35,79 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const entitlements = await getEntitlements(shop.id);
     const experienceCount = experiences.length;
 
+    // Fetch analytics for each experience (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    thirtyDaysAgo.setHours(0, 0, 0, 0);
+
+    const experienceAnalyticsMap = new Map<string, {
+      sessions: number;
+      resultsGenerated: number;
+      productClicks: number;
+      addToCart: number;
+    }>();
+
+    // Fetch sessions per experience
+    const sessions = await prisma.conciergeSession.findMany({
+      where: {
+        shopId: shop.id,
+        experienceId: { in: experiences.map(e => e.id) },
+        createdAt: { gte: thirtyDaysAgo },
+      },
+      include: { result: true },
+    });
+
+    // Fetch events per experience
+    const events = await prisma.usageEvent.findMany({
+      where: {
+        shopId: shop.id,
+        createdAt: { gte: thirtyDaysAgo },
+      },
+    });
+
+    // Initialize analytics for all experiences
+    for (const exp of experiences) {
+      experienceAnalyticsMap.set(exp.id, {
+        sessions: 0,
+        resultsGenerated: 0,
+        productClicks: 0,
+        addToCart: 0,
+      });
+    }
+
+    // Calculate session metrics per experience
+    for (const session of sessions) {
+      if (session.experienceId) {
+        const analytics = experienceAnalyticsMap.get(session.experienceId);
+        if (analytics) {
+          analytics.sessions++;
+          if (session.result) {
+            analytics.resultsGenerated++;
+          }
+        }
+      }
+    }
+
+    // Calculate event metrics per experience (via session metadata)
+    for (const event of events) {
+      try {
+        const metadata = typeof event.metadata === 'string' ? JSON.parse(event.metadata) : event.metadata;
+        const experienceId = metadata?.experienceId;
+        
+        if (experienceId && experienceAnalyticsMap.has(experienceId)) {
+          const analytics = experienceAnalyticsMap.get(experienceId)!;
+          
+          if (event.eventType === UsageEventType.RECOMMENDATION_CLICKED) {
+            analytics.productClicks++;
+          } else if (event.eventType === UsageEventType.ADD_TO_CART_CLICKED) {
+            analytics.addToCart++;
+          }
+        }
+      } catch (e) {
+        // Skip invalid metadata
+      }
+    }
+
     // Normalize invalid modes to "hybrid"
     const validModes = ["quiz", "chat", "hybrid"];
     
@@ -47,12 +121,19 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       shopDomain,
       experiences: experiences.map((exp: any) => {
         const mode = validModes.includes(exp.mode) ? exp.mode : "hybrid";
+        const analytics = experienceAnalyticsMap.get(exp.id) || {
+          sessions: 0,
+          resultsGenerated: 0,
+          productClicks: 0,
+          addToCart: 0,
+        };
         return {
           ...exp,
           mode, // Normalized mode
           includedCollections: JSON.parse(exp.includedCollections || "[]"),
           excludedTags: JSON.parse(exp.excludedTags || "[]"),
           isDefault: (exp as any).isDefault || false,
+          analytics, // Add analytics to each experience
         };
       }),
       hasDuplicateDefaultConcierge,
@@ -210,6 +291,53 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return redirect(withQuery(request, "/app/experiences"));
       }
       return { success: "No duplicates found" };
+    } else if (intent === "duplicate") {
+      if (!experienceId) {
+        console.error("[ExperiencesIndex] Duplicate: Experience ID required");
+        return { error: "Experience ID required" };
+      }
+      // Verify shop ownership
+      const experience = await prisma.experience.findFirst({
+        where: {
+          id: experienceId,
+          shopId: shop.id,
+        },
+      });
+      
+      if (!experience) {
+        console.error("[ExperiencesIndex] Duplicate: Experience not found or access denied", { experienceId, shopId: shop.id });
+        return { error: "Experience not found or access denied" };
+      }
+      
+      // Check experience limit
+      const currentCount = await prisma.experience.count({
+        where: { shopId: shop.id },
+      });
+      const entitlements = await getEntitlements(shop.id);
+      if (entitlements.experiencesLimit !== null && currentCount >= entitlements.experiencesLimit) {
+        return { error: `Experience limit reached (${entitlements.experiencesLimit}). Please upgrade your plan or delete an existing experience.` };
+      }
+      
+      // Create duplicate (exclude isDefault to prevent conflicts)
+      const duplicated = await prisma.experience.create({
+        data: {
+          shopId: shop.id,
+          name: `${experience.name} (Copy)`,
+          mode: experience.mode,
+          resultCount: experience.resultCount,
+          tone: experience.tone,
+          includedCollections: experience.includedCollections,
+          excludedTags: experience.excludedTags,
+          inStockOnly: experience.inStockOnly,
+          isDefault: false, // Never duplicate as default
+          questionsJson: experience.questionsJson,
+          searchSynonymsJson: experience.searchSynonymsJson,
+        },
+      });
+      
+      console.log("[ExperiencesIndex] Duplicate: Successfully duplicated experience", { originalId: experienceId, newId: duplicated.id });
+      // Redirect to revalidate the list
+      return redirect(withQuery(request, "/app/experiences"));
     } else {
       console.error("[ExperiencesIndex] Action: Invalid intent", { intent });
       return { error: "Invalid action" };
@@ -435,6 +563,7 @@ export default function ExperiencesIndex() {
                   <th style={{ padding: "0.75rem" }}>Mode</th>
                   <th style={{ padding: "0.75rem" }}>Results</th>
                   <th style={{ padding: "0.75rem" }}>Default</th>
+                  <th style={{ padding: "0.75rem" }}>Analytics (30d)</th>
                   <th style={{ padding: "0.75rem" }}>ID</th>
                   <th style={{ padding: "0.75rem" }}>Actions</th>
                 </tr>
@@ -442,6 +571,7 @@ export default function ExperiencesIndex() {
               <tbody>
                 {experiences.map((exp: any) => {
                   const shortId = exp.id.substring(0, 8);
+                  const analytics = exp.analytics || { sessions: 0, resultsGenerated: 0, productClicks: 0, addToCart: 0 };
                   return (
                     <tr key={exp.id} style={{ borderBottom: "1px solid rgba(11,11,15,0.12)" }}>
                       <td style={{ padding: "0.75rem" }}>{exp.name}</td>
@@ -458,6 +588,14 @@ export default function ExperiencesIndex() {
                         ) : (
                           <span style={{ color: "rgba(11,11,15,0.4)" }}>—</span>
                         )}
+                      </td>
+                      <td style={{ padding: "0.75rem", fontSize: "0.875rem" }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                          <div>Sessions: <strong>{analytics.sessions}</strong></div>
+                          <div>Results: <strong>{analytics.resultsGenerated}</strong></div>
+                          <div>Clicks: <strong>{analytics.productClicks}</strong></div>
+                          <div>ATC: <strong>{analytics.addToCart}</strong></div>
+                        </div>
                       </td>
                       <td style={{ padding: "0.75rem" }}>
                         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -530,6 +668,27 @@ export default function ExperiencesIndex() {
                               </button>
                             </Form>
                           )}
+                          <Form method="post" style={{ display: "inline" }}>
+                            <input type="hidden" name="intent" value="duplicate" />
+                            <input type="hidden" name="experienceId" value={exp.id} />
+                            <button 
+                              type="submit"
+                              disabled={navigation.state === "submitting" || isLimitReached}
+                              style={{
+                                padding: "0.25rem 0.75rem",
+                                backgroundColor: "#FFFFFF",
+                                border: "1px solid #06B6D4",
+                                borderRadius: "12px",
+                                color: "#06B6D4",
+                                cursor: navigation.state === "submitting" || isLimitReached ? "not-allowed" : "pointer",
+                                fontSize: "0.875rem",
+                                opacity: isLimitReached ? 0.5 : 1,
+                              }}
+                              title={isLimitReached ? "Experience limit reached" : "Duplicate this experience"}
+                            >
+                              {navigation.state === "submitting" ? "Duplicating..." : "Duplicate"}
+                            </button>
+                          </Form>
                           <Form method="post" style={{ display: "inline" }}>
                             <input type="hidden" name="intent" value="delete" />
                             <input type="hidden" name="experienceId" value={exp.id} />
