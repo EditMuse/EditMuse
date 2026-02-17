@@ -6,6 +6,7 @@ import prisma from "~/db.server";
 import { UsageEventType } from "@prisma/client";
 import { getEntitlements } from "~/models/billing.server";
 import { PLAN_TIER } from "~/models/billing.server";
+import { useAppBridge } from "@shopify/app-bridge-react";
 
 type LoaderData = {
   from: string;
@@ -163,12 +164,14 @@ export default function UsagePage() {
   const data = useLoaderData<LoaderData>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const app = useAppBridge();
   const [fromDate, setFromDate] = useState(data.from);
   const [toDate, setToDate] = useState(data.to);
   const [preset, setPreset] = useState<string>("custom");
   const [eventFilter, setEventFilter] = useState<string>("all");
   const [eventSearch, setEventSearch] = useState<string>("");
   const [selectedEvent, setSelectedEvent] = useState<number | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
 
   // Update dates when loader data changes
   useEffect(() => {
@@ -226,6 +229,45 @@ export default function UsagePage() {
   const handleDateChange = () => {
     if (fromDate && toDate) {
       navigate(`/app/usage?from=${fromDate}&to=${toDate}`);
+    }
+  };
+
+  const handleExportCSV = async () => {
+    if (isExporting) return;
+    
+    setIsExporting(true);
+    try {
+      const url = `/app/usage/export-csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`;
+      
+      // Use regular fetch with credentials for embedded app context
+      const response = await fetch(url, { credentials: 'include' });
+      
+      if (!response.ok) {
+        throw new Error(`Export failed: ${response.status} ${response.statusText}`);
+      }
+      
+      const csvText = await response.text();
+      
+      // Create blob and trigger download
+      const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const filename = `usage-${data.from}_to_${data.to}.csv`;
+      
+      // Create temporary anchor element and trigger download
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      // Clean up blob URL
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error('CSV export failed:', error);
+      alert('Failed to export CSV. Please try again.');
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -487,11 +529,12 @@ export default function UsagePage() {
 
             {/* Export CSV Button */}
             <div style={{ display: "flex", alignItems: "flex-end" }}>
-              <a
-                href={`/app/usage/export-csv?from=${encodeURIComponent(data.from)}&to=${encodeURIComponent(data.to)}`}
+              <button
+                onClick={handleExportCSV}
+                disabled={isExporting}
                 style={{
                   padding: "0.625rem 1.25rem",
-                  background: "#7C3AED",
+                  background: isExporting ? "#9CA3AF" : "#7C3AED",
                   border: "none",
                   borderRadius: "8px",
                   color: "#FFFFFF",
@@ -499,21 +542,26 @@ export default function UsagePage() {
                   fontWeight: "500",
                   fontSize: "0.875rem",
                   display: "inline-block",
+                  cursor: isExporting ? "not-allowed" : "pointer",
                   transition: "all 0.2s",
                 }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "#6D28D9";
-                  e.currentTarget.style.transform = "translateY(-1px)";
-                  e.currentTarget.style.boxShadow = "0 4px 12px rgba(124, 58, 237, 0.3)";
+                  if (!isExporting) {
+                    e.currentTarget.style.background = "#6D28D9";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 4px 12px rgba(124, 58, 237, 0.3)";
+                  }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "#7C3AED";
-                  e.currentTarget.style.transform = "translateY(0)";
-                  e.currentTarget.style.boxShadow = "none";
+                  if (!isExporting) {
+                    e.currentTarget.style.background = "#7C3AED";
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "none";
+                  }
                 }}
               >
-                Export CSV
-              </a>
+                {isExporting ? "Exporting..." : "Export CSV"}
+              </button>
             </div>
           </div>
 
