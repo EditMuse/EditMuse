@@ -1361,7 +1361,7 @@ export default function DashboardPage() {
                   </th>
                   <th
                     style={{
-                      textAlign: "right",
+                      textAlign: "center",
                       borderBottom: "1px solid rgba(11,11,15,0.12)",
                       padding: "0.75rem 1rem",
                       fontWeight: "500",
@@ -1394,17 +1394,6 @@ export default function DashboardPage() {
                   </th>
                   <th
                     style={{
-                      textAlign: "right",
-                      borderBottom: "1px solid rgba(11,11,15,0.12)",
-                      padding: "0.75rem 1rem",
-                      fontWeight: "500",
-                      color: "#0B0B0F",
-                    }}
-                  >
-                    Add to Cart
-                  </th>
-                  <th
-                    style={{
                       textAlign: "center",
                       borderBottom: "1px solid rgba(11,11,15,0.12)",
                       padding: "0.75rem 1rem",
@@ -1420,7 +1409,7 @@ export default function DashboardPage() {
                 {data.topProducts.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={6}
+                      colSpan={5}
                       style={{
                         padding: "3rem",
                         textAlign: "center",
@@ -1469,6 +1458,38 @@ export default function DashboardPage() {
                         style={{
                           borderBottom: "1px solid rgba(11,11,15,0.08)",
                           padding: "0.75rem 1rem",
+                          textAlign: "center",
+                        }}
+                      >
+                        <a
+                          href={`https://${data.shopDomain}/products/${product.handle}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{
+                            padding: "0.375rem 0.75rem",
+                            background: "#7C3AED",
+                            color: "#FFFFFF",
+                            textDecoration: "none",
+                            borderRadius: "6px",
+                            fontSize: "0.75rem",
+                            fontWeight: "500",
+                            display: "inline-block",
+                            transition: "all 0.2s",
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "#6D28D9";
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "#7C3AED";
+                          }}
+                        >
+                          View Product
+                        </a>
+                      </td>
+                      <td
+                        style={{
+                          borderBottom: "1px solid rgba(11,11,15,0.08)",
+                          padding: "0.75rem 1rem",
                           textAlign: "right",
                           color: "#0B0B0F",
                           fontWeight: "500",
@@ -1485,16 +1506,6 @@ export default function DashboardPage() {
                         }}
                       >
                         {product.clicks.toLocaleString()}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                          color: "#0B0B0F",
-                        }}
-                      >
-                        {product.addToCart.toLocaleString()}
                       </td>
                       <td
                         style={{
@@ -1530,38 +1541,6 @@ export default function DashboardPage() {
                             Out of Stock
                           </span>
                         )}
-                      </td>
-                      <td
-                        style={{
-                          borderBottom: "1px solid rgba(11,11,15,0.08)",
-                          padding: "0.75rem 1rem",
-                          textAlign: "right",
-                        }}
-                      >
-                        <a
-                          href={`https://${data.shopDomain}/products/${product.handle}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          style={{
-                            padding: "0.375rem 0.75rem",
-                            background: "#7C3AED",
-                            color: "#FFFFFF",
-                            textDecoration: "none",
-                            borderRadius: "6px",
-                            fontSize: "0.75rem",
-                            fontWeight: "500",
-                            display: "inline-block",
-                            transition: "all 0.2s",
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.background = "#6D28D9";
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.background = "#7C3AED";
-                          }}
-                        >
-                          View Product
-                        </a>
                       </td>
                     </tr>
                     );
