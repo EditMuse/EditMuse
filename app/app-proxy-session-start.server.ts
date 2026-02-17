@@ -21,6 +21,7 @@ import {
   expandTokenMorphology,
 } from "~/utils/text-indexing.server";
 import { expandTerms } from "~/utils/term-expansion.server";
+import { cleanReasoning } from "~/utils/reasoning-cleaner.server";
 
 type UsageEventType = "SESSION_STARTED" | "AI_RANKING_EXECUTED";
 
@@ -10881,11 +10882,13 @@ async function processSessionInBackground({
               // Build reasoning from AI
               let reasoningText = "";
               if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
-                reasoningText = aiBundle.reasoning.trim();
-              } else {
-                // Fallback reasoning
-                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-                reasoningText = `Built a bundle: ${itemNames}.`;
+                reasoningText = cleanReasoning(aiBundle.reasoning.trim());
+              }
+              
+              // If cleaned reasoning is empty or too short, create a better fallback
+              if (!reasoningText || reasoningText.length < 20) {
+                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(", ");
+                reasoningText = `Selected a bundle of ${itemNames} that work well together.`;
               }
               
               // Add delivered vs requested count to reasoning (will be finalized after top-up)
@@ -10894,6 +10897,8 @@ async function processSessionInBackground({
                 reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
               }
               
+              // Final cleanup
+              reasoningText = cleanReasoning(reasoningText) || reasoningText;
               reasoningParts.push(reasoningText);
               
               // Skip legacy selection - AI result is the single source of truth

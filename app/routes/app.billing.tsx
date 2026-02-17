@@ -1143,7 +1143,12 @@ export default function Billing() {
                 ))}
               </tr>
               <tr style={{ backgroundColor: "#F9FAFB" }}>
-                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Credits Included</td>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                  <div>Credits Included</div>
+                  <div style={{ fontSize: "0.75rem", color: "#666", fontWeight: "normal", marginTop: "0.25rem" }}>
+                    Monthly credits for AI-powered product recommendations
+                  </div>
+                </td>
                 {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.includedCredits.toLocaleString()}
@@ -1151,7 +1156,12 @@ export default function Billing() {
                 ))}
               </tr>
               <tr style={{ backgroundColor: "#FFFFFF" }}>
-                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Experiences</td>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                  <div>Experiences</div>
+                  <div style={{ fontSize: "0.75rem", color: "#666", fontWeight: "normal", marginTop: "0.25rem" }}>
+                    Number of concierge experiences you can create
+                  </div>
+                </td>
                 {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     {plan.experiences === null ? "Unlimited" : plan.experiences}
@@ -1172,7 +1182,12 @@ export default function Billing() {
                 ))}
               </tr>
               <tr style={{ backgroundColor: "#FFFFFF" }}>
-                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>Overage Rate</td>
+                <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                  <div>Overage Rate</div>
+                  <div style={{ fontSize: "0.75rem", color: "#666", fontWeight: "normal", marginTop: "0.25rem" }}>
+                    Cost per credit when you exceed your monthly limit
+                  </div>
+                </td>
                 {typedAllPlans.filter((p: PlanInfo) => p.tier !== "TRIAL").map((plan: PlanInfo) => (
                   <td key={plan.tier} style={{ padding: "0.75rem 1rem", textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                     ${plan.overageRate.toFixed(2)}/credit

@@ -15,6 +15,7 @@
 import crypto from "crypto";
 import prisma from "~/db.server";
 import OpenAI from "openai";
+import { cleanReasoning, combineReasonings } from "~/utils/reasoning-cleaner.server";
 
 interface ProductCandidate {
   handle: string;
@@ -2290,8 +2291,16 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
         
         // Prioritize AI's human-like reasons if available
         if (itemReasons.length > 0) {
-          // Use AI's reasons as primary feedback (more human-like)
-          reasoning = itemReasons.join(" ");
+          // Combine and clean reasons intelligently
+          reasoning = combineReasonings(itemReasons);
+          
+          // If combination resulted in empty, fall back to individual cleaning
+          if (!reasoning && itemReasons.length > 0) {
+            const cleanedReasons = itemReasons.map(r => cleanReasoning(r)).filter(Boolean);
+            if (cleanedReasons.length > 0) {
+              reasoning = cleanedReasons[0]; // Use first valid cleaned reason
+            }
+          }
           
           // Add brief context if helpful (but keep it natural)
           if (!trustFallback && hardTerms.length > 0 && itemReasons.length >= resultCount) {
@@ -2317,6 +2326,9 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             reasoning = "Selected products based on your preferences.";
           }
       }
+      
+      // Final cleanup of reasoning
+      reasoning = cleanReasoning(reasoning) || reasoning; // Use original if cleaning removes everything
 
       console.log("[AI Ranking] source=ai trustFallback=", trustFallback, "final_result_source=ai");
       console.log("[AI Ranking] Successfully ranked", selectedHandles.length, "products");

@@ -445,11 +445,58 @@
   }
 
   // Helper function to escape HTML
-  function escapeHtml(text) {
-    if (!text) return '';
-    var div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+function escapeHtml(text) {
+  if (!text) return '';
+  var div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+  }
+
+  // Clean and format reasoning text for better presentation
+  function cleanReasoningText(text) {
+    if (!text || !text.trim()) return '';
+    
+    var cleaned = text.trim();
+    
+    // Remove technical jargon and prefixes
+    cleaned = cleaned.replace(/^(reasoning|explanation|selection|rationale|note|summary):\s*/i, '');
+    
+    // Remove markdown formatting
+    cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, '$1');
+    cleaned = cleaned.replace(/\*(.*?)\*/g, '$1');
+    cleaned = cleaned.replace(/`(.*?)`/g, '$1');
+    
+    // Remove incomplete sentences
+    cleaned = cleaned.replace(/\s+[a-z]{1,3}\s*$/i, '');
+    
+    // Ensure proper capitalization
+    if (cleaned.length > 0) {
+      cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+    }
+    
+    // Ensure proper punctuation
+    if (cleaned.length > 0 && !/[.!?]$/.test(cleaned)) {
+      cleaned += '.';
+    }
+    
+    // Remove excessive whitespace
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+    
+    // Remove redundant phrases
+    cleaned = cleaned.replace(/\b(based on|according to|due to|because of)\s+(the\s+)?(user|shopper|customer|your)\s+(intent|query|request|preferences|needs|requirements)\s*,?\s*/gi, '');
+    cleaned = cleaned.replace(/\b(these\s+)?(products?|items?|selections?)\s+(were|are|is)\s+(selected|chosen|picked)\s+(because|due to|based on)\s*/gi, '');
+    cleaned = cleaned.replace(/\b(selected|chosen|picked)\s+(these\s+)?(products?|items?)\s+(because|due to|based on)\s*/gi, '');
+    cleaned = cleaned.replace(/\b(i|we|the system|the ai|the model)\s+(selected|chose|picked|determined|decided)\s+/gi, '');
+    
+    // Remove technical terms
+    cleaned = cleaned.replace(/\b(handle|productId|itemIndex|score|label|exact|good|fallback|trustFallback|candidate|ranking|algorithm|model|ai|llm)\b/gi, '');
+    
+    // Clean up fragments
+    cleaned = cleaned.replace(/^[,\s\-]+|[,\s\-]+$/g, '');
+    cleaned = cleaned.replace(/\s*,\s*,/g, ',');
+    cleaned = cleaned.replace(/\s*\.\s*\./g, '.');
+    
+    return cleaned.trim();
   }
 
   function showReasoning(reasoning, mode, error, productCount) {
@@ -537,11 +584,15 @@
       }
     } else if (reasoning) {
       // Normal mode (AI-powered or saved result) with reasoning
+      // Clean and format the reasoning for better presentation
+      var cleanedReasoning = cleanReasoningText(reasoning);
+      
       // Show the reasoning with AI label if it's not explicitly fallback
       reasoningText = '<div class="editmuse-reasoning-detail">';
       reasoningText += '<strong>AI-Powered Selection:</strong> ';
-      reasoningText += escapeHtml(reasoning);
-      if (productCount && productCount > 0) {
+      reasoningText += escapeHtml(cleanedReasoning);
+      if (productCount && productCount > 0 && cleanedReasoning.length < 100) {
+        // Only add the additional explanation if reasoning is short
         reasoningText += ' These ' + productCount + ' product' + (productCount !== 1 ? 's were' : ' was') + ' ';
         reasoningText += 'intelligently ranked and selected based on your quiz responses, preferences, and product attributes.';
       }

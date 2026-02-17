@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, Link, useLoaderData, useNavigate, useActionData, useNavigation, redirect } from "react-router";
+import { Form, Link, useLoaderData, useNavigate, useActionData, useNavigation, redirect, useSubmit } from "react-router";
 import { authenticate } from "~/shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import type { HeadersFunction } from "react-router";
@@ -381,6 +381,7 @@ export default function ExperiencesIndex() {
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const navigate = useNavigate();
+  const submit = useSubmit();
   const experiences = loaderData?.experiences || [];
   const shopDomain = loaderData?.shopDomain || "unknown";
   const error = loaderData?.error;
@@ -1076,47 +1077,19 @@ export default function ExperiencesIndex() {
         confirmColor="#EF4444"
         onConfirm={() => {
           if (confirmDelete.isBulk) {
-            // Submit bulk delete form
-            const form = document.createElement("form");
-            form.method = "post";
-            form.style.display = "none";
-            
-            const intentInput = document.createElement("input");
-            intentInput.type = "hidden";
-            intentInput.name = "intent";
-            intentInput.value = "bulkDelete";
-            form.appendChild(intentInput);
-            
+            // Submit bulk delete using React Router's submit
+            const formData = new FormData();
+            formData.append("intent", "bulkDelete");
             Array.from(selectedExperiences).forEach(id => {
-              const input = document.createElement("input");
-              input.type = "hidden";
-              input.name = "experienceIds";
-              input.value = id;
-              form.appendChild(input);
+              formData.append("experienceIds", id);
             });
-            
-            document.body.appendChild(form);
-            form.submit();
+            submit(formData, { method: "post" });
           } else if (confirmDelete.experienceId) {
-            // Submit single delete form
-            const form = document.createElement("form");
-            form.method = "post";
-            form.style.display = "none";
-            
-            const intentInput = document.createElement("input");
-            intentInput.type = "hidden";
-            intentInput.name = "intent";
-            intentInput.value = "delete";
-            form.appendChild(intentInput);
-            
-            const idInput = document.createElement("input");
-            idInput.type = "hidden";
-            idInput.name = "experienceId";
-            idInput.value = confirmDelete.experienceId;
-            form.appendChild(idInput);
-            
-            document.body.appendChild(form);
-            form.submit();
+            // Submit single delete using React Router's submit
+            const formData = new FormData();
+            formData.append("intent", "delete");
+            formData.append("experienceId", confirmDelete.experienceId);
+            submit(formData, { method: "post" });
           }
           setConfirmDelete({ isOpen: false });
         }}
