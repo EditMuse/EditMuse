@@ -7,6 +7,9 @@ import { getOfflineAccessTokenForShop } from "~/shopify-admin.server";
 import { fetchShopifyProductsByHandlesGraphQL } from "~/shopify-admin.server";
 import { useState, useEffect } from "react";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { useNavigation, useRevalidator } from "react-router";
+import { showToast } from "~/components/Toast";
+import { LoadingSkeleton, TableSkeleton } from "~/components/LoadingSkeleton";
 
 function safeJson(s: string | null): any {
   if (!s) return null;
@@ -427,10 +430,39 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const app = useAppBridge();
+  const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const [fromDate, setFromDate] = useState(data.from);
   const [toDate, setToDate] = useState(data.to);
   const [preset, setPreset] = useState<string>("custom");
   const [isExporting, setIsExporting] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [topQueriesPage, setTopQueriesPage] = useState(1);
+  const [topProductsPage, setTopProductsPage] = useState(1);
+  const itemsPerPage = 10;
+
+  const isLoading = navigation.state === "loading" || navigation.state === "submitting";
+
+  // Auto-refresh functionality
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(() => {
+      revalidator.revalidate();
+    }, 30000); // Refresh every 30 seconds
+    return () => clearInterval(interval);
+  }, [autoRefresh, revalidator]);
+
+  // Paginated data
+  const paginatedTopQueries = data.topQueries.slice(
+    (topQueriesPage - 1) * itemsPerPage,
+    topQueriesPage * itemsPerPage
+  );
+  const paginatedTopProducts = data.topProducts.slice(
+    (topProductsPage - 1) * itemsPerPage,
+    topProductsPage * itemsPerPage
+  );
+  const totalQueriesPages = Math.ceil(data.topQueries.length / itemsPerPage);
+  const totalProductsPages = Math.ceil(data.topProducts.length / itemsPerPage);
 
   // Update dates when loader data changes
   useEffect(() => {
@@ -522,9 +554,10 @@ export default function DashboardPage() {
       
       // Clean up blob URL
       URL.revokeObjectURL(blobUrl);
+      showToast("CSV exported successfully", "success");
     } catch (error) {
       console.error('CSV export failed:', error);
-      alert('Failed to export CSV. Please try again.');
+      showToast('Failed to export CSV. Please try again.', "error");
     } finally {
       setIsExporting(false);
     }
@@ -786,41 +819,50 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            {/* Export CSV Button */}
-            <div style={{ display: "flex", alignItems: "flex-end" }}>
-            <button
-              onClick={handleExportCSV}
-              disabled={isExporting}
-              style={{
-                padding: "0.625rem 1.25rem",
-                background: isExporting ? "#9CA3AF" : "#7C3AED",
-                border: "none",
-                borderRadius: "8px",
-                color: "#FFFFFF",
-                textDecoration: "none",
-                fontWeight: "500",
-                fontSize: "0.875rem",
-                display: "inline-block",
-                cursor: isExporting ? "not-allowed" : "pointer",
-                transition: "all 0.2s",
-              }}
-              onMouseEnter={(e) => {
-                if (!isExporting) {
-                  e.currentTarget.style.background = "#6D28D9";
-                  e.currentTarget.style.transform = "translateY(-1px)";
-                  e.currentTarget.style.boxShadow = "0 4px 12px rgba(124, 58, 237, 0.3)";
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!isExporting) {
-                  e.currentTarget.style.background = "#7C3AED";
-                  e.currentTarget.style.transform = "translateY(0)";
-                  e.currentTarget.style.boxShadow = "none";
-                }
-              }}
-            >
-              {isExporting ? "Exporting..." : "Export CSV"}
-            </button>
+            {/* Export CSV Button and Auto-Refresh Toggle */}
+            <div style={{ display: "flex", alignItems: "flex-end", gap: "0.75rem" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                <input
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                  style={{ cursor: "pointer" }}
+                />
+                <span>Auto-refresh (30s)</span>
+              </label>
+              <button
+                onClick={handleExportCSV}
+                disabled={isExporting}
+                style={{
+                  padding: "0.625rem 1.25rem",
+                  background: isExporting ? "#9CA3AF" : "#7C3AED",
+                  border: "none",
+                  borderRadius: "8px",
+                  color: "#FFFFFF",
+                  textDecoration: "none",
+                  fontWeight: "500",
+                  fontSize: "0.875rem",
+                  display: "inline-block",
+                  cursor: isExporting ? "not-allowed" : "pointer",
+                  transition: "all 0.2s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!isExporting) {
+                    e.currentTarget.style.background = "#6D28D9";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 4px 12px rgba(124, 58, 237, 0.3)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!isExporting) {
+                    e.currentTarget.style.background = "#7C3AED";
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "none";
+                  }
+                }}
+              >
+                {isExporting ? "Exporting..." : "Export CSV"}
+              </button>
             </div>
           </div>
 
@@ -1229,9 +1271,12 @@ export default function DashboardPage() {
           </div>
 
           {/* Top Queries Table */}
-          <h2 style={{ marginBottom: "1rem", color: "#0B0B0F" }}>
-            Top Queries
-          </h2>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+            <h2 style={{ margin: 0, color: "#0B0B0F" }}>
+              Top Queries
+            </h2>
+            {isLoading && <LoadingSkeleton width="100px" height="1.5rem" />}
+          </div>
           <div
             style={{
               backgroundColor: "#FFFFFF",
@@ -1275,16 +1320,19 @@ export default function DashboardPage() {
                     <td
                       colSpan={2}
                       style={{
-                        padding: "2rem",
+                        padding: "3rem",
                         textAlign: "center",
                         color: "rgba(11,11,15,0.62)",
                       }}
                     >
-                      No queries found
+                      <p style={{ fontSize: "1.125rem", marginBottom: "0.5rem", margin: 0 }}>No queries yet</p>
+                      <p style={{ fontSize: "0.875rem", margin: 0 }}>Queries will appear here once users start using the concierge.</p>
                     </td>
                   </tr>
                 ) : (
-                  data.topQueries.map((query, idx) => (
+                  paginatedTopQueries.map((query, idx) => {
+                    const globalIdx = (topQueriesPage - 1) * itemsPerPage + idx;
+                    return (
                     <tr
                       key={idx}
                       style={{
@@ -1312,10 +1360,54 @@ export default function DashboardPage() {
                         {query.sessions.toLocaleString()}
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
+            {/* Pagination for Top Queries */}
+            {totalQueriesPages > 1 && (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "1rem", borderTop: "1px solid rgba(11,11,15,0.12)", backgroundColor: "#F9FAFB" }}>
+                <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                  Showing {((topQueriesPage - 1) * itemsPerPage) + 1} to {Math.min(topQueriesPage * itemsPerPage, data.topQueries.length)} of {data.topQueries.length} queries
+                </div>
+                <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                  <button
+                    onClick={() => setTopQueriesPage(p => Math.max(1, p - 1))}
+                    disabled={topQueriesPage === 1}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: topQueriesPage === 1 ? "#F9FAFB" : "#FFFFFF",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "6px",
+                      cursor: topQueriesPage === 1 ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                      opacity: topQueriesPage === 1 ? 0.5 : 1,
+                    }}
+                  >
+                    Previous
+                  </button>
+                  <span style={{ fontSize: "0.875rem", color: "#0B0B0F", fontWeight: "500" }}>
+                    Page {topQueriesPage} of {totalQueriesPages}
+                  </span>
+                  <button
+                    onClick={() => setTopQueriesPage(p => Math.min(totalQueriesPages, p + 1))}
+                    disabled={topQueriesPage === totalQueriesPages}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: topQueriesPage === totalQueriesPages ? "#F9FAFB" : "#FFFFFF",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "6px",
+                      cursor: topQueriesPage === totalQueriesPages ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                      opacity: topQueriesPage === totalQueriesPages ? 0.5 : 1,
+                    }}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Top Products Table */}
@@ -1409,16 +1501,19 @@ export default function DashboardPage() {
                     <td
                       colSpan={6}
                       style={{
-                        padding: "2rem",
+                        padding: "3rem",
                         textAlign: "center",
                         color: "rgba(11,11,15,0.62)",
                       }}
                     >
-                      No products found
+                      <p style={{ fontSize: "1.125rem", marginBottom: "0.5rem", margin: 0 }}>No products yet</p>
+                      <p style={{ fontSize: "0.875rem", margin: 0 }}>Products will appear here once users start clicking on recommendations.</p>
                     </td>
                   </tr>
                 ) : (
-                  data.topProducts.map((product, idx) => (
+                  paginatedTopProducts.map((product, idx) => {
+                    const globalIdx = (topProductsPage - 1) * itemsPerPage + idx;
+                    return (
                     <tr
                       key={idx}
                       style={{
@@ -1548,10 +1643,54 @@ export default function DashboardPage() {
                         </a>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
+            {/* Pagination for Top Products */}
+            {totalProductsPages > 1 && (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "1rem", borderTop: "1px solid rgba(11,11,15,0.12)", backgroundColor: "#F9FAFB" }}>
+                <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                  Showing {((topProductsPage - 1) * itemsPerPage) + 1} to {Math.min(topProductsPage * itemsPerPage, data.topProducts.length)} of {data.topProducts.length} products
+                </div>
+                <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                  <button
+                    onClick={() => setTopProductsPage(p => Math.max(1, p - 1))}
+                    disabled={topProductsPage === 1}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: topProductsPage === 1 ? "#F9FAFB" : "#FFFFFF",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "6px",
+                      cursor: topProductsPage === 1 ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                      opacity: topProductsPage === 1 ? 0.5 : 1,
+                    }}
+                  >
+                    Previous
+                  </button>
+                  <span style={{ fontSize: "0.875rem", color: "#0B0B0F", fontWeight: "500" }}>
+                    Page {topProductsPage} of {totalProductsPages}
+                  </span>
+                  <button
+                    onClick={() => setTopProductsPage(p => Math.min(totalProductsPages, p + 1))}
+                    disabled={topProductsPage === totalProductsPages}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: topProductsPage === totalProductsPages ? "#F9FAFB" : "#FFFFFF",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "6px",
+                      cursor: topProductsPage === totalProductsPages ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                      opacity: topProductsPage === totalProductsPages ? 0.5 : 1,
+                    }}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </s-section>

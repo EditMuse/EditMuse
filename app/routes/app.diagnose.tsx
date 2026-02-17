@@ -1,8 +1,9 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData } from "react-router";
+import { useLoaderData, useRevalidator } from "react-router";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { useAppBridge } from "@shopify/app-bridge-react";
 
 type LoaderData = {
   errors: Array<{
@@ -74,12 +75,28 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export default function DiagnosePage() {
   const { errors, proxyLogs } = useLoaderData<LoaderData>();
+  const revalidator = useRevalidator();
+  const app = useAppBridge();
   const [copied, setCopied] = useState(false);
   const [errorFilter, setErrorFilter] = useState<string>("all");
   const [errorSearch, setErrorSearch] = useState<string>("");
   const [proxyStatusFilter, setProxyStatusFilter] = useState<string>("all");
   const [showSlowRequests, setShowSlowRequests] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
+  const [isExportingErrors, setIsExportingErrors] = useState(false);
+  const [isExportingLogs, setIsExportingLogs] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [groupErrors, setGroupErrors] = useState(true);
+  const [resolvedErrors, setResolvedErrors] = useState<Set<string>>(new Set());
+
+  // Auto-refresh functionality
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(() => {
+      revalidator.revalidate();
+    }, 5000); // Refresh every 5 seconds
+    return () => clearInterval(interval);
+  }, [autoRefresh, revalidator]);
 
   // Calculate error analytics
   const errorAnalytics = useMemo(() => {
@@ -113,9 +130,39 @@ export default function DiagnosePage() {
     };
   }, [errors]);
 
+  // Group errors by similar message/route
+  const groupedErrors = useMemo(() => {
+    if (!groupErrors) return null;
+    
+    const groups = new Map<string, typeof errors>();
+    
+    errors.forEach((error) => {
+      // Create a group key based on route and message pattern (first 100 chars)
+      const messageKey = error.message.substring(0, 100).toLowerCase().replace(/\s+/g, " ");
+      const route = error.route || "unknown";
+      const groupKey = `${route}::${messageKey}`;
+      
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, []);
+      }
+      groups.get(groupKey)!.push(error);
+    });
+    
+    return Array.from(groups.entries())
+      .map(([key, groupErrors]) => ({
+        key,
+        errors: groupErrors.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
+        count: groupErrors.length,
+        latest: groupErrors[0],
+        route: groupErrors[0].route || "unknown",
+        message: groupErrors[0].message.substring(0, 150),
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [errors, groupErrors]);
+
   // Filter errors
   const filteredErrors = useMemo(() => {
-    let filtered = errors;
+    let filtered = errors.filter(e => !resolvedErrors.has(e.id));
 
     if (errorFilter !== "all") {
       filtered = filtered.filter((e) => e.route === errorFilter);
@@ -131,7 +178,28 @@ export default function DiagnosePage() {
     }
 
     return filtered;
-  }, [errors, errorFilter, errorSearch]);
+  }, [errors, errorFilter, errorSearch, resolvedErrors]);
+
+  // Filter grouped errors
+  const filteredGroupedErrors = useMemo(() => {
+    if (!groupedErrors) return null;
+    
+    let filtered = groupedErrors.filter(g => !resolvedErrors.has(g.latest.id));
+    
+    if (errorFilter !== "all") {
+      filtered = filtered.filter((g) => g.route === errorFilter);
+    }
+    
+    if (errorSearch.trim()) {
+      const searchLower = errorSearch.toLowerCase();
+      filtered = filtered.filter((g) =>
+        g.message.toLowerCase().includes(searchLower) ||
+        g.route.toLowerCase().includes(searchLower)
+      );
+    }
+    
+    return filtered;
+  }, [groupedErrors, errorFilter, errorSearch, resolvedErrors]);
 
   // Filter proxy logs
   const filteredProxyLogs = useMemo(() => {
@@ -215,6 +283,75 @@ export default function DiagnosePage() {
     }
   };
 
+  const handleExportErrorsCSV = async () => {
+    if (isExportingErrors) return;
+    setIsExportingErrors(true);
+    try {
+      const rows: string[] = [];
+      rows.push("ID,Request ID,Route,Message,Stack,Context,Created At");
+      
+      filteredErrors.forEach((e) => {
+        const context = e.contextJson ? JSON.stringify(JSON.parse(e.contextJson)).replace(/"/g, '""') : "";
+        const message = e.message.replace(/"/g, '""');
+        const stack = (e.stack || "").replace(/"/g, '""').replace(/\n/g, " ");
+        rows.push(
+          `"${e.id}","${e.requestId}","${e.route || ""}","${message}","${stack}","${context}","${e.createdAt.toISOString()}"`
+        );
+      });
+
+      const csv = rows.join("\n");
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const filename = `errors-${new Date().toISOString().slice(0, 10)}.csv`;
+      
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error('CSV export failed:', error);
+      alert('Failed to export errors CSV. Please try again.');
+    } finally {
+      setIsExportingErrors(false);
+    }
+  };
+
+  const handleExportLogsCSV = async () => {
+    if (isExportingLogs) return;
+    setIsExportingLogs(true);
+    try {
+      const rows: string[] = [];
+      rows.push("ID,Request ID,Route,Status,Duration (ms),Created At");
+      
+      filteredProxyLogs.forEach((l) => {
+        rows.push(
+          `"${l.id}","${l.requestId}","${l.route}","${l.status}","${l.durationMs}","${l.createdAt.toISOString()}"`
+        );
+      });
+
+      const csv = rows.join("\n");
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const filename = `proxy-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+      
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error('CSV export failed:', error);
+      alert('Failed to export logs CSV. Please try again.');
+    } finally {
+      setIsExportingLogs(false);
+    }
+  };
+
   // Get unique routes for filter
   const uniqueRoutes = useMemo(() => {
     const routes = new Set<string>();
@@ -235,20 +372,56 @@ export default function DiagnosePage() {
                 View error logs and app proxy request logs for debugging
               </p>
             </div>
-            <button
-              onClick={handleCopyDebugBundle}
-              style={{
-                padding: "0.75rem 1.5rem",
-                background: copied ? "#10B981" : "#7C3AED",
-                color: "#FFFFFF",
-                border: "none",
-                borderRadius: "8px",
-                fontWeight: "500",
-                cursor: "pointer",
-              }}
-            >
-              {copied ? "✓ Copied!" : "Copy Debug Bundle"}
-            </button>
+            <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+              <button
+                onClick={handleCopyDebugBundle}
+                style={{
+                  padding: "0.75rem 1.5rem",
+                  background: copied ? "#10B981" : "#7C3AED",
+                  color: "#FFFFFF",
+                  border: "none",
+                  borderRadius: "8px",
+                  fontWeight: "500",
+                  cursor: "pointer",
+                }}
+              >
+                {copied ? "✓ Copied!" : "Copy Debug Bundle"}
+              </button>
+              {filteredErrors.length > 0 && (
+                <button
+                  onClick={handleExportErrorsCSV}
+                  disabled={isExportingErrors}
+                  style={{
+                    padding: "0.75rem 1.5rem",
+                    background: isExportingErrors ? "#9CA3AF" : "#7C3AED",
+                    color: "#FFFFFF",
+                    border: "none",
+                    borderRadius: "8px",
+                    fontWeight: "500",
+                    cursor: isExportingErrors ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {isExportingErrors ? "Exporting..." : "Export Errors CSV"}
+                </button>
+              )}
+              {filteredProxyLogs.length > 0 && (
+                <button
+                  onClick={handleExportLogsCSV}
+                  disabled={isExportingLogs}
+                  style={{
+                    padding: "0.75rem 1.5rem",
+                    background: isExportingLogs ? "#9CA3AF" : "#7C3AED",
+                    color: "#FFFFFF",
+                    border: "none",
+                    borderRadius: "8px",
+                    fontWeight: "500",
+                    cursor: isExportingLogs ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {isExportingLogs ? "Exporting..." : "Export Logs CSV"}
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Error Analytics */}
@@ -356,8 +529,19 @@ export default function DiagnosePage() {
 
           {/* Errors Table */}
           <div style={{ marginBottom: "3rem" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
-              <h2 style={{ margin: 0, color: "#0B0B0F" }}>Recent Errors ({filteredErrors.length})</h2>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap", gap: "1rem" }}>
+              <h2 style={{ margin: 0, color: "#0B0B0F" }}>
+                {groupErrors ? `Error Groups (${filteredGroupedErrors?.length || 0})` : `Recent Errors (${filteredErrors.length})`}
+              </h2>
+              <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                <input
+                  type="checkbox"
+                  checked={groupErrors}
+                  onChange={(e) => setGroupErrors(e.target.checked)}
+                  style={{ cursor: "pointer" }}
+                />
+                <span>Group similar errors</span>
+              </label>
             </div>
             
             {/* Error Filtering */}
@@ -427,56 +611,100 @@ export default function DiagnosePage() {
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead>
                   <tr style={{ backgroundColor: "#F9FAFB" }}>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        borderBottom: "1px solid rgba(11,11,15,0.12)",
-                        padding: "0.75rem 1rem",
-                        fontWeight: "500",
-                        color: "#0B0B0F",
-                      }}
-                    >
-                      Time
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        borderBottom: "1px solid rgba(11,11,15,0.12)",
-                        padding: "0.75rem 1rem",
-                        fontWeight: "500",
-                        color: "#0B0B0F",
-                      }}
-                    >
-                      Request ID
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        borderBottom: "1px solid rgba(11,11,15,0.12)",
-                        padding: "0.75rem 1rem",
-                        fontWeight: "500",
-                        color: "#0B0B0F",
-                      }}
-                    >
-                      Route
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        borderBottom: "1px solid rgba(11,11,15,0.12)",
-                        padding: "0.75rem 1rem",
-                        fontWeight: "500",
-                        color: "#0B0B0F",
-                      }}
-                    >
-                      Message
-                    </th>
+                    {groupErrors ? (
+                      <>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Count
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Route
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Message
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Latest Occurrence
+                        </th>
+                        <th style={{ textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Actions
+                        </th>
+                      </>
+                    ) : (
+                      <>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Time
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Request ID
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Route
+                        </th>
+                        <th style={{ textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Message
+                        </th>
+                        <th style={{ textAlign: "center", borderBottom: "1px solid rgba(11,11,15,0.12)", padding: "0.75rem 1rem", fontWeight: "500", color: "#0B0B0F" }}>
+                          Actions
+                        </th>
+                      </>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredErrors.length === 0 ? (
+                  {groupErrors ? (
+                    filteredGroupedErrors && filteredGroupedErrors.length > 0 ? (
+                      filteredGroupedErrors.map((group, idx) => (
+                        <tr
+                          key={group.key}
+                          style={{
+                            backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB",
+                          }}
+                        >
+                          <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F", fontWeight: "600" }}>
+                            {group.count}
+                          </td>
+                          <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F", fontSize: "0.875rem" }}>
+                            {group.route}
+                          </td>
+                          <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F", fontSize: "0.875rem", maxWidth: "400px", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {group.message}
+                          </td>
+                          <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F", fontSize: "0.875rem" }}>
+                            {new Date(group.latest.createdAt).toLocaleString()}
+                          </td>
+                          <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", textAlign: "center" }}>
+                            <button
+                              onClick={() => {
+                                const newResolved = new Set(resolvedErrors);
+                                group.errors.forEach(e => newResolved.add(e.id));
+                                setResolvedErrors(newResolved);
+                              }}
+                              style={{
+                                padding: "0.25rem 0.75rem",
+                                background: "#10B981",
+                                color: "#FFFFFF",
+                                border: "none",
+                                borderRadius: "6px",
+                                cursor: "pointer",
+                                fontSize: "0.75rem",
+                                fontWeight: "500",
+                              }}
+                            >
+                              Mark Resolved
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={5} style={{ padding: "2rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
+                          No error groups found
+                        </td>
+                      </tr>
+                    )
+                  ) : filteredErrors.length === 0 ? (
                     <tr>
-                      <td colSpan={4} style={{ padding: "2rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
+                      <td colSpan={5} style={{ padding: "2rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
                         No errors found matching your filters
                       </td>
                     </tr>

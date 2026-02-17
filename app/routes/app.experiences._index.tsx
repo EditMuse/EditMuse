@@ -4,10 +4,12 @@ import { authenticate } from "~/shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import type { HeadersFunction } from "react-router";
 import prisma from "~/db.server";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { getEntitlements } from "~/models/billing.server";
 import { withQuery } from "~/utils/redirect.server";
 import { UsageEventType } from "@prisma/client";
+import { ConfirmationDialog } from "~/components/ConfirmationDialog";
+import { showToast } from "~/components/Toast";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
@@ -291,6 +293,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return redirect(withQuery(request, "/app/experiences"));
       }
       return { success: "No duplicates found" };
+    } else if (intent === "bulkDelete") {
+      const experienceIds = formData.getAll("experienceIds") as string[];
+      if (experienceIds.length === 0) {
+        return { error: "No experiences selected" };
+      }
+      
+      // Verify shop ownership and delete
+      const deleted = await prisma.experience.deleteMany({
+        where: {
+          id: { in: experienceIds },
+          shopId: shop.id,
+        },
+      });
+      
+      console.log("[ExperiencesIndex] BulkDelete: Deleted", deleted.count, "experiences");
+      return redirect(withQuery(request, "/app/experiences"));
     } else if (intent === "duplicate") {
       if (!experienceId) {
         console.error("[ExperiencesIndex] Duplicate: Experience ID required");
@@ -370,9 +388,65 @@ export default function ExperiencesIndex() {
   const experienceUsed = loaderData?.experienceUsed || 0;
   const experienceLimit = loaderData?.experienceLimit;
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [sortBy, setSortBy] = useState<"name" | "created" | "sessions" | "results">("created");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+  const [selectedExperiences, setSelectedExperiences] = useState<Set<string>>(new Set());
+  const [showBulkActions, setShowBulkActions] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<{ isOpen: boolean; experienceId?: string; isBulk?: boolean }>({ isOpen: false });
 
   // Check if creation is blocked
   const isLimitReached = experienceLimit !== null && experienceUsed >= experienceLimit;
+
+  // Filter and sort experiences
+  const filteredAndSortedExperiences = useMemo(() => {
+    let filtered = experiences;
+
+    // Apply search filter
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase();
+      filtered = filtered.filter((exp: any) =>
+        exp.name.toLowerCase().includes(query) ||
+        exp.mode.toLowerCase().includes(query) ||
+        exp.id.toLowerCase().includes(query)
+      );
+    }
+
+    // Apply sorting
+    filtered = [...filtered].sort((a: any, b: any) => {
+      let aVal: any;
+      let bVal: any;
+
+      switch (sortBy) {
+        case "name":
+          aVal = a.name.toLowerCase();
+          bVal = b.name.toLowerCase();
+          break;
+        case "created":
+          aVal = new Date(a.createdAt).getTime();
+          bVal = new Date(b.createdAt).getTime();
+          break;
+        case "sessions":
+          aVal = (a.analytics?.sessions || 0);
+          bVal = (b.analytics?.sessions || 0);
+          break;
+        case "results":
+          aVal = (a.analytics?.resultsGenerated || 0);
+          bVal = (b.analytics?.resultsGenerated || 0);
+          break;
+        default:
+          return 0;
+      }
+
+      if (sortOrder === "asc") {
+        return aVal > bVal ? 1 : aVal < bVal ? -1 : 0;
+      } else {
+        return aVal < bVal ? 1 : aVal > bVal ? -1 : 0;
+      }
+    });
+
+    return filtered;
+  }, [experiences, searchQuery, sortBy, sortOrder]);
 
   // Auto-dismiss success messages after 3 seconds
   useEffect(() => {
@@ -569,11 +643,35 @@ export default function ExperiencesIndex() {
                 </tr>
               </thead>
               <tbody>
-                {experiences.map((exp: any) => {
-                  const shortId = exp.id.substring(0, 8);
-                  const analytics = exp.analytics || { sessions: 0, resultsGenerated: 0, productClicks: 0, addToCart: 0 };
+                {filteredAndSortedExperiences.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} style={{ padding: "2rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
+                      {searchQuery ? `No experiences match "${searchQuery}"` : "No experiences found"}
+                    </td>
+                  </tr>
+                ) : (
+                  filteredAndSortedExperiences.map((exp: any) => {
+                    const shortId = exp.id.substring(0, 8);
+                    const analytics = exp.analytics || { sessions: 0, resultsGenerated: 0, productClicks: 0, addToCart: 0 };
+                    const isSelected = selectedExperiences.has(exp.id);
                   return (
-                    <tr key={exp.id} style={{ borderBottom: "1px solid rgba(11,11,15,0.12)" }}>
+                    <tr key={exp.id} style={{ borderBottom: "1px solid rgba(11,11,15,0.12)", backgroundColor: isSelected ? "#F0F9FF" : "transparent" }}>
+                      <td style={{ padding: "0.75rem" }}>
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={(e) => {
+                            const newSet = new Set(selectedExperiences);
+                            if (e.target.checked) {
+                              newSet.add(exp.id);
+                            } else {
+                              newSet.delete(exp.id);
+                            }
+                            setSelectedExperiences(newSet);
+                          }}
+                          style={{ cursor: "pointer" }}
+                        />
+                      </td>
                       <td style={{ padding: "0.75rem" }}>{exp.name}</td>
                       <td style={{ padding: "0.75rem" }}>
                         {exp.mode === "quiz" ? "Guided Quiz" :
@@ -689,40 +787,94 @@ export default function ExperiencesIndex() {
                               {navigation.state === "submitting" ? "Duplicating..." : "Duplicate"}
                             </button>
                           </Form>
-                          <Form method="post" style={{ display: "inline" }}>
-                            <input type="hidden" name="intent" value="delete" />
-                            <input type="hidden" name="experienceId" value={exp.id} />
-                            <button 
-                              type="submit"
-                              disabled={navigation.state === "submitting"}
-                              onClick={(e) => {
-                                if (!confirm(`Are you sure you want to delete "${exp.name}"? This action cannot be undone.`)) {
-                                  e.preventDefault();
-                                }
-                              }}
-                              style={{
-                                padding: "0.25rem 0.75rem",
-                                backgroundColor: "#FFFFFF",
-                                border: "1px solid #EF4444",
-                                borderRadius: "12px",
-                                color: "#EF4444",
-                                cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
-                                fontSize: "0.875rem",
-                              }}
-                            >
-                              {navigation.state === "submitting" ? "Deleting..." : "Delete"}
-                            </button>
-                          </Form>
+                          <button 
+                            type="button"
+                            disabled={navigation.state === "submitting"}
+                            onClick={() => setConfirmDelete({ isOpen: true, experienceId: exp.id, isBulk: false })}
+                            style={{
+                              padding: "0.25rem 0.75rem",
+                              backgroundColor: "#FFFFFF",
+                              border: "1px solid #EF4444",
+                              borderRadius: "12px",
+                              color: "#EF4444",
+                              cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
+                              fontSize: "0.875rem",
+                            }}
+                          >
+                            Delete
+                          </button>
                         </div>
                       </td>
                     </tr>
                   );
-                })}
+                  })
+                )}
               </tbody>
             </table>
           </>
         )}
       </s-section>
+      
+      {/* Confirmation Dialog */}
+      <ConfirmationDialog
+        isOpen={confirmDelete.isOpen}
+        title={confirmDelete.isBulk ? "Delete Selected Experiences" : "Delete Experience"}
+        message={
+          confirmDelete.isBulk
+            ? `Are you sure you want to delete ${selectedExperiences.size} experience${selectedExperiences.size > 1 ? "s" : ""}? This action cannot be undone.`
+            : `Are you sure you want to delete this experience? This action cannot be undone.`
+        }
+        confirmText="Delete"
+        cancelText="Cancel"
+        confirmColor="#EF4444"
+        onConfirm={() => {
+          if (confirmDelete.isBulk) {
+            // Submit bulk delete form
+            const form = document.createElement("form");
+            form.method = "post";
+            form.style.display = "none";
+            
+            const intentInput = document.createElement("input");
+            intentInput.type = "hidden";
+            intentInput.name = "intent";
+            intentInput.value = "bulkDelete";
+            form.appendChild(intentInput);
+            
+            Array.from(selectedExperiences).forEach(id => {
+              const input = document.createElement("input");
+              input.type = "hidden";
+              input.name = "experienceIds";
+              input.value = id;
+              form.appendChild(input);
+            });
+            
+            document.body.appendChild(form);
+            form.submit();
+          } else if (confirmDelete.experienceId) {
+            // Submit single delete form
+            const form = document.createElement("form");
+            form.method = "post";
+            form.style.display = "none";
+            
+            const intentInput = document.createElement("input");
+            intentInput.type = "hidden";
+            intentInput.name = "intent";
+            intentInput.value = "delete";
+            form.appendChild(intentInput);
+            
+            const idInput = document.createElement("input");
+            idInput.type = "hidden";
+            idInput.name = "experienceId";
+            idInput.value = confirmDelete.experienceId;
+            form.appendChild(idInput);
+            
+            document.body.appendChild(form);
+            form.submit();
+          }
+          setConfirmDelete({ isOpen: false });
+        }}
+        onCancel={() => setConfirmDelete({ isOpen: false })}
+      />
     </s-page>
   );
 }

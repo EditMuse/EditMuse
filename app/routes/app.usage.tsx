@@ -172,6 +172,20 @@ export default function UsagePage() {
   const [eventSearch, setEventSearch] = useState<string>("");
   const [selectedEvent, setSelectedEvent] = useState<number | null>(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [isExportingJSON, setIsExportingJSON] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const revalidator = useRevalidator();
+  const eventsPerPage = 50;
+
+  // Auto-refresh functionality
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(() => {
+      revalidator.revalidate();
+    }, 30000); // Refresh every 30 seconds
+    return () => clearInterval(interval);
+  }, [autoRefresh, revalidator]);
 
   // Update dates when loader data changes
   useEffect(() => {
@@ -263,13 +277,84 @@ export default function UsagePage() {
       
       // Clean up blob URL
       URL.revokeObjectURL(blobUrl);
+      showToast("CSV exported successfully", "success");
     } catch (error) {
       console.error('CSV export failed:', error);
-      alert('Failed to export CSV. Please try again.');
+      showToast('Failed to export CSV. Please try again.', "error");
     } finally {
       setIsExporting(false);
     }
   };
+
+  const handleExportJSON = async () => {
+    if (isExportingJSON) return;
+    
+    setIsExportingJSON(true);
+    try {
+      const exportData = {
+        dateRange: { from: data.from, to: data.to },
+        totals: data.totals,
+        creditsBurned: data.creditsBurned,
+        ctr: data.ctr,
+        events: data.events,
+        creditsForecast: data.creditsForecast,
+        usageTrends: data.usageTrends,
+        exportedAt: new Date().toISOString(),
+      };
+      
+      const jsonText = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const filename = `usage-${data.from}_to_${data.to}.json`;
+      
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+      showToast("JSON exported successfully", "success");
+    } catch (error) {
+      console.error('JSON export failed:', error);
+      showToast('Failed to export JSON. Please try again.', "error");
+    } finally {
+      setIsExportingJSON(false);
+    }
+  };
+
+  // Filter events
+  const filteredEvents = useMemo(() => {
+    let filtered = data.events;
+    
+    if (eventFilter !== "all") {
+      filtered = filtered.filter(e => e.eventType === eventFilter);
+    }
+    
+    if (eventSearch.trim()) {
+      const searchLower = eventSearch.toLowerCase();
+      filtered = filtered.filter(e => {
+        const metadataStr = JSON.stringify(e.metadata || {}).toLowerCase();
+        return e.eventType.toLowerCase().includes(searchLower) ||
+               metadataStr.includes(searchLower) ||
+               e.createdAt.toLowerCase().includes(searchLower);
+      });
+    }
+    
+    return filtered;
+  }, [data.events, eventFilter, eventSearch]);
+
+  // Paginate events
+  const totalPages = Math.ceil(filteredEvents.length / eventsPerPage);
+  const paginatedEvents = filteredEvents.slice(
+    (currentPage - 1) * eventsPerPage,
+    currentPage * eventsPerPage
+  );
+
+  // Reset to page 1 when filter changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [eventFilter, eventSearch]);
 
   return (
     <s-page heading="Usage & Analytics">
@@ -527,8 +612,17 @@ export default function UsagePage() {
               </div>
             </div>
 
-            {/* Export CSV Button */}
-            <div style={{ display: "flex", alignItems: "flex-end" }}>
+            {/* Export Buttons and Auto-Refresh Toggle */}
+            <div style={{ display: "flex", alignItems: "flex-end", gap: "0.75rem", flexWrap: "wrap" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                <input
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                  style={{ cursor: "pointer" }}
+                />
+                <span>Auto-refresh (30s)</span>
+              </label>
               <button
                 onClick={handleExportCSV}
                 disabled={isExporting}
@@ -561,6 +655,39 @@ export default function UsagePage() {
                 }}
               >
                 {isExporting ? "Exporting..." : "Export CSV"}
+              </button>
+              <button
+                onClick={handleExportJSON}
+                disabled={isExportingJSON}
+                style={{
+                  padding: "0.625rem 1.25rem",
+                  background: isExportingJSON ? "#9CA3AF" : "#06B6D4",
+                  border: "none",
+                  borderRadius: "8px",
+                  color: "#FFFFFF",
+                  textDecoration: "none",
+                  fontWeight: "500",
+                  fontSize: "0.875rem",
+                  display: "inline-block",
+                  cursor: isExportingJSON ? "not-allowed" : "pointer",
+                  transition: "all 0.2s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!isExportingJSON) {
+                    e.currentTarget.style.background = "#0891B2";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 4px 12px rgba(6, 182, 212, 0.3)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!isExportingJSON) {
+                    e.currentTarget.style.background = "#06B6D4";
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "none";
+                  }
+                }}
+              >
+                {isExportingJSON ? "Exporting..." : "Export JSON"}
               </button>
             </div>
           </div>
@@ -978,24 +1105,7 @@ export default function UsagePage() {
               </tr>
             </thead>
             <tbody>
-              {(() => {
-                let filteredEvents = data.events;
-                
-                // Filter by event type
-                if (eventFilter !== "all") {
-                  filteredEvents = filteredEvents.filter(e => e.eventType === eventFilter);
-                }
-                
-                // Filter by search term
-                if (eventSearch.trim()) {
-                  const searchLower = eventSearch.toLowerCase();
-                  filteredEvents = filteredEvents.filter(e => {
-                    const metadataStr = JSON.stringify(e.metadata || {}).toLowerCase();
-                    return e.eventType.toLowerCase().includes(searchLower) || metadataStr.includes(searchLower);
-                  });
-                }
-                
-                return filteredEvents.length === 0 ? (
+              {paginatedEvents.length === 0 ? (
                   <tr>
                     <td
                       colSpan={5}
@@ -1009,21 +1119,23 @@ export default function UsagePage() {
                     </td>
                   </tr>
                 ) : (
-                  filteredEvents.map((e, idx) => (
+                  paginatedEvents.map((e, idx) => {
+                    const globalIdx = (currentPage - 1) * eventsPerPage + idx;
+                    return (
                     <tr
-                      key={idx}
+                      key={globalIdx}
                       style={{
                         backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB",
                         cursor: "pointer",
                       }}
-                      onClick={() => setSelectedEvent(selectedEvent === idx ? null : idx)}
+                      onClick={() => setSelectedEvent(selectedEvent === globalIdx ? null : globalIdx)}
                     >
                       <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", whiteSpace: "nowrap", color: "rgba(11,11,15,0.62)", fontSize: "0.875rem" }}>
                         {new Date(e.createdAt).toLocaleString()}
                       </td>
                   <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", color: "#0B0B0F" }}>{e.eventType}</td>
                       <td style={{ borderBottom: "1px solid rgba(11,11,15,0.08)", padding: "0.75rem 1rem", maxWidth: "300px", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.75rem", color: "rgba(11,11,15,0.62)", maxHeight: selectedEvent === idx ? "none" : "3rem", overflow: selectedEvent === idx ? "visible" : "hidden" }}>
+                        <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.75rem", color: "rgba(11,11,15,0.62)", maxHeight: selectedEvent === globalIdx ? "none" : "3rem", overflow: selectedEvent === globalIdx ? "visible" : "hidden" }}>
                           {JSON.stringify(e.metadata, null, 2)}
                         </pre>
                   </td>
@@ -1032,23 +1144,67 @@ export default function UsagePage() {
                         <button
                           style={{
                             padding: "0.25rem 0.5rem",
-                            background: selectedEvent === idx ? "#7C3AED" : "transparent",
-                            color: selectedEvent === idx ? "#FFFFFF" : "#7C3AED",
+                            background: selectedEvent === globalIdx ? "#7C3AED" : "transparent",
+                            color: selectedEvent === globalIdx ? "#FFFFFF" : "#7C3AED",
                             border: "1px solid #7C3AED",
                             borderRadius: "4px",
                             fontSize: "0.75rem",
                             cursor: "pointer",
                           }}
                         >
-                          {selectedEvent === idx ? "Hide" : "View"}
+                          {selectedEvent === globalIdx ? "Hide" : "View"}
                         </button>
                       </td>
                 </tr>
-                  ))
-                );
-              })()}
+                  );
+                  })
+                )}
             </tbody>
           </table>
+          
+          {/* Pagination Controls */}
+          {totalPages > 1 && (
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "1rem", padding: "1rem", backgroundColor: "#F9FAFB", borderRadius: "8px" }}>
+              <div style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)" }}>
+                Showing {((currentPage - 1) * eventsPerPage) + 1} to {Math.min(currentPage * eventsPerPage, filteredEvents.length)} of {filteredEvents.length} events
+              </div>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                <button
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: currentPage === 1 ? "#F9FAFB" : "#FFFFFF",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    cursor: currentPage === 1 ? "not-allowed" : "pointer",
+                    fontSize: "0.875rem",
+                    opacity: currentPage === 1 ? 0.5 : 1,
+                  }}
+                >
+                  Previous
+                </button>
+                <span style={{ fontSize: "0.875rem", color: "#0B0B0F", fontWeight: "500" }}>
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    background: currentPage === totalPages ? "#F9FAFB" : "#FFFFFF",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "6px",
+                    cursor: currentPage === totalPages ? "not-allowed" : "pointer",
+                    fontSize: "0.875rem",
+                    opacity: currentPage === totalPages ? 0.5 : 1,
+                  }}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </s-section>
     </s-page>

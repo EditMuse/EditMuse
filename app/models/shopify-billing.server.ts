@@ -280,6 +280,73 @@ export async function createRecurringCharge(
 }
 
 /**
+ * Get payment history (usage records) for a shop
+ */
+export async function getPaymentHistory(shopDomain: string, limit: number = 20, opts?: { admin?: any; accessToken?: string }) {
+  try {
+    const query = `
+      query {
+        currentAppInstallation {
+          activeSubscriptions {
+            id
+            name
+            lineItems {
+              id
+              usageRecords(first: ${limit}, orderBy: CREATED_AT) {
+                edges {
+                  node {
+                    id
+                    createdAt
+                    description
+                    price {
+                      amount
+                      currencyCode
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = await runGraphQL(shopDomain, query, undefined, opts);
+    const subscriptions = data.currentAppInstallation?.activeSubscriptions || [];
+    
+    // Collect all usage records from all subscriptions
+    const allRecords: Array<{
+      id: string;
+      createdAt: string;
+      description: string;
+      amount: number;
+      currencyCode: string;
+    }> = [];
+    
+    subscriptions.forEach((sub: any) => {
+      sub.lineItems?.forEach((item: any) => {
+        item.usageRecords?.edges?.forEach((edge: any) => {
+          const node = edge.node;
+          allRecords.push({
+            id: node.id,
+            createdAt: node.createdAt,
+            description: node.description || "Usage charge",
+            amount: parseFloat(node.price?.amount || "0"),
+            currencyCode: node.price?.currencyCode || "USD",
+          });
+        });
+      });
+    });
+    
+    // Sort by date (newest first)
+    return allRecords.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, limit);
+  } catch (error) {
+    console.error("[getPaymentHistory] Error:", error);
+    return [];
+  }
+}
+
+/**
  * Get active subscription charge for a shop (GraphQL)
  */
 export async function getActiveCharge(shopDomain: string, opts?: { admin?: any; accessToken?: string }) {

@@ -25,7 +25,7 @@ import {
   type PlanInfo,
   creditsToX2
 } from "~/models/billing.server";
-import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, cancelSubscription, isDevelopmentStore } from "~/models/shopify-billing.server";
+import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, getPaymentHistory, cancelSubscription, isDevelopmentStore } from "~/models/shopify-billing.server";
 
 type PlanTier = "TRIAL" | "LITE" | "GROWTH" | "SCALE" | "PRO";
 
@@ -118,6 +118,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     usageCapAmountUsd,
     currentPeriodEnd: activeCharge?.currentPeriodEnd ?? null,
     allPlans: allPlansList satisfies PlanInfo[], // Pass PLANS through loader to avoid client-side import
+    paymentHistory,
+    usageByExperience: Array.from(experienceMap.values()),
+    recommendedPlan,
   };
 };
 
@@ -579,7 +582,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 export default function Billing() {
   const loaderData = useLoaderData<typeof loader>();
-  const { currentPlan, inTrial, usage, entitlements, subscription, experienceCount, shopDomain, availablePlans, approved: loaderApproved, errorParam, usageBalanceUsedUsd, usageCapAmountUsd, currentPeriodEnd, allPlans } = loaderData;
+  const { currentPlan, inTrial, usage, entitlements, subscription, experienceCount, shopDomain, availablePlans, approved: loaderApproved, errorParam, usageBalanceUsedUsd, usageCapAmountUsd, currentPeriodEnd, allPlans, paymentHistory, usageByExperience, recommendedPlan } = loaderData;
   
   // Type assertion for allPlans to ensure TypeScript knows it's PlanInfo[]
   const typedAllPlans: PlanInfo[] = allPlans as PlanInfo[];
@@ -884,6 +887,76 @@ export default function Billing() {
               </div>
             </div>
           )}
+
+          {/* Usage Alerts */}
+          {(() => {
+            const usagePercent = entitlements.totalCreditsX2 > 0 ? (entitlements.usedCreditsX2 / entitlements.totalCreditsX2) : 0;
+            const remainingPercent = 1 - usagePercent;
+            const remainingCredits = entitlements.remainingX2 / 2;
+            
+            if (remainingPercent <= 0.05 && remainingCredits > 0) {
+              // Critical: Less than 5% remaining
+              return (
+                <div style={{
+                  padding: "1rem",
+                  backgroundColor: "#FEF2F2",
+                  border: "2px solid #EF4444",
+                  borderRadius: "12px",
+                  marginBottom: "1rem",
+                }}>
+                  <div style={{ fontSize: "0.875rem", color: "#DC2626", fontWeight: "600", marginBottom: "0.5rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    ⚠️ Critical: Credits Running Low
+                  </div>
+                  <div style={{ fontSize: "1rem", fontWeight: "500", color: "#991B1B", marginBottom: "0.5rem" }}>
+                    Only {remainingCredits.toFixed(0)} credits remaining ({remainingPercent * 100}%)
+                  </div>
+                  <div style={{ fontSize: "0.875rem", color: "#991B1B" }}>
+                    Upgrade your plan or purchase additional credits to avoid service interruption.
+                  </div>
+                </div>
+              );
+            } else if (remainingPercent <= 0.1 && remainingCredits > 0) {
+              // Warning: Less than 10% remaining
+              return (
+                <div style={{
+                  padding: "1rem",
+                  backgroundColor: "#FFFBEB",
+                  border: "2px solid #F59E0B",
+                  borderRadius: "12px",
+                  marginBottom: "1rem",
+                }}>
+                  <div style={{ fontSize: "0.875rem", color: "#D97706", fontWeight: "600", marginBottom: "0.5rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    ⚠️ Warning: Low Credits
+                  </div>
+                  <div style={{ fontSize: "1rem", fontWeight: "500", color: "#92400E" }}>
+                    {remainingCredits.toFixed(0)} credits remaining ({remainingPercent * 100}%)
+                  </div>
+                  <div style={{ fontSize: "0.875rem", color: "#92400E", marginTop: "0.25rem" }}>
+                    Consider upgrading your plan to avoid running out.
+                  </div>
+                </div>
+              );
+            } else if (remainingPercent <= 0.2 && remainingCredits > 0) {
+              // Info: Less than 20% remaining
+              return (
+                <div style={{
+                  padding: "1rem",
+                  backgroundColor: "#EFF6FF",
+                  border: "2px solid #3B82F6",
+                  borderRadius: "12px",
+                  marginBottom: "1rem",
+                }}>
+                  <div style={{ fontSize: "0.875rem", color: "#1E40AF", fontWeight: "600", marginBottom: "0.5rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    ℹ️ Credits Notice
+                  </div>
+                  <div style={{ fontSize: "0.875rem", color: "#1E40AF" }}>
+                    {remainingCredits.toFixed(0)} credits remaining ({remainingPercent * 100}%). Monitor your usage to avoid running out.
+                  </div>
+                </div>
+              );
+            }
+            return null;
+          })()}
 
           {/* Credits Progress Bar */}
           <div style={{ marginBottom: "1.5rem" }}>
@@ -1536,6 +1609,116 @@ export default function Billing() {
                 </button>
               </Form>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Plan Recommendation */}
+      {recommendedPlan && (
+        <div style={{
+          padding: "1.5rem",
+          backgroundColor: "#FFFBEB",
+          border: "2px solid #F59E0B",
+          borderRadius: "12px",
+          marginBottom: "2rem",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.75rem" }}>
+            <span style={{ fontSize: "1.5rem" }}>💡</span>
+            <h3 style={{ margin: 0, color: "#D97706" }}>Plan Recommendation</h3>
+          </div>
+          <p style={{ margin: 0, color: "#92400E", fontSize: "0.875rem", lineHeight: "1.5" }}>
+            You're using {((usage.aiRankingsExecuted * 2) / currentPlan.includedCredits * 100).toFixed(0)}% of your monthly credits. 
+            Consider upgrading to <strong>{recommendedPlan.name}</strong> for {recommendedPlan.includedCredits.toLocaleString()} credits/month.
+          </p>
+        </div>
+      )}
+
+      {/* Usage Breakdown by Experience */}
+      {usageByExperience.length > 0 && (
+        <div style={{ marginBottom: "2rem" }}>
+          <h2 style={{ marginBottom: "1rem" }}>Usage Breakdown (Last 30 Days)</h2>
+          <div style={{
+            backgroundColor: "#FFFFFF",
+            border: "1px solid rgba(11,11,15,0.12)",
+            borderRadius: "12px",
+            overflow: "hidden",
+            boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)"
+          }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ backgroundColor: "#F9FAFB" }}>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Experience
+                  </th>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Sessions
+                  </th>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Credits Used
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {usageByExperience.map((item, idx) => (
+                  <tr key={idx} style={{ backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB" }}>
+                    <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                      {item.name}
+                    </td>
+                    <td style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                      {item.sessions.toLocaleString()}
+                    </td>
+                    <td style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
+                      {item.credits.toFixed(1)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Payment History */}
+      {paymentHistory.length > 0 && (
+        <div style={{ marginBottom: "2rem" }}>
+          <h2 style={{ marginBottom: "1rem" }}>Payment History</h2>
+          <div style={{
+            backgroundColor: "#FFFFFF",
+            border: "1px solid rgba(11,11,15,0.12)",
+            borderRadius: "12px",
+            overflow: "hidden",
+            boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)"
+          }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ backgroundColor: "#F9FAFB" }}>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Date
+                  </th>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Description
+                  </th>
+                  <th style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
+                    Amount
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {paymentHistory.map((payment, idx) => (
+                  <tr key={payment.id} style={{ backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB" }}>
+                    <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F", fontSize: "0.875rem" }}>
+                      {new Date(payment.createdAt).toLocaleDateString()}
+                    </td>
+                    <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F", fontSize: "0.875rem" }}>
+                      {payment.description}
+                    </td>
+                    <td style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F", fontSize: "0.875rem", fontWeight: "500" }}>
+                      {payment.currencyCode} ${payment.amount.toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
