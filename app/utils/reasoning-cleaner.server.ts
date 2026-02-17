@@ -120,6 +120,47 @@ export function combineReasonings(reasonings: string[]): string {
   }
   
   // Too many different reasons - create a summary from the first few
-  return `${unique[0]} These products were carefully selected based on your specific requirements and preferences.`;
+  return `${unique[0]} I've carefully selected these options based on your specific requirements and preferences.`;
+}
+
+/**
+ * Generates human-like, sales-representative-style reasoning for bundle queries
+ */
+export function handleBundleReasoning(
+  bundleGroupedResult: any,
+  deliveredCountFinal: number,
+  requestedCountFinal: number,
+  relaxNotes: string[],
+  finalReasoning: string
+): string {
+  let salesReasoning = "";
+  const itemNames = bundleGroupedResult?.items?.map((item: any) => item.type).filter(Boolean).join(", ");
+
+  if (itemNames) {
+    salesReasoning = `I've curated a fantastic bundle featuring ${itemNames} just for you.`;
+  } else {
+    salesReasoning = "I've put together a great selection of products tailored to your needs.";
+  }
+
+  if (deliveredCountFinal < requestedCountFinal) {
+    let whyFewer = "";
+    if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+      whyFewer = "I found limited options within your specified budget and stock availability.";
+    } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+      whyFewer = "There were limited in-stock options for your requested categories.";
+    } else {
+      whyFewer = "I found limited options matching all your bundle preferences.";
+    }
+    salesReasoning += ` ${whyFewer}`;
+  } else if (deliveredCountFinal === requestedCountFinal && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
+    salesReasoning += ` I've found all ${deliveredCountFinal} items you requested! Please note, I've slightly adjusted the budget criteria to bring you these great options.`;
+  }
+
+  // Fallback if salesReasoning is still too generic or empty
+  if (!salesReasoning || salesReasoning.length < 30) {
+    salesReasoning = finalReasoning; // Use original AI reasoning as a last resort
+  }
+
+  return cleanReasoning(salesReasoning) || salesReasoning;
 }
 

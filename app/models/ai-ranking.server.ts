@@ -720,7 +720,7 @@ function deterministicRanking(
   
   return {
     selectedHandles,
-    reasoning: "Selected the best matches based on your preferences and product quality.",
+    reasoning: "I've handpicked the best matches based on your preferences and what I think would work best for you.",
     trustFallback: true,
     source: "fallback",
     parseFailReason: parseFailReason || null,
@@ -2602,7 +2602,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     
     return {
       selectedHandles: bm25Handles,
-      reasoning: "Selected the best matches based on relevance to your request.",
+      reasoning: "I've selected the best matches based on relevance to your request.",
       trustFallback: true,
       source: "ai_failed_fallback_bm25" as any, // Use custom source type
       parseFailReason: failReason,

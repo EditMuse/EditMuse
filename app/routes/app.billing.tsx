@@ -23,7 +23,8 @@ import {
   markSubscriptionAsCancelled,
   PLANS,
   type PlanInfo,
-  creditsToX2
+  creditsToX2,
+  computeCreditsBurned
 } from "~/models/billing.server";
 import { createRecurringCharge, purchaseAddon, updateSubscriptionFromCharge, purchaseAddonUsageCharge, chargeRecurringAddonForCycle, getActiveCharge, getPaymentHistory, cancelSubscription, isDevelopmentStore } from "~/models/shopify-billing.server";
 
@@ -128,20 +129,43 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         select: { name: true },
       });
       if (exp) {
-        // Calculate credits from resultCount (approximate: resultCount * 2 credits per result)
+        // Calculate credits from resultCount using the actual credit calculation function
         const resultCount = item._sum?.resultCount || 0;
-        const estimatedCredits = resultCount * 2; // Approximate credits
+        // Sum up credits for each session's resultCount
+        // We need to calculate credits per session, not total resultCount
+        // Since we're grouping by experienceId, we need to fetch individual sessions
+        // to calculate credits accurately
+        const sessions = await prisma.conciergeSession.findMany({
+          where: {
+            experienceId: item.experienceId,
+            shopId: shop.id,
+            createdAt: { gte: thirtyDaysAgo },
+            result: { isNot: null },
+            resultCount: { not: null } as any, // Filter out null resultCount
+          },
+          select: { resultCount: true },
+        });
+        
+        // Calculate total credits by summing credits for each session
+        const totalCredits = sessions.reduce((sum, session) => {
+          if (session.resultCount) {
+            return sum + computeCreditsBurned(session.resultCount);
+          }
+          return sum;
+        }, 0);
+        
         experienceMap.set(item.experienceId, {
           name: exp.name,
           sessions: item._count.id,
-          credits: estimatedCredits,
+          credits: totalCredits,
         });
       }
     }
   }
 
   // Plan recommendations
-  const currentMonthCredits = usage.aiRankingsExecuted * 2; // Approximate credits used
+  // Use totalCreditsBurned from UsageEvent table (already calculated correctly using computeCreditsBurned)
+  const currentMonthCredits = usage.totalCreditsBurned || 0;
   const currentPlanCredits = currentPlan.includedCredits;
   const usagePercent = currentPlanCredits > 0 ? (currentMonthCredits / currentPlanCredits) : 0;
   
@@ -1694,7 +1718,7 @@ export default function Billing() {
             <h3 style={{ margin: 0, color: "#D97706" }}>Plan Recommendation</h3>
           </div>
           <p style={{ margin: 0, color: "#92400E", fontSize: "0.875rem", lineHeight: "1.5" }}>
-            You're using {((usage.aiRankingsExecuted * 2) / currentPlan.includedCredits * 100).toFixed(0)}% of your monthly credits. 
+            You're using {((usage.totalCreditsBurned || 0) / currentPlan.includedCredits * 100).toFixed(0)}% of your monthly credits. 
             Consider upgrading to <strong>{recommendedPlan.name}</strong> for {recommendedPlan.includedCredits.toLocaleString()} credits/month.
           </p>
         </div>
