@@ -610,53 +610,230 @@ export default function ExperiencesIndex() {
           </div>
         ) : (
           <>
-            {experiences.length > 1 && (
-              <Form method="post" style={{ marginBottom: "1rem" }}>
-                <input type="hidden" name="intent" value="deleteDuplicates" />
-                <button 
-                  type="submit"
-                  disabled={navigation.state === "submitting"}
+            {/* Search and Filter Controls */}
+            <div style={{
+              display: "flex",
+              gap: "1rem",
+              marginBottom: "1.5rem",
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}>
+              <div style={{ flex: "1", minWidth: "250px" }}>
+                <input
+                  type="text"
+                  placeholder="Search experiences..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
                   style={{
-                    padding: "0.5rem 1rem",
-                    backgroundColor: "#F9FAFB",
+                    width: "100%",
+                    padding: "0.625rem 1rem",
                     border: "1px solid rgba(11,11,15,0.12)",
-                    borderRadius: "12px",
-                    color: "#0B0B0F",
-                    cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
+                    borderRadius: "8px",
                     fontSize: "0.875rem",
+                    fontFamily: "inherit",
+                    color: "#0B0B0F",
+                    backgroundColor: "#FFFFFF",
+                    transition: "all 0.2s",
+                  }}
+                  onFocus={(e) => {
+                    e.currentTarget.style.borderColor = "#7C3AED";
+                    e.currentTarget.style.boxShadow = "0 0 0 3px rgba(124, 58, 237, 0.1)";
+                  }}
+                  onBlur={(e) => {
+                    e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
+                    e.currentTarget.style.boxShadow = "none";
+                  }}
+                />
+              </div>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                <label style={{ fontSize: "0.875rem", color: "rgba(11,11,15,0.62)", fontWeight: "500", whiteSpace: "nowrap" }}>
+                  Sort by:
+                </label>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as any)}
+                  style={{
+                    padding: "0.625rem 0.75rem",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "8px",
+                    fontSize: "0.875rem",
+                    fontFamily: "inherit",
+                    color: "#0B0B0F",
+                    backgroundColor: "#FFFFFF",
+                    cursor: "pointer",
                   }}
                 >
-                  {navigation.state === "submitting" ? "Deleting..." : "Delete duplicates"}
+                  <option value="created">Created Date</option>
+                  <option value="name">Name</option>
+                  <option value="sessions">Sessions</option>
+                  <option value="results">Results</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setSortOrder(sortOrder === "asc" ? "desc" : "asc")}
+                  style={{
+                    padding: "0.625rem 0.75rem",
+                    background: "#F9FAFB",
+                    border: "1px solid rgba(11,11,15,0.12)",
+                    borderRadius: "8px",
+                    cursor: "pointer",
+                    fontSize: "0.875rem",
+                    color: "#0B0B0F",
+                  }}
+                  title={sortOrder === "asc" ? "Sort ascending" : "Sort descending"}
+                >
+                  {sortOrder === "asc" ? "↑" : "↓"}
                 </button>
-              </Form>
+              </div>
+            </div>
+
+            {/* Bulk Actions Bar */}
+            {selectedExperiences.size > 0 && (
+              <div style={{
+                padding: "1rem",
+                backgroundColor: "#EFF6FF",
+                border: "1px solid #3B82F6",
+                borderRadius: "12px",
+                marginBottom: "1rem",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: "1rem",
+              }}>
+                <div style={{ fontSize: "0.875rem", color: "#1E40AF", fontWeight: "500" }}>
+                  {selectedExperiences.size} experience{selectedExperiences.size > 1 ? "s" : ""} selected
+                </div>
+                <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                  <Form method="post" style={{ display: "inline" }}>
+                    <input type="hidden" name="intent" value="bulkDuplicate" />
+                    {Array.from(selectedExperiences).map(id => (
+                      <input key={id} type="hidden" name="experienceIds" value={id} />
+                    ))}
+                    <button
+                      type="submit"
+                      disabled={navigation.state === "submitting" || isLimitReached}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        background: "#06B6D4",
+                        color: "#FFFFFF",
+                        border: "none",
+                        borderRadius: "8px",
+                        cursor: navigation.state === "submitting" || isLimitReached ? "not-allowed" : "pointer",
+                        fontSize: "0.875rem",
+                        fontWeight: "500",
+                        opacity: isLimitReached ? 0.5 : 1,
+                      }}
+                    >
+                      {navigation.state === "submitting" ? "Duplicating..." : "Duplicate Selected"}
+                    </button>
+                  </Form>
+                  <button
+                    type="button"
+                    disabled={navigation.state === "submitting"}
+                    onClick={() => setConfirmDelete({ isOpen: true, isBulk: true })}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: "#EF4444",
+                      color: "#FFFFFF",
+                      border: "none",
+                      borderRadius: "8px",
+                      cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
+                      fontSize: "0.875rem",
+                      fontWeight: "500",
+                    }}
+                  >
+                    Delete Selected
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedExperiences(new Set())}
+                    style={{
+                      padding: "0.5rem 1rem",
+                      background: "#F9FAFB",
+                      color: "#0B0B0F",
+                      border: "1px solid rgba(11,11,15,0.12)",
+                      borderRadius: "8px",
+                      cursor: "pointer",
+                      fontSize: "0.875rem",
+                      fontWeight: "500",
+                    }}
+                  >
+                    Clear Selection
+                  </button>
+                </div>
+              </div>
             )}
-            <table style={{ width: "100%", borderCollapse: "collapse", marginTop: "1rem" }}>
-              <thead>
-                <tr style={{ borderBottom: "2px solid rgba(11,11,15,0.12)", textAlign: "left", backgroundColor: "#F9FAFB" }}>
-                  <th style={{ padding: "0.75rem" }}>Name</th>
-                  <th style={{ padding: "0.75rem" }}>Mode</th>
-                  <th style={{ padding: "0.75rem" }}>Results</th>
-                  <th style={{ padding: "0.75rem" }}>Default</th>
-                  <th style={{ padding: "0.75rem" }}>Analytics (30d)</th>
-                  <th style={{ padding: "0.75rem" }}>ID</th>
-                  <th style={{ padding: "0.75rem" }}>Actions</th>
-                </tr>
-              </thead>
+
+            {/* Experiences Table */}
+            <div style={{
+              backgroundColor: "#FFFFFF",
+              border: "1px solid rgba(11,11,15,0.12)",
+              borderRadius: "12px",
+              overflow: "hidden",
+              boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
+            }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ backgroundColor: "#F9FAFB" }}>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedExperiences.size === filteredAndSortedExperiences.length && filteredAndSortedExperiences.length > 0}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedExperiences(new Set(filteredAndSortedExperiences.map((exp: any) => exp.id)));
+                          } else {
+                            setSelectedExperiences(new Set());
+                          }
+                        }}
+                        style={{ cursor: "pointer" }}
+                      />
+                    </th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Name</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Mode</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Results</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Default</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Analytics (30d)</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>ID</th>
+                    <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F", fontSize: "0.875rem" }}>Actions</th>
+                  </tr>
+                </thead>
               <tbody>
                 {filteredAndSortedExperiences.length === 0 ? (
                   <tr>
-                    <td colSpan={8} style={{ padding: "2rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
-                      {searchQuery ? `No experiences match "${searchQuery}"` : "No experiences found"}
+                    <td colSpan={8} style={{ padding: "3rem", textAlign: "center", color: "rgba(11,11,15,0.62)" }}>
+                      <p style={{ fontSize: "1.125rem", marginBottom: "0.5rem", margin: 0 }}>No experiences found</p>
+                      <p style={{ fontSize: "0.875rem", margin: 0 }}>
+                        {searchQuery ? `No experiences match "${searchQuery}"` : "Create your first experience to get started."}
+                      </p>
                     </td>
                   </tr>
                 ) : (
-                  filteredAndSortedExperiences.map((exp: any) => {
+                  filteredAndSortedExperiences.map((exp: any, idx: number) => {
                     const shortId = exp.id.substring(0, 8);
                     const analytics = exp.analytics || { sessions: 0, resultsGenerated: 0, productClicks: 0, addToCart: 0 };
                     const isSelected = selectedExperiences.has(exp.id);
                   return (
-                    <tr key={exp.id} style={{ borderBottom: "1px solid rgba(11,11,15,0.12)", backgroundColor: isSelected ? "#F0F9FF" : "transparent" }}>
-                      <td style={{ padding: "0.75rem" }}>
+                    <tr 
+                      key={exp.id} 
+                      style={{ 
+                        borderBottom: "1px solid rgba(11,11,15,0.08)",
+                        backgroundColor: isSelected ? "#EFF6FF" : (idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB"),
+                        transition: "background-color 0.2s",
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!isSelected) {
+                          e.currentTarget.style.backgroundColor = "#F3F4F6";
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!isSelected) {
+                          e.currentTarget.style.backgroundColor = idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB";
+                        }
+                      }}
+                    >
+                      <td style={{ padding: "0.75rem 1rem" }}>
                         <input
                           type="checkbox"
                           checked={isSelected}
@@ -672,30 +849,47 @@ export default function ExperiencesIndex() {
                           style={{ cursor: "pointer" }}
                         />
                       </td>
-                      <td style={{ padding: "0.75rem" }}>{exp.name}</td>
-                      <td style={{ padding: "0.75rem" }}>
-                        {exp.mode === "quiz" ? "Guided Quiz" :
-                         exp.mode === "chat" ? "Chat" :
-                         exp.mode === "hybrid" ? "Hybrid" :
-                         exp.mode}
+                      <td style={{ padding: "0.75rem 1rem", color: "#0B0B0F", fontWeight: "500" }}>{exp.name}</td>
+                      <td style={{ padding: "0.75rem 1rem", color: "#0B0B0F" }}>
+                        <span style={{
+                          padding: "0.25rem 0.75rem",
+                          backgroundColor: exp.mode === "quiz" ? "#EFF6FF" : exp.mode === "chat" ? "#F0FDF4" : "#FFFBEB",
+                          color: exp.mode === "quiz" ? "#1E40AF" : exp.mode === "chat" ? "#16A34A" : "#D97706",
+                          borderRadius: "6px",
+                          fontSize: "0.875rem",
+                          fontWeight: "500",
+                        }}>
+                          {exp.mode === "quiz" ? "Guided Quiz" :
+                           exp.mode === "chat" ? "Chat" :
+                           exp.mode === "hybrid" ? "Hybrid" :
+                           exp.mode}
+                        </span>
                       </td>
-                      <td style={{ padding: "0.75rem" }}>{exp.resultCount}</td>
-                      <td style={{ padding: "0.75rem" }}>
+                      <td style={{ padding: "0.75rem 1rem", color: "#0B0B0F", fontWeight: "500" }}>{exp.resultCount}</td>
+                      <td style={{ padding: "0.75rem 1rem" }}>
                         {exp.isDefault ? (
-                          <span style={{ color: "#10B981", fontWeight: "bold" }}>✓ Default</span>
+                          <span style={{ 
+                            color: "#10B981", 
+                            fontWeight: "600",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "0.25rem",
+                          }}>
+                            <span>✓</span> Default
+                          </span>
                         ) : (
                           <span style={{ color: "rgba(11,11,15,0.4)" }}>—</span>
                         )}
                       </td>
-                      <td style={{ padding: "0.75rem", fontSize: "0.875rem" }}>
-                        <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-                          <div>Sessions: <strong>{analytics.sessions}</strong></div>
-                          <div>Results: <strong>{analytics.resultsGenerated}</strong></div>
-                          <div>Clicks: <strong>{analytics.productClicks}</strong></div>
-                          <div>ATC: <strong>{analytics.addToCart}</strong></div>
+                      <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem", color: "#0B0B0F" }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "0.375rem" }}>
+                          <div>Sessions: <strong style={{ color: "#7C3AED" }}>{analytics.sessions.toLocaleString()}</strong></div>
+                          <div>Results: <strong style={{ color: "#7C3AED" }}>{analytics.resultsGenerated.toLocaleString()}</strong></div>
+                          <div>Clicks: <strong style={{ color: "#7C3AED" }}>{analytics.productClicks.toLocaleString()}</strong></div>
+                          <div>ATC: <strong style={{ color: "#7C3AED" }}>{analytics.addToCart.toLocaleString()}</strong></div>
                         </div>
                       </td>
-                      <td style={{ padding: "0.75rem" }}>
+                      <td style={{ padding: "0.75rem 1rem" }}>
                         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                           <code 
                             style={{ fontSize: "0.875rem", fontFamily: "monospace" }}
@@ -729,18 +923,28 @@ export default function ExperiencesIndex() {
                           </button>
                         </div>
                       </td>
-                      <td style={{ padding: "0.75rem" }}>
+                      <td style={{ padding: "0.75rem 1rem" }}>
                         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
                           <Link 
                             to={exp.id}
                             style={{
-                              padding: "0.25rem 0.75rem",
+                              padding: "0.375rem 0.75rem",
                               backgroundColor: "#F9FAFB",
                               border: "1px solid rgba(11,11,15,0.12)",
-                              borderRadius: "12px",
+                              borderRadius: "8px",
                               textDecoration: "none",
                               color: "#0B0B0F",
                               fontSize: "0.875rem",
+                              fontWeight: "500",
+                              transition: "all 0.2s",
+                            }}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.backgroundColor = "#F3F4F6";
+                              e.currentTarget.style.borderColor = "#7C3AED";
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.backgroundColor = "#F9FAFB";
+                              e.currentTarget.style.borderColor = "rgba(11,11,15,0.12)";
                             }}
                           >
                             Edit
@@ -753,13 +957,27 @@ export default function ExperiencesIndex() {
                                 type="submit"
                                 disabled={navigation.state === "submitting"}
                                 style={{
-                                  padding: "0.25rem 0.75rem",
+                                  padding: "0.375rem 0.75rem",
                                   backgroundColor: "#FFFFFF",
                                   border: "1px solid #7C3AED",
-                                  borderRadius: "12px",
+                                  borderRadius: "8px",
                                   color: "#7C3AED",
                                   cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
                                   fontSize: "0.875rem",
+                                  fontWeight: "500",
+                                  transition: "all 0.2s",
+                                }}
+                                onMouseEnter={(e) => {
+                                  if (!navigation.state) {
+                                    e.currentTarget.style.backgroundColor = "#7C3AED";
+                                    e.currentTarget.style.color = "#FFFFFF";
+                                  }
+                                }}
+                                onMouseLeave={(e) => {
+                                  if (!navigation.state) {
+                                    e.currentTarget.style.backgroundColor = "#FFFFFF";
+                                    e.currentTarget.style.color = "#7C3AED";
+                                  }
                                 }}
                               >
                                 {navigation.state === "submitting" ? "Setting..." : "Set Default"}
@@ -773,16 +991,30 @@ export default function ExperiencesIndex() {
                               type="submit"
                               disabled={navigation.state === "submitting" || isLimitReached}
                               style={{
-                                padding: "0.25rem 0.75rem",
+                                padding: "0.375rem 0.75rem",
                                 backgroundColor: "#FFFFFF",
                                 border: "1px solid #06B6D4",
-                                borderRadius: "12px",
+                                borderRadius: "8px",
                                 color: "#06B6D4",
                                 cursor: navigation.state === "submitting" || isLimitReached ? "not-allowed" : "pointer",
                                 fontSize: "0.875rem",
+                                fontWeight: "500",
                                 opacity: isLimitReached ? 0.5 : 1,
+                                transition: "all 0.2s",
                               }}
                               title={isLimitReached ? "Experience limit reached" : "Duplicate this experience"}
+                              onMouseEnter={(e) => {
+                                if (!navigation.state && !isLimitReached) {
+                                  e.currentTarget.style.backgroundColor = "#06B6D4";
+                                  e.currentTarget.style.color = "#FFFFFF";
+                                }
+                              }}
+                              onMouseLeave={(e) => {
+                                if (!navigation.state && !isLimitReached) {
+                                  e.currentTarget.style.backgroundColor = "#FFFFFF";
+                                  e.currentTarget.style.color = "#06B6D4";
+                                }
+                              }}
                             >
                               {navigation.state === "submitting" ? "Duplicating..." : "Duplicate"}
                             </button>
@@ -792,13 +1024,27 @@ export default function ExperiencesIndex() {
                             disabled={navigation.state === "submitting"}
                             onClick={() => setConfirmDelete({ isOpen: true, experienceId: exp.id, isBulk: false })}
                             style={{
-                              padding: "0.25rem 0.75rem",
+                              padding: "0.375rem 0.75rem",
                               backgroundColor: "#FFFFFF",
                               border: "1px solid #EF4444",
-                              borderRadius: "12px",
+                              borderRadius: "8px",
                               color: "#EF4444",
                               cursor: navigation.state === "submitting" ? "not-allowed" : "pointer",
                               fontSize: "0.875rem",
+                              fontWeight: "500",
+                              transition: "all 0.2s",
+                            }}
+                            onMouseEnter={(e) => {
+                              if (!navigation.state) {
+                                e.currentTarget.style.backgroundColor = "#EF4444";
+                                e.currentTarget.style.color = "#FFFFFF";
+                              }
+                            }}
+                            onMouseLeave={(e) => {
+                              if (!navigation.state) {
+                                e.currentTarget.style.backgroundColor = "#FFFFFF";
+                                e.currentTarget.style.color = "#EF4444";
+                              }
                             }}
                           >
                             Delete
@@ -811,6 +1057,7 @@ export default function ExperiencesIndex() {
                 )}
               </tbody>
             </table>
+            </div>
           </>
         )}
       </s-section>
