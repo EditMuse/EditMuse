@@ -104,63 +104,110 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const approved = url.searchParams.get("approved") === "true";
   const errorParam = url.searchParams.get("error");
 
-  // Get payment history
-  const paymentHistory = await getPaymentHistory(session.shop, 20, { admin });
+  // Get payment history (with error handling)
+  let paymentHistory: Array<{ id: string; createdAt: string; description: string; amount: number; currencyCode: string }> = [];
+  try {
+    paymentHistory = await getPaymentHistory(session.shop, 20, { admin });
+  } catch (error) {
+    console.error("[Billing] Error fetching payment history:", error);
+    // Continue with empty array if payment history fails
+  }
 
   // Get usage breakdown by experience
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  const usageByExperienceData = await prisma.conciergeSession.groupBy({
-    by: ["experienceId"],
-    where: {
-      shopId: shop.id,
-      createdAt: { gte: thirtyDaysAgo },
-      result: { isNot: null },
-    },
-    _count: { id: true },
-    _sum: { resultCount: true },
-  });
+  
+  let usageByExperienceData: Array<{
+    experienceId: string | null;
+    _count: { id: number };
+    _sum: { resultCount: number | null };
+  }> = [];
+  
+  try {
+    const groupByResult = await prisma.conciergeSession.groupBy({
+      by: ["experienceId"],
+      where: {
+        shopId: shop.id,
+        createdAt: { gte: thirtyDaysAgo },
+        result: { isNot: null },
+      },
+      _count: { id: true },
+      _sum: { resultCount: true },
+    });
+    usageByExperienceData = groupByResult;
+  } catch (error) {
+    console.error("[Billing] Error fetching usage by experience:", error);
+    // Continue with empty array if query fails
+  }
 
+  // Optimize: Fetch all experiences in one query instead of in a loop
+  const experienceIds = usageByExperienceData
+    .map(item => item.experienceId)
+    .filter((id): id is string => id !== null);
+  
+  const experiences = experienceIds.length > 0
+    ? await prisma.experience.findMany({
+        where: { id: { in: experienceIds } },
+        select: { id: true, name: true },
+      })
+    : [];
+  
+  const experienceNameMap = new Map(experiences.map(exp => [exp.id, exp.name]));
+
+  // Build experience map with accurate credit calculations
   const experienceMap = new Map<string, { name: string; sessions: number; credits: number }>();
-  for (const item of usageByExperienceData) {
-    if (item.experienceId && item._count && item._count.id !== undefined) {
-      const exp = await prisma.experience.findUnique({
-        where: { id: item.experienceId },
-        select: { name: true },
-      });
-      if (exp) {
-        // Calculate credits from resultCount using the actual credit calculation function
-        const resultCount = item._sum?.resultCount || 0;
-        // Sum up credits for each session's resultCount
-        // We need to calculate credits per session, not total resultCount
-        // Since we're grouping by experienceId, we need to fetch individual sessions
-        // to calculate credits accurately
-        const sessions = await prisma.conciergeSession.findMany({
-          where: {
-            experienceId: item.experienceId,
-            shopId: shop.id,
-            createdAt: { gte: thirtyDaysAgo },
-            result: { isNot: null },
-            resultCount: { not: null } as any, // Filter out null resultCount
-          },
-          select: { resultCount: true },
-        });
-        
-        // Calculate total credits by summing credits for each session
-        const totalCredits = sessions.reduce((sum, session) => {
-          if (session.resultCount) {
-            return sum + computeCreditsBurned(session.resultCount);
+  
+  // Process in parallel batches to avoid timeout
+  const batchSize = 5;
+  for (let i = 0; i < usageByExperienceData.length; i += batchSize) {
+    const batch = usageByExperienceData.slice(i, i + batchSize);
+    
+    await Promise.all(
+      batch.map(async (item) => {
+        if (item.experienceId && item._count && typeof item._count === 'object' && 'id' in item._count && item._count.id !== undefined) {
+          const expName = experienceNameMap.get(item.experienceId);
+          if (expName) {
+            try {
+              // Fetch sessions for this experience to calculate credits accurately
+              const sessions = await prisma.conciergeSession.findMany({
+                where: {
+                  experienceId: item.experienceId,
+                  shopId: shop.id,
+                  createdAt: { gte: thirtyDaysAgo },
+                  result: { isNot: null },
+                  resultCount: { not: null } as any,
+                },
+                select: { resultCount: true },
+              });
+              
+              // Calculate total credits by summing credits for each session
+              const totalCredits = sessions.reduce((sum, session) => {
+                if (session.resultCount) {
+                  return sum + computeCreditsBurned(session.resultCount);
+                }
+                return sum;
+              }, 0);
+              
+              experienceMap.set(item.experienceId, {
+                name: expName,
+                sessions: item._count.id,
+                credits: totalCredits,
+              });
+            } catch (error) {
+              console.error(`[Billing] Error calculating credits for experience ${item.experienceId}:`, error);
+              // Fallback: use approximate calculation if session fetch fails
+              const resultCount = item._sum?.resultCount || 0;
+              const estimatedCredits = resultCount > 0 ? computeCreditsBurned(Math.min(resultCount, 16)) : 0;
+              experienceMap.set(item.experienceId, {
+                name: expName,
+                sessions: item._count.id,
+                credits: estimatedCredits,
+              });
+            }
           }
-          return sum;
-        }, 0);
-        
-        experienceMap.set(item.experienceId, {
-          name: exp.name,
-          sessions: item._count.id,
-          credits: totalCredits,
-        });
-      }
-    }
+        }
+      })
+    );
   }
 
   // Plan recommendations
