@@ -1771,51 +1771,6 @@ export default function Billing() {
         </div>
       )}
 
-      {/* Usage Breakdown by Experience */}
-      {usageByExperience.length > 0 && (
-        <div style={{ marginBottom: "2rem" }}>
-          <h2 style={{ marginBottom: "1rem" }}>Usage Breakdown (Last 30 Days)</h2>
-          <div style={{
-            backgroundColor: "#FFFFFF",
-            border: "1px solid rgba(11,11,15,0.12)",
-            borderRadius: "12px",
-            overflow: "hidden",
-            boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)"
-          }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr style={{ backgroundColor: "#F9FAFB" }}>
-                  <th style={{ padding: "0.75rem 1rem", textAlign: "left", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
-                    Experience
-                  </th>
-                  <th style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
-                    Sessions
-                  </th>
-                  <th style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.12)", fontWeight: "500", color: "#0B0B0F" }}>
-                    Credits Used
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {usageByExperience.map((item: { name: string; sessions: number; credits: number }, idx: number) => (
-                  <tr key={idx} style={{ backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB" }}>
-                    <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
-                      {item.name}
-                    </td>
-                    <td style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
-                      {item.sessions.toLocaleString()}
-                    </td>
-                    <td style={{ padding: "0.75rem 1rem", textAlign: "right", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
-                      {item.credits.toFixed(1)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
       {/* Payment History */}
       {paymentHistory.length > 0 && (
         <div style={{ marginBottom: "2rem" }}>

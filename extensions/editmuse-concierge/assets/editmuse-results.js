@@ -342,6 +342,10 @@
       card.className = 'editmuse-results-card';
       card.style.textDecoration = 'none';
       card.style.color = 'inherit';
+      // Add data attribute for easy handle extraction in Add to Cart tracking
+      if (product.handle) {
+        card.setAttribute('data-product-handle', product.handle);
+      }
 
       // Image wrapper
       var imageWrapper = document.createElement('div');
@@ -913,6 +917,61 @@ function escapeHtml(text) {
 
     if (!sessionId) return; // No session ID available
 
+    // Track add-to-cart button clicks to capture product handle before form submission
+    document.addEventListener('click', function(e) {
+      var target = e.target;
+      if (!target) return;
+      
+      // Check if clicked element is an add to cart button
+      var addToCartButton = target.closest('button[type="submit"][formaction*="/cart/add"], button[type="submit"][formaction*="/cart/add.js"], form[action*="/cart/add"] button, [name="add"], button[aria-label*="cart" i], button[aria-label*="add" i]');
+      if (!addToCartButton) {
+        // Also check for common add to cart button classes/text
+        var text = (target.textContent || '').toLowerCase();
+        var isAddToCartText = text.includes('add to cart') || text.includes('add to bag') || text.includes('buy now');
+        if (isAddToCartText && (target.tagName === 'BUTTON' || target.closest('button'))) {
+          addToCartButton = target.closest('button') || target;
+        }
+      }
+      
+      if (addToCartButton) {
+        var form = addToCartButton.form || addToCartButton.closest('form');
+        if (form && (form.action && form.action.indexOf('/cart/add') !== -1)) {
+          // Try to get product handle from the product card/link that contains this button
+          var productHandle = null;
+          try {
+            // 1. Check for data-product-handle on card/container
+            var productCard = addToCartButton.closest('[data-product-handle]');
+            if (productCard) {
+              productHandle = productCard.getAttribute('data-product-handle');
+            } else {
+              // 2. Look for product link in the same card/container
+              var productLink = addToCartButton.closest('a[href*="/products/"]');
+              if (!productLink) {
+                var container = addToCartButton.closest('[class*="product"], [class*="card"], [class*="item"]');
+                if (container) {
+                  productLink = container.querySelector('a[href*="/products/"]');
+                }
+              }
+              if (productLink) {
+                var match = productLink.href.match(/\/products\/([^\/\?#]+)/);
+                if (match) productHandle = match[1];
+              }
+            }
+            
+            // Store in sessionStorage for form submission handler to use
+            if (productHandle) {
+              try {
+                sessionStorage.setItem('editmuse_atc_handle', JSON.stringify({
+                  handle: productHandle,
+                  at: Date.now()
+                }));
+              } catch (e) {}
+            }
+          } catch (e) {}
+        }
+      }
+    }, true); // Use capture phase
+    
     // Track add-to-cart via form submission
     document.addEventListener('submit', function(e) {
       var form = e.target;
@@ -921,32 +980,89 @@ function escapeHtml(text) {
       var action = form.action || '';
       if (action.indexOf('/cart/add') === -1) return;
 
-      // Get product handle from current URL (if on product page) or form
+      // Get product handle from multiple sources (results page, product page, sessionStorage)
       var productHandle = null;
       try {
-        // First, try to extract from current page URL (most reliable on product pages)
+        // 1. First, try to extract from current page URL (most reliable on product pages)
         var urlMatch = window.location.pathname.match(/\/products\/([^\/\?#]+)/);
         if (urlMatch) {
           productHandle = urlMatch[1];
         } else {
-          // Fallback: try to get from form
-          var productInput = form.querySelector('input[name="id"], input[name="product_id"]');
-          if (productInput) {
-            // Try to get handle from data attributes or nearby links
-            var productLink = form.closest('form')?.querySelector('a[href*="/products/"]');
-            if (!productLink) {
-              // Try finding link in parent containers
-              var parent = form.parentElement;
-              while (parent && !productLink) {
-                productLink = parent.querySelector('a[href*="/products/"]');
-                parent = parent.parentElement;
+          // 2. Try to get from form's action URL (some themes include handle in action)
+          var formAction = form.action || '';
+          var actionMatch = formAction.match(/\/products\/([^\/\?#]+)/);
+          if (actionMatch) {
+            productHandle = actionMatch[1];
+            } else {
+              // 3. Try to get from data attributes on form or button
+              var formHandle = form.getAttribute('data-product-handle') || form.getAttribute('data-handle');
+              var buttonHandle = form.querySelector('button[data-product-handle], button[data-handle]');
+              if (formHandle) {
+                productHandle = formHandle;
+              } else if (buttonHandle) {
+                productHandle = buttonHandle.getAttribute('data-product-handle') || buttonHandle.getAttribute('data-handle');
+              } else {
+                // 4. Try to get from nearby product links/cards (results page cards have data-product-handle)
+                var productCard = form.closest('[data-product-handle], a[href*="/products/"]');
+                if (productCard) {
+                  var cardHandle = productCard.getAttribute('data-product-handle');
+                  if (cardHandle) {
+                    productHandle = cardHandle;
+                  } else {
+                    var match = productCard.href ? productCard.href.match(/\/products\/([^\/\?#]+)/) : null;
+                    if (match) productHandle = match[1];
+                  }
+                } else {
+                  // Try finding link in parent containers
+                  var parent = form.parentElement;
+                  while (parent && !productCard && parent !== document.body) {
+                    productCard = parent.querySelector('[data-product-handle], a[href*="/products/"]');
+                    if (productCard) {
+                      var cardHandle = productCard.getAttribute('data-product-handle');
+                      if (cardHandle) {
+                        productHandle = cardHandle;
+                        break;
+                      } else if (productCard.href) {
+                        var match = productCard.href.match(/\/products\/([^\/\?#]+)/);
+                        if (match) {
+                          productHandle = match[1];
+                          break;
+                        }
+                      }
+                    }
+                    parent = parent.parentElement;
+                  }
+                }
+                
+                // 5. Check sessionStorage for ATC handle (stored when button was clicked)
+                if (!productHandle) {
+                  try {
+                    var atcHandle = sessionStorage.getItem('editmuse_atc_handle');
+                    if (atcHandle) {
+                      var atcData = JSON.parse(atcHandle);
+                      // Only use if stored within last 30 seconds (very recent)
+                      if (atcData && atcData.handle && atcData.at && (Date.now() - atcData.at) < 30000) {
+                        productHandle = atcData.handle;
+                      }
+                    }
+                  } catch (e) {}
+                }
+                
+                // 6. Final fallback: check sessionStorage for last clicked product (from results page)
+                if (!productHandle) {
+                  try {
+                    var lastClick = sessionStorage.getItem('editmuse_last_click');
+                    if (lastClick) {
+                      var lastClickData = JSON.parse(lastClick);
+                      // Only use if clicked within last 5 minutes (to avoid stale data)
+                      if (lastClickData && lastClickData.handle && lastClickData.at && (Date.now() - lastClickData.at) < 300000) {
+                        productHandle = lastClickData.handle;
+                      }
+                    }
+                  } catch (e) {}
+                }
               }
             }
-            if (productLink) {
-              var match = productLink.href.match(/\/products\/([^\/\?#]+)/);
-              if (match) productHandle = match[1];
-            }
-          }
         }
       } catch (e) {}
 
@@ -978,12 +1094,54 @@ function escapeHtml(text) {
         var options = arguments[1] || {};
         
         if (typeof url === 'string' && (url.indexOf('/cart/add') !== -1 || url.indexOf('/cart/add.js') !== -1)) {
-          // Extract product handle from current page URL (if on product page)
+          // Extract product handle from multiple sources (results page, product page, sessionStorage)
           var productHandle = null;
           try {
+            // 1. Try to extract from current page URL (most reliable on product pages)
             var urlMatch = window.location.pathname.match(/\/products\/([^\/\?#]+)/);
             if (urlMatch) {
               productHandle = urlMatch[1];
+            } else {
+              // 2. Try to extract from fetch URL (some themes include handle in URL)
+              var fetchUrlMatch = url.match(/\/products\/([^\/\?#]+)/);
+              if (fetchUrlMatch) {
+                productHandle = fetchUrlMatch[1];
+              } else {
+                // 3. Try to get from request body (if it contains product ID/handle)
+                if (options.body) {
+                  try {
+                    var bodyData = typeof options.body === 'string' ? JSON.parse(options.body) : options.body;
+                    if (bodyData && bodyData.id) {
+                      // If we have product ID, we can't get handle directly, but we can check sessionStorage
+                    }
+                  } catch (e) {}
+                }
+                // 4. Check sessionStorage for ATC handle (stored when button was clicked)
+                try {
+                  var atcHandle = sessionStorage.getItem('editmuse_atc_handle');
+                  if (atcHandle) {
+                    var atcData = JSON.parse(atcHandle);
+                    // Only use if stored within last 30 seconds (very recent)
+                    if (atcData && atcData.handle && atcData.at && (Date.now() - atcData.at) < 30000) {
+                      productHandle = atcData.handle;
+                    }
+                  }
+                } catch (e) {}
+                
+                // 5. Final fallback: check sessionStorage for last clicked product (from results page)
+                if (!productHandle) {
+                  try {
+                    var lastClick = sessionStorage.getItem('editmuse_last_click');
+                    if (lastClick) {
+                      var lastClickData = JSON.parse(lastClick);
+                      // Only use if clicked within last 5 minutes (to avoid stale data)
+                      if (lastClickData && lastClickData.handle && lastClickData.at && (Date.now() - lastClickData.at) < 300000) {
+                        productHandle = lastClickData.handle;
+                      }
+                    }
+                  } catch (e) {}
+                }
+              }
             }
           } catch (e) {}
           

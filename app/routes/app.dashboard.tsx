@@ -381,9 +381,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   // Calculate performance metrics
   const sessionsWithResults = sessions.filter((s) => s.result).length;
-  const avgResultsPerSession = sessionsCount > 0 ? resultsGenerated / sessionsCount : 0;
+  // Avg Results per Session = total number of products returned / total sessions
+  const totalResultsCount = sessions
+    .filter((s) => s.result && s.resultCount)
+    .reduce((sum, s) => sum + (s.resultCount || 0), 0);
+  const avgResultsPerSession = sessionsCount > 0 ? totalResultsCount / sessionsCount : 0;
   const sessionCompletionRate = sessionsCount > 0 ? (sessionsWithResults / sessionsCount) * 100 : 0;
-  const avgClicksPerResult = resultsGenerated > 0 ? productClicked / resultsGenerated : 0;
+  // Avg Clicks per Result = total clicks / total products returned (not result sets)
+  const avgClicksPerResult = totalResultsCount > 0 ? productClicked / totalResultsCount : 0;
 
   const data: DashboardData = {
     shopDomain: shop.domain,

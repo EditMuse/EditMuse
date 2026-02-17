@@ -10134,6 +10134,10 @@ async function processSessionInBackground({
       // Store per-item pools for bundle AI candidate selection (accessible in bundle AI block)
       let itemGatedPools: Array<{ itemIndex: number; candidates: EnrichedCandidate[]; hardTerms: string[] }> = [];
       
+      // CATEGORY CONTEXT DETECTION: Detect bundle category context (accessible in both bundle processing and validation blocks)
+      // Industry-agnostic: If all bundle items are in the same category, filter out products from other categories
+      let bundleCategoryContext: string | null = null;
+      
       // BM25 timing: start before bundle/single-item split (bundle path does its own BM25)
       let bm25Start = performance.now();
       
@@ -10141,6 +10145,40 @@ async function processSessionInBackground({
         // BUNDLE PATH: Handle multi-item queries
         isBundleMode = true;
         console.log("[Bundle] [Layer 3] Processing bundle with", bundleIntent.items.length, "items");
+        
+        // CATEGORY CONTEXT DETECTION: Detect bundle category context once for all items
+        // Industry-agnostic: If all bundle items are in the same category, filter out products from other categories
+        if (bundleIntent.items.length > 1) {
+          // Category mapping (industry-agnostic)
+          const categoryMap: Record<string, string[]> = {
+            fashion: ["suit", "dress", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "hoodie", "t-shirt", "tshirt", "shorts", "skirt", "blouse", "polo", "tank", "blazer", "cardigan", "vest", "jumpsuit", "romper", "trousers", "chinos", "sweatpants", "leggings", "activewear", "athleisure", "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper", "hat", "cap", "scarf", "gloves", "bag", "backpack", "wallet", "jewelry", "necklace", "ring", "earring", "bracelet"],
+            beauty: ["serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner", "perfume", "cologne", "shampoo", "conditioner", "body wash", "soap", "lotion", "cream", "sunscreen", "makeup", "concealer", "blush", "bronzer", "highlighter", "eyeshadow", "lip balm", "nail polish", "skincare", "anti-aging", "exfoliant", "essence", "ampoule", "sheet mask"],
+            home: ["sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug", "lamp", "vase", "mirror", "shelf", "cabinet", "drawer", "plant", "lawn mower", "mower", "shed", "fence", "garden tool", "watering can", "pot", "planter", "outdoor furniture", "coffee table", "dining table", "side table", "end table", "bookshelf", "wardrobe", "dresser", "nightstand", "dining chair", "office chair", "armchair", "recliner", "ottoman", "bench", "stool", "throw pillow", "cushion", "comforter", "duvet", "bedding", "bed sheet", "towel", "bath mat", "wall art", "picture frame", "decor", "candle", "diffuser", "plant pot", "garden planter"],
+            health: ["treadmill", "dumbbell", "yoga mat", "resistance band", "exercise bike", "rowing machine", "elliptical", "supplement", "vitamin", "protein", "probiotic", "omega", "multivitamin", "fish oil", "collagen supplement", "massage gun", "foam roller", "kettlebell", "barbell", "weight", "fitness tracker", "smart scale", "essential oil", "aromatherapy", "meditation cushion", "yoga block", "pilates ball"],
+            electronics: ["phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch", "monitor", "keyboard", "mouse", "printer", "router", "charger", "cable"],
+          };
+          
+          // Detect categories for all bundle items
+          const itemCategories: string[] = [];
+          for (let otherIdx = 0; otherIdx < bundleIntent.items.length; otherIdx++) {
+            const otherItem = bundleItemsWithBudget[otherIdx];
+            const otherItemType = ((otherItem as any).canonicalType || otherItem.hardTerms[0] || "").toLowerCase();
+            
+            // Find which category this item belongs to
+            for (const [category, items] of Object.entries(categoryMap)) {
+              if (items.some(item => otherItemType.includes(item) || item.includes(otherItemType))) {
+                itemCategories.push(category);
+                break;
+              }
+            }
+          }
+          
+          // If all items are in the same category, use that as context
+          if (itemCategories.length > 0 && itemCategories.every(cat => cat === itemCategories[0])) {
+            bundleCategoryContext = itemCategories[0];
+            console.log(`[Bundle] category_context detected=${bundleCategoryContext} from_items=[${bundleIntent.items.map((item, idx) => ((bundleItemsWithBudget[idx] as any).canonicalType || item.hardTerms[0])).join(", ")}]`);
+          }
+        }
         
         // Gate candidates per item
         itemGatedPools = [];
@@ -10508,40 +10546,7 @@ async function processSessionInBackground({
             }
           }
           
-          // CATEGORY CONTEXT DETECTION: Use bundle context to understand category alignment
-          // Industry-agnostic: If all bundle items are in the same category, filter out products from other categories
-          let bundleCategoryContext: string | null = null;
-          if (bundleIntent.items.length > 1) {
-            // Category mapping (industry-agnostic)
-            const categoryMap: Record<string, string[]> = {
-              fashion: ["suit", "dress", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "hoodie", "t-shirt", "tshirt", "shorts", "skirt", "blouse", "polo", "tank", "blazer", "cardigan", "vest", "jumpsuit", "romper", "trousers", "chinos", "sweatpants", "leggings", "activewear", "athleisure", "shoe", "boot", "sneaker", "sandals", "flip flop", "slipper", "hat", "cap", "scarf", "gloves", "bag", "backpack", "wallet", "jewelry", "necklace", "ring", "earring", "bracelet"],
-              beauty: ["serum", "moisturizer", "cleanser", "toner", "face mask", "lipstick", "foundation", "mascara", "eyeliner", "perfume", "cologne", "shampoo", "conditioner", "body wash", "soap", "lotion", "cream", "sunscreen", "makeup", "concealer", "blush", "bronzer", "highlighter", "eyeshadow", "lip balm", "nail polish", "skincare", "anti-aging", "exfoliant", "essence", "ampoule", "sheet mask"],
-              home: ["sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug", "lamp", "vase", "mirror", "shelf", "cabinet", "drawer", "plant", "lawn mower", "mower", "shed", "fence", "garden tool", "watering can", "pot", "planter", "outdoor furniture", "coffee table", "dining table", "side table", "end table", "bookshelf", "wardrobe", "dresser", "nightstand", "dining chair", "office chair", "armchair", "recliner", "ottoman", "bench", "stool", "throw pillow", "cushion", "comforter", "duvet", "bedding", "bed sheet", "towel", "bath mat", "wall art", "picture frame", "decor", "candle", "diffuser", "plant pot", "garden planter"],
-              health: ["treadmill", "dumbbell", "yoga mat", "resistance band", "exercise bike", "rowing machine", "elliptical", "supplement", "vitamin", "protein", "probiotic", "omega", "multivitamin", "fish oil", "collagen supplement", "massage gun", "foam roller", "kettlebell", "barbell", "weight", "fitness tracker", "smart scale", "essential oil", "aromatherapy", "meditation cushion", "yoga block", "pilates ball"],
-              electronics: ["phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch", "monitor", "keyboard", "mouse", "printer", "router", "charger", "cable"],
-            };
-            
-            // Detect categories for all bundle items
-            const itemCategories: string[] = [];
-            for (let otherIdx = 0; otherIdx < bundleIntent.items.length; otherIdx++) {
-              const otherItem = bundleItemsWithBudget[otherIdx];
-              const otherItemType = ((otherItem as any).canonicalType || otherItem.hardTerms[0] || "").toLowerCase();
-              
-              // Find which category this item belongs to
-              for (const [category, items] of Object.entries(categoryMap)) {
-                if (items.some(item => otherItemType.includes(item) || item.includes(otherItemType))) {
-                  itemCategories.push(category);
-                  break;
-                }
-              }
-            }
-            
-            // If all items are in the same category, use that as context
-            if (itemCategories.length > 0 && itemCategories.every(cat => cat === itemCategories[0])) {
-              bundleCategoryContext = itemCategories[0];
-              console.log(`[Bundle] category_context detected=${bundleCategoryContext} from_items=[${bundleIntent.items.map((item, idx) => ((bundleItemsWithBudget[idx] as any).canonicalType || item.hardTerms[0])).join(", ")}]`);
-            }
-          }
+          // bundleCategoryContext is now defined at bundle level (before the loop)
           
           // PRODUCTTYPE FILTERING: Infer productType filter for canonicalType (industry-agnostic)
           let itemGatedWithProductType = itemGatedUnfiltered;
@@ -11131,7 +11136,7 @@ async function processSessionInBackground({
                   reasoningText = `I've curated a perfect pairing of ${itemNames[0]} and ${itemNames[1]} that complement each other beautifully.`;
                 } else if (itemNames.length === 3) {
                   reasoningText = `I've put together a complete ${itemNames[0]}, ${itemNames[1]}, and ${itemNames[2]} combination that works seamlessly together.`;
-                } else {
+              } else {
                   reasoningText = `I've selected a carefully curated bundle of ${itemNames.slice(0, -1).join(", ")}, and ${itemNames[itemNames.length - 1]} that work perfectly together.`;
                 }
               }
@@ -12964,6 +12969,60 @@ async function processSessionInBackground({
                   if (itemGenericConstraints.length > 0) {
                     const constraintResult = await satisfiesConstraintsStructuredOrTags(c, itemGenericConstraints, facetVocabulary);
                     if (!constraintResult.ok) continue;
+                  }
+                  
+                  // CATEGORY CONTEXT FILTER: Apply category guard during refill (industry-agnostic)
+                  if (bundleCategoryContext) {
+                    const candidateProductType = c.productType ? String(c.productType).trim() : "";
+                    const candidateTitle = (c.title || "").toLowerCase();
+                    const candidateHandle = (c.handle || "").toLowerCase();
+                    const candidateText = `${candidateProductType} ${candidateTitle} ${candidateHandle}`.toLowerCase();
+                    
+                    // Category exclusion patterns (industry-agnostic)
+                    const categoryExclusions: Record<string, string[]> = {
+                      fashion: ["nail polish", "top coat", "base coat", "gel", "lacquer", "beauty", "cosmetics", "skincare", "makeup", "serum", "moisturizer", "cleanser", "toner", "pet food", "dog", "cat", "animal", "veterinary"],
+                      beauty: ["suit", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "dress", "clothing", "apparel", "fashion", "pet food", "dog", "cat", "animal", "veterinary"],
+                      home: ["nail polish", "top coat", "base coat", "gel", "lacquer", "beauty", "cosmetics", "skincare", "makeup", "suit", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "dress", "clothing", "apparel", "fashion", "pet food", "dog", "cat", "animal", "veterinary"],
+                      health: ["nail polish", "top coat", "base coat", "gel", "lacquer", "beauty", "cosmetics", "skincare", "makeup", "suit", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "dress", "clothing", "apparel", "fashion", "pet food", "dog", "cat", "animal", "veterinary"],
+                      electronics: ["nail polish", "top coat", "base coat", "gel", "lacquer", "beauty", "cosmetics", "skincare", "makeup", "suit", "shirt", "pants", "jeans", "jacket", "coat", "sweater", "dress", "clothing", "apparel", "fashion", "pet food", "dog", "cat", "animal", "veterinary"],
+                    };
+                    
+                    const exclusions = categoryExclusions[bundleCategoryContext] || [];
+                    // Check if candidate text contains exclusion terms (strong signal it's wrong category)
+                    const hasExclusionTerm = exclusions.some(exclusion => 
+                      candidateText.includes(exclusion.toLowerCase())
+                    );
+                    
+                    if (hasExclusionTerm) {
+                      // Additional check: if productType also contains exclusion term, definitely exclude
+                      const productTypeHasExclusion = exclusions.some(exclusion => 
+                        candidateProductType.toLowerCase().includes(exclusion.toLowerCase())
+                      );
+                      
+                      if (productTypeHasExclusion) {
+                        continue; // Definitely wrong category - skip this candidate
+                      }
+                      
+                      // If only title/handle has exclusion but productType doesn't, check if productType aligns with category
+                      // For fashion category, productType should contain fashion-related terms
+                      const categoryIndicators: Record<string, string[]> = {
+                        fashion: ["shirt", "suit", "jacket", "coat", "dress", "pants", "jeans", "blazer", "sweater", "apparel", "clothing", "fashion", "outerwear", "trench", "overcoat"],
+                        beauty: ["nail", "polish", "top coat", "base coat", "gel", "lacquer", "beauty", "cosmetics", "skincare", "makeup", "serum", "moisturizer", "cleanser", "toner"],
+                        home: ["furniture", "sofa", "couch", "chair", "table", "desk", "bed", "mattress", "pillow", "blanket", "curtain", "rug", "lamp", "vase", "mirror", "shelf", "cabinet", "drawer"],
+                        health: ["fitness", "exercise", "yoga", "supplement", "vitamin", "protein", "probiotic", "treadmill", "dumbbell", "resistance", "band"],
+                        electronics: ["phone", "laptop", "tablet", "headphone", "speaker", "camera", "watch", "smartwatch", "monitor", "keyboard", "mouse", "printer", "router", "charger", "cable"],
+                      };
+                      
+                      const indicators = categoryIndicators[bundleCategoryContext] || [];
+                      const hasCategoryIndicator = indicators.some(indicator => 
+                        candidateProductType.toLowerCase().includes(indicator.toLowerCase())
+                      );
+                      
+                      // If productType doesn't have category indicator, exclude (wrong category)
+                      if (!hasCategoryIndicator) {
+                        continue; // Wrong category - skip this candidate
+                      }
+                    }
                   }
                   
                   itemPool.push(c);
@@ -15006,25 +15065,25 @@ async function processSessionInBackground({
       // Update reasoning with final delivered count (only if different from requested)
       // Use human-like, sales representative language (but only if not already handled by handleBundleReasoning)
       if (!isBundleModeForReasoning || !bundleGroupedResult) {
-        if (deliveredCountFinal < requestedCountFinal) {
+      if (deliveredCountFinal < requestedCountFinal) {
           // Explain why fewer results in a natural, helpful way
-          let whyFewer = "";
-          if (isBundleModeForReasoning) {
+        let whyFewer = "";
+        if (isBundleModeForReasoning) {
             // Bundle-specific reasons (sales representative style)
-            if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
               whyFewer = "I've selected the best options that fit within your budget while maintaining quality.";
-            } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
               whyFewer = "I've curated the best available in-stock options for your bundle.";
-            } else {
-              whyFewer = "I've handpicked the finest options available for each item in your bundle.";
-            }
           } else {
+              whyFewer = "I've handpicked the finest options available for each item in your bundle.";
+          }
+        } else {
             // Single-item reasons (sales representative style)
-            if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
+          if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
               whyFewer = "I've selected the best options that fit within your budget.";
-            } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
+          } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
               whyFewer = "I've curated the best in-stock options available.";
-            } else {
+          } else {
               whyFewer = "I've handpicked the finest options that match your preferences.";
             }
           }
@@ -15037,7 +15096,7 @@ async function processSessionInBackground({
             // For small differences, just add the explanation without mentioning count
             finalReasoningToSave += ` ${whyFewer}`;
           }
-        } else if (deliveredCountFinal === requestedCountFinal && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
+      } else if (deliveredCountFinal === requestedCountFinal && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
           // Budget was exceeded - use natural language
           finalReasoningToSave += ` I've expanded the selection slightly to give you more great options to choose from.`;
         }
