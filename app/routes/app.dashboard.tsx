@@ -43,7 +43,6 @@ type DashboardData = {
   performanceMetrics: {
     avgResultsPerSession: number;
     sessionCompletionRate: number;
-    avgClicksPerResult: number;
   };
   funnel: Array<{
     step: string;
@@ -144,11 +143,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       step: "Product Clicked",
       count: productClicked,
     },
-    {
-      step: "Add to Cart",
-      count: addToCartClicked,
-    },
-    // Note: Checkout Started and Order metrics removed for PCD Level 0 compliance
+    // Note: Add to Cart, Checkout Started and Order metrics removed for PCD Level 0 compliance
   ];
 
   const funnel = funnelSteps.map((step, index) => {
@@ -413,7 +408,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     performanceMetrics: {
       avgResultsPerSession,
       sessionCompletionRate,
-      avgClicksPerResult,
     },
     funnel,
     topQueries,
@@ -838,16 +832,16 @@ export default function DashboardPage() {
               <button
                 onClick={handleExportCSV}
                 disabled={isExporting}
-                style={{
-                  padding: "0.625rem 1.25rem",
+              style={{
+                padding: "0.625rem 1.25rem",
                   background: isExporting ? "#9CA3AF" : "#7C3AED",
-                  border: "none",
-                  borderRadius: "8px",
-                  color: "#FFFFFF",
-                  textDecoration: "none",
-                  fontWeight: "500",
-                  fontSize: "0.875rem",
-                  display: "inline-block",
+                border: "none",
+                borderRadius: "8px",
+                color: "#FFFFFF",
+                textDecoration: "none",
+                fontWeight: "500",
+                fontSize: "0.875rem",
+                display: "inline-block",
                   cursor: isExporting ? "not-allowed" : "pointer",
                   transition: "all 0.2s",
                 }}
@@ -868,8 +862,8 @@ export default function DashboardPage() {
               >
                 {isExporting ? "Exporting..." : "Export CSV"}
               </button>
+              </div>
             </div>
-          </div>
 
           {/* KPI Cards */}
           <div
@@ -899,14 +893,14 @@ export default function DashboardPage() {
                 Sessions
               </div>
               <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
-                <div
-                  style={{
-                    fontSize: "1.5rem",
-                    fontWeight: "bold",
-                    color: "#7C3AED",
-                  }}
-                >
-                  {data.metrics.sessions.toLocaleString()}
+              <div
+                style={{
+                  fontSize: "1.5rem",
+                  fontWeight: "bold",
+                  color: "#7C3AED",
+                }}
+              >
+                {data.metrics.sessions.toLocaleString()}
                 </div>
                 {(() => {
                   const change = calculateChange(data.metrics.sessions, data.previousPeriodMetrics.sessions);
@@ -949,14 +943,14 @@ export default function DashboardPage() {
                 Results Generated
               </div>
               <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
-                <div
-                  style={{
-                    fontSize: "1.5rem",
-                    fontWeight: "bold",
-                    color: "#06B6D4",
-                  }}
-                >
-                  {data.metrics.resultsGenerated.toLocaleString()}
+              <div
+                style={{
+                  fontSize: "1.5rem",
+                  fontWeight: "bold",
+                  color: "#06B6D4",
+                }}
+              >
+                {data.metrics.resultsGenerated.toLocaleString()}
                 </div>
                 {(() => {
                   const change = calculateChange(data.metrics.resultsGenerated, data.previousPeriodMetrics.resultsGenerated);
@@ -999,15 +993,15 @@ export default function DashboardPage() {
                 Product Clicks
               </div>
               <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
-                <div
-                  style={{
-                    fontSize: "1.5rem",
-                    fontWeight: "bold",
-                    color: "#0B0B0F",
-                  }}
-                >
-                  {data.metrics.productClicked.toLocaleString()}
-                </div>
+              <div
+                style={{
+                  fontSize: "1.5rem",
+                  fontWeight: "bold",
+                  color: "#0B0B0F",
+                }}
+              >
+                {data.metrics.productClicked.toLocaleString()}
+              </div>
                 {(() => {
                   const change = calculateChange(data.metrics.productClicked, data.previousPeriodMetrics.productClicked);
                   if (change) {
@@ -1023,57 +1017,7 @@ export default function DashboardPage() {
                         }}
                       >
                         {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
-                      </div>
-                    );
-                  }
-                  return null;
-                })()}
-              </div>
             </div>
-            <div
-              style={{
-                padding: "1rem",
-                backgroundColor: "#FFFFFF",
-                border: "1px solid rgba(11,11,15,0.12)",
-                borderRadius: "12px",
-                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "0.875rem",
-                  color: "rgba(11,11,15,0.62)",
-                  marginBottom: "0.25rem",
-                }}
-              >
-                Add to Cart
-              </div>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
-                <div
-                  style={{
-                    fontSize: "1.5rem",
-                    fontWeight: "bold",
-                    color: "#0B0B0F",
-                  }}
-                >
-                  {data.metrics.addToCartClicked.toLocaleString()}
-                </div>
-                {(() => {
-                  const change = calculateChange(data.metrics.addToCartClicked, data.previousPeriodMetrics.addToCartClicked);
-                  if (change) {
-                    return (
-                      <div
-                        style={{
-                          fontSize: "0.75rem",
-                          color: change.isPositive ? "#10B981" : "#EF4444",
-                          fontWeight: "500",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "0.25rem",
-                        }}
-                      >
-                        {change.isPositive ? "↑" : "↓"} {change.value.toFixed(1)}%
-                      </div>
                     );
                   }
                   return null;
@@ -1145,34 +1089,6 @@ export default function DashboardPage() {
                 }}
               >
                 {data.performanceMetrics.sessionCompletionRate.toFixed(1)}%
-              </div>
-            </div>
-            <div
-              style={{
-                padding: "1rem",
-                backgroundColor: "#FFFFFF",
-                border: "1px solid rgba(11,11,15,0.12)",
-                borderRadius: "12px",
-                boxShadow: "0 2px 8px rgba(124, 58, 237, 0.1)",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "0.875rem",
-                  color: "rgba(11,11,15,0.62)",
-                  marginBottom: "0.25rem",
-                }}
-              >
-                Avg Clicks per Result
-              </div>
-              <div
-                style={{
-                  fontSize: "1.25rem",
-                  fontWeight: "bold",
-                  color: "#0B0B0F",
-                }}
-              >
-                {data.performanceMetrics.avgClicksPerResult.toFixed(2)}
               </div>
             </div>
           </div>
@@ -1278,8 +1194,8 @@ export default function DashboardPage() {
           {/* Top Queries Table */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
             <h2 style={{ margin: 0, color: "#0B0B0F" }}>
-              Top Queries
-            </h2>
+            Top Queries
+          </h2>
             {isLoading && <LoadingSkeleton width="100px" height="1.5rem" />}
           </div>
           <div
@@ -1380,7 +1296,7 @@ export default function DashboardPage() {
                   <button
                     onClick={() => setTopQueriesPage(p => Math.max(1, p - 1))}
                     disabled={topQueriesPage === 1}
-                    style={{
+                        style={{
                       padding: "0.5rem 1rem",
                       background: topQueriesPage === 1 ? "#F9FAFB" : "#FFFFFF",
                       border: "1px solid rgba(11,11,15,0.12)",
@@ -1398,7 +1314,7 @@ export default function DashboardPage() {
                   <button
                     onClick={() => setTopQueriesPage(p => Math.min(totalQueriesPages, p + 1))}
                     disabled={topQueriesPage === totalQueriesPages}
-                    style={{
+                        style={{
                       padding: "0.5rem 1rem",
                       background: topQueriesPage === totalQueriesPages ? "#F9FAFB" : "#FFFFFF",
                       border: "1px solid rgba(11,11,15,0.12)",
