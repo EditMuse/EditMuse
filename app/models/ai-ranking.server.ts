@@ -2210,13 +2210,54 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             }
           }
           
-          // Check avoidTerms
+          // Check avoidTerms with normalization (handle misspellings and plural/singular)
           if (finalAvoidTerms.length > 0) {
-            const hasAvoidTerm = finalAvoidTerms.some(avoid =>
-              candidateText.includes(avoid.toLowerCase())
-            );
+            // Normalize avoid terms to handle misspellings and plural/singular variations
+            const normalizeAvoidTerm = (term: string): string[] => {
+              const normalized = term.toLowerCase().trim();
+              const variants: string[] = [normalized];
+              
+              // Handle common misspellings (industry-agnostic)
+              const misspellings: Record<string, string> = {
+                "paterns": "patterns",
+                "patern": "pattern",
+                "pater": "pattern",
+              };
+              
+              if (misspellings[normalized]) {
+                variants.push(misspellings[normalized]);
+              }
+              
+              // Handle plural/singular variations (industry-agnostic)
+              if (normalized.endsWith("s") && normalized.length > 1) {
+                variants.push(normalized.slice(0, -1)); // Remove 's' for singular
+              } else if (normalized.length > 1) {
+                variants.push(normalized + "s"); // Add 's' for plural
+                if (/[sxz]$/.test(normalized) || /[ch]sh$/.test(normalized)) {
+                  variants.push(normalized + "es"); // Add 'es' for certain endings
+                }
+              }
+              
+              return Array.from(new Set(variants));
+            };
+            
+            // Build normalized avoid term set
+            const avoidTermVariants = new Set<string>();
+            for (const avoidTerm of finalAvoidTerms) {
+              const variants = normalizeAvoidTerm(avoidTerm);
+              for (const variant of variants) {
+                avoidTermVariants.add(variant);
+              }
+            }
+            
+            // Check if candidate contains any avoid term variant (using word boundary matching)
+            const hasAvoidTerm = Array.from(avoidTermVariants).some(avoidVariant => {
+              const pattern = new RegExp(`\\b${avoidVariant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+              return pattern.test(candidateText);
+            });
+            
             if (hasAvoidTerm) {
-              console.warn(`[AI Ranking] Skipping ${handle} - contains avoidTerm`);
+              console.warn(`[AI Ranking] Skipping ${handle} - contains avoidTerm variant`);
               continue;
             }
           }
@@ -2261,9 +2302,14 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
               .slice(0, resultCount);
             
             if (aiHandles.length > 0) {
+              // Use AI's reasoning if available, otherwise create human-like fallback
+              let fallbackReasoning = singleItemResult.selected[0]?.reason;
+              if (!fallbackReasoning || fallbackReasoning.trim().length < 10) {
+                fallbackReasoning = "I've handpicked these options based on your preferences.";
+              }
               return {
                 selectedHandles: aiHandles,
-                reasoning: singleItemResult.selected[0]?.reason || "Selected based on your preferences.",
+                reasoning: cleanReasoning(fallbackReasoning) || fallbackReasoning,
                 trustFallback: true,
                 source: "ai",
                 parseFailReason: "Validation failed but using AI selections",
@@ -2307,23 +2353,27 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
             // All items have reasons, so the AI feedback is comprehensive
             // No need to add generic summary
           } else if (trustFallback && hardTerms.length > 0) {
-            // Add context about alternatives if trustFallback
-            reasoning = `Showing closest matches to "${hardTerms.join(", ")}". ${reasoning}`;
+            // Add context about alternatives if trustFallback (sales representative style)
+            const termsText = hardTerms.slice(0, 3).join(", ");
+            reasoning = `I've found the closest matches to "${termsText}". ${reasoning}`;
           }
         } else {
           // Fallback to summary if AI didn't provide reasons (shouldn't happen with structured output)
+          // Use human-like, sales representative language
       if (!trustFallback && hardTerms.length > 0) {
         const matchedTerms = [...new Set(validSelectedItems.flatMap(item => item.evidence?.matchedHardTerms || []))];
+        const primaryTerms = matchedTerms.slice(0, 2).join(" and ");
         const facetParts: string[] = [];
-        if (hardFacetsForPrompt.size) facetParts.push(`size: ${hardFacetsForPrompt.size.join(", ")}`);
-        if (hardFacetsForPrompt.color) facetParts.push(`color: ${hardFacetsForPrompt.color.join(", ")}`);
-        if (hardFacetsForPrompt.material) facetParts.push(`material: ${hardFacetsForPrompt.material.join(", ")}`);
-            const facetsText = facetParts.length > 0 ? ` with ${facetParts.join(", ")}` : "";
-            reasoning = `Selected products matching ${matchedTerms.join(", ")}${facetsText}.`;
+        if (hardFacetsForPrompt.size) facetParts.push(hardFacetsForPrompt.size.join(" or "));
+        if (hardFacetsForPrompt.color) facetParts.push(hardFacetsForPrompt.color.join(" or "));
+        if (hardFacetsForPrompt.material) facetParts.push(hardFacetsForPrompt.material.join(" or "));
+            const facetsText = facetParts.length > 0 ? ` in ${facetParts.join(", ")}` : "";
+            reasoning = `I've curated a selection of ${primaryTerms}${facetsText} that perfectly match what you're looking for.`;
       } else if (trustFallback && hardTerms.length > 0) {
-        reasoning = `No exact matches found for "${hardTerms.join(", ")}"; showing closest alternatives.`;
+        const termsText = hardTerms.slice(0, 2).join(" and ");
+        reasoning = `I couldn't find exact matches for "${termsText}", but I've selected the closest alternatives that I think you'll love.`;
       } else {
-            reasoning = "Selected products based on your preferences.";
+            reasoning = "I've handpicked these options based on your preferences and what I think would work best for you.";
           }
       }
       
@@ -2572,7 +2622,7 @@ Return ONLY the JSON object matching the schema - no markdown, no prose outside 
     fallbackResult.selectedHandles = fallbackCandidatesToUse
       .slice(0, Math.min(resultCount, fallbackCandidatesToUse.length))
       .map(c => c.handle);
-    fallbackResult.reasoning = "Showing the best available matches for your request.";
+    fallbackResult.reasoning = "I've selected the best available options that match your request.";
     console.log(`[AI Ranking] ✅ Absolute fallback applied: ${fallbackResult.selectedHandles.length} products`);
   }
   

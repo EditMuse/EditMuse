@@ -23,9 +23,16 @@ export function cleanReasoning(text: string | null | undefined): string {
   // Remove sentence fragments that don't make sense
   cleaned = cleaned.replace(/\b(handle|score|label|itemIndex|productId|id):\s*\w+/gi, "");
   
+  // Remove BUNDLE_GROUPED JSON metadata first (before other cleaning)
+  cleaned = cleaned.replace(/\[BUNDLE_GROUPED:[^\]]+\]/g, "");
+  
   // Remove JSON-like structures
   cleaned = cleaned.replace(/\{[^}]*\}/g, "");
   cleaned = cleaned.replace(/\[[^\]]*\]/g, "");
+  
+  // Remove technical count messages (e.g., "Showing 15 results (requested 16)")
+  cleaned = cleaned.replace(/\b(showing|showed)\s+\d+\s+(results?|products?|items?)\s*\([^)]*requested[^)]*\)/gi, "");
+  cleaned = cleaned.replace(/\b(requested|delivered)\s+\d+/gi, "");
   
   // Remove excessive punctuation
   cleaned = cleaned.replace(/[!]{2,}/g, "!");

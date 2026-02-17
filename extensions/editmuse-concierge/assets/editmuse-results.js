@@ -452,11 +452,14 @@ function escapeHtml(text) {
   return div.innerHTML;
   }
 
-  // Clean and format reasoning text for better presentation
+  // Clean and format reasoning text for better presentation (sales representative style)
   function cleanReasoningText(text) {
     if (!text || !text.trim()) return '';
     
     var cleaned = text.trim();
+    
+    // Remove BUNDLE_GROUPED JSON metadata first (before other cleaning)
+    cleaned = cleaned.replace(/\[BUNDLE_GROUPED:[^\]]+\]/g, '');
     
     // Remove technical jargon and prefixes
     cleaned = cleaned.replace(/^(reasoning|explanation|selection|rationale|note|summary):\s*/i, '');
@@ -465,6 +468,10 @@ function escapeHtml(text) {
     cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, '$1');
     cleaned = cleaned.replace(/\*(.*?)\*/g, '$1');
     cleaned = cleaned.replace(/`(.*?)`/g, '$1');
+    
+    // Remove JSON-like structures
+    cleaned = cleaned.replace(/\{[^}]*\}/g, '');
+    cleaned = cleaned.replace(/\[[^\]]*\]/g, '');
     
     // Remove incomplete sentences
     cleaned = cleaned.replace(/\s+[a-z]{1,3}\s*$/i, '');
@@ -482,7 +489,7 @@ function escapeHtml(text) {
     // Remove excessive whitespace
     cleaned = cleaned.replace(/\s+/g, ' ').trim();
     
-    // Remove redundant phrases
+    // Remove redundant phrases (make it sound more like a sales rep)
     cleaned = cleaned.replace(/\b(based on|according to|due to|because of)\s+(the\s+)?(user|shopper|customer|your)\s+(intent|query|request|preferences|needs|requirements)\s*,?\s*/gi, '');
     cleaned = cleaned.replace(/\b(these\s+)?(products?|items?|selections?)\s+(were|are|is)\s+(selected|chosen|picked)\s+(because|due to|based on)\s*/gi, '');
     cleaned = cleaned.replace(/\b(selected|chosen|picked)\s+(these\s+)?(products?|items?)\s+(because|due to|based on)\s*/gi, '');
@@ -490,6 +497,10 @@ function escapeHtml(text) {
     
     // Remove technical terms
     cleaned = cleaned.replace(/\b(handle|productId|itemIndex|score|label|exact|good|fallback|trustFallback|candidate|ranking|algorithm|model|ai|llm)\b/gi, '');
+    
+    // Remove count mentions that sound technical (e.g., "Showing 15 results (requested 16)")
+    cleaned = cleaned.replace(/\b(showing|showed)\s+\d+\s+(results?|products?|items?)\s*\([^)]*requested[^)]*\)/gi, '');
+    cleaned = cleaned.replace(/\b(requested|delivered)\s+\d+/gi, '');
     
     // Clean up fragments
     cleaned = cleaned.replace(/^[,\s\-]+|[,\s\-]+$/g, '');
@@ -556,10 +567,10 @@ function escapeHtml(text) {
       reasoningText += '<strong>Note:</strong> ';
       
       if (productCount && productCount > 0) {
-        reasoningText += 'We selected ' + productCount + ' product' + (productCount !== 1 ? 's' : '') + ' ';
-        reasoningText += 'from our catalog based on availability and popularity.';
+        reasoningText += 'I\'ve selected ' + productCount + ' product' + (productCount !== 1 ? 's' : '') + ' ';
+        reasoningText += 'from our collection that I think you\'ll love.';
       } else {
-        reasoningText += 'Products were selected from our catalog based on availability and popularity.';
+        reasoningText += 'I\'ve curated a selection from our collection that I think you\'ll love.';
       }
       
       reasoningText += '</div>';
@@ -591,24 +602,26 @@ function escapeHtml(text) {
       reasoningText = '<div class="editmuse-reasoning-detail">';
       reasoningText += '<strong>AI-Powered Selection:</strong> ';
       reasoningText += escapeHtml(cleanedReasoning);
-      if (productCount && productCount > 0 && cleanedReasoning.length < 100) {
-        // Only add the additional explanation if reasoning is short
-        reasoningText += ' These ' + productCount + ' product' + (productCount !== 1 ? 's were' : ' was') + ' ';
-        reasoningText += 'intelligently ranked and selected based on your quiz responses, preferences, and product attributes.';
+      // Don't add generic technical explanation - the AI reasoning should be sufficient
+      // Only add if reasoning is very short and needs context
+      if (cleanedReasoning.length < 30) {
+        reasoningText += ' I\'ve carefully selected these options based on your preferences.';
       }
       reasoningText += '</div>';
     } else {
-      // Normal mode without reasoning - provide default explanation
+      // Normal mode without reasoning - provide default explanation (sales representative style)
       if (productCount && productCount > 0) {
         reasoningText = '<div class="editmuse-reasoning-detail">';
-        reasoningText += 'These ' + productCount + ' product' + (productCount !== 1 ? 's were' : ' was') + ' ';
-        reasoningText += 'carefully selected based on your quiz responses and preferences. ';
-        reasoningText += 'Each recommendation matches the style, needs, and criteria you specified during the quiz.';
+        reasoningText += '<strong>AI-Powered Selection:</strong> ';
+        reasoningText += 'I\'ve handpicked ' + productCount + ' product' + (productCount !== 1 ? 's' : '') + ' ';
+        reasoningText += 'that I think perfectly match what you\'re looking for. ';
+        reasoningText += 'Each recommendation has been carefully chosen based on your preferences and needs.';
         reasoningText += '</div>';
       } else {
         reasoningText = '<div class="editmuse-reasoning-detail">';
-        reasoningText += 'These recommendations were selected based on your quiz responses and preferences. ';
-        reasoningText += 'Each product matches the style, needs, and criteria you specified.';
+        reasoningText += '<strong>AI-Powered Selection:</strong> ';
+        reasoningText += 'I\'ve curated these recommendations based on your preferences. ';
+        reasoningText += 'Each product has been carefully selected to match your style and needs.';
         reasoningText += '</div>';
       }
     }

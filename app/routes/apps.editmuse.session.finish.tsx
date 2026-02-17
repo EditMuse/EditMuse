@@ -137,12 +137,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (openaiApiKey) {
       // TODO: Call OpenAI API for intelligent ranking
       // For now, use deterministic selection
-      reasoning = "Selected based on your preferences and experience settings.";
+      reasoning = "I've handpicked these options based on your preferences and what I think would work best for you.";
       selectedProducts = products.slice(0, session.resultCount);
     } else {
       // Deterministic ranking (stub)
       console.log("[App Proxy] No OpenAI API key - using deterministic ranking");
-      reasoning = "Selected top products based on your preferences.";
+      reasoning = "I've curated the top products that best match your preferences.";
       selectedProducts = products.slice(0, session.resultCount);
     }
 

@@ -3913,7 +3913,12 @@ async function processSessionInBackground({
       "up", "down", "out", "off", "away", "back", "here", "there", "where", "everywhere", "nowhere",
       "some", "any", "all", "both", "each", "every", "few", "many", "most", "other", "such",
       "no", "not", "none", "nothing", "nobody", "nowhere", "never", "neither", "nor",
-      "less", "than", "more", "most", "least", "fewer", "greater"
+      "less", "than", "more", "most", "least", "fewer", "greater",
+      // Action verbs that should be filtered (industry-agnostic)
+      "want", "wants", "wanted", "needs", "needed", "need", "looking", "look", "looks", "get", "gets", "got",
+      "find", "finds", "found", "search", "searches", "searched", "buy", "buys", "bought", "purchase", "purchases",
+      "show", "shows", "showed", "give", "gives", "gave", "see", "sees", "saw", "prefer", "prefers", "preferred",
+      "like", "likes", "liked", "love", "loves", "loved"
     ]);
     
     // Remove budget-related words
@@ -3942,8 +3947,16 @@ async function processSessionInBackground({
       }
     }
     
-    // Return unique phrases, prioritizing shorter ones first
-    return Array.from(new Set(phrases)).sort((a, b) => a.length - b.length);
+    // Return unique phrases, prioritizing LONGER phrases first (product types are usually longer)
+    // This ensures "3 piece suit" is preferred over "want" or "piece"
+    return Array.from(new Set(phrases)).sort((a, b) => {
+      // First sort by length (longer first)
+      if (b.length !== a.length) {
+        return b.length - a.length;
+      }
+      // Then alphabetically
+      return a.localeCompare(b);
+    });
   }
   
   // Issue 2/3 fix: Parse per-item budgets from answers array BEFORE global budget resolution
@@ -4242,7 +4255,8 @@ async function processSessionInBackground({
             const itemTerms = extractItemTerms(itemPart);
             
             if (itemTerms.length > 0 && amount > 0) {
-              // Use the first (shortest) meaningful term as the primary itemType
+              // Use the first (longest) meaningful term as the primary itemType
+              // extractItemTerms now returns longer phrases first, so first item is the best match
               const primaryItemType = itemTerms[0];
               perItemBudgets.push({
                 itemType: primaryItemType,
@@ -4269,6 +4283,7 @@ async function processSessionInBackground({
             const itemTerms = extractItemTerms(itemPart);
             
             if (itemTerms.length > 0 && minAmount > 0 && maxAmount > 0 && minAmount <= maxAmount) {
+              // Use the first (longest) meaningful term as the primary itemType
               const primaryItemType = itemTerms[0];
               perItemBudgets.push({
                 itemType: primaryItemType,
@@ -4294,6 +4309,7 @@ async function processSessionInBackground({
             const itemTerms = extractItemTerms(itemPart);
             
             if (itemTerms.length > 0 && amount > 0) {
+              // Use the first (longest) meaningful term as the primary itemType
               const primaryItemType = itemTerms[0];
               perItemBudgets.push({
                 itemType: primaryItemType,
@@ -8825,6 +8841,78 @@ async function processSessionInBackground({
           }
         }
         
+        // Filter avoid terms from strict gate (industry-agnostic)
+        // Normalize avoid terms to handle misspellings and plural/singular variations
+        const normalizeAvoidTerm = (term: string): string[] => {
+          const normalized = term.toLowerCase().trim();
+          const variants: string[] = [normalized];
+          
+          // Handle common misspellings (industry-agnostic)
+          const misspellings: Record<string, string> = {
+            "paterns": "patterns",
+            "patern": "pattern",
+            "pater": "pattern",
+          };
+          
+          if (misspellings[normalized]) {
+            variants.push(misspellings[normalized]);
+          }
+          
+          // Handle plural/singular variations (industry-agnostic)
+          if (normalized.endsWith("s") && normalized.length > 1) {
+            // Remove 's' for singular
+            variants.push(normalized.slice(0, -1));
+          } else if (normalized.length > 1) {
+            // Add 's' for plural
+            variants.push(normalized + "s");
+            // Also try 'es' for words ending in certain letters
+            if (/[sxz]$/.test(normalized) || /[ch]sh$/.test(normalized)) {
+              variants.push(normalized + "es");
+            }
+          }
+          
+          return Array.from(new Set(variants));
+        };
+        
+        // Build normalized avoid term set
+        const avoidTermVariants = new Set<string>();
+        for (const avoidTerm of avoidTerms) {
+          const variants = normalizeAvoidTerm(avoidTerm);
+          for (const variant of variants) {
+            avoidTermVariants.add(variant);
+          }
+        }
+        
+        // Filter out products that contain any avoid term variant
+        if (avoidTermVariants.size > 0) {
+          const beforeAvoidFilter = strictGate.length;
+          const filteredStrictGate = strictGate.filter(candidate => {
+            const searchableText = unifiedNormalize(
+              candidate.searchText || extractSearchText(candidate, indexMetafields)
+            );
+            
+            // Check if any avoid term variant appears in searchable text
+            const hasAvoidTerm = Array.from(avoidTermVariants).some(avoidVariant => {
+              // Use word boundary matching for better precision
+              const pattern = new RegExp(`\\b${avoidVariant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+              return pattern.test(searchableText);
+            });
+            
+            if (hasAvoidTerm) {
+              console.log(`[AvoidFilter] Rejected ${candidate.handle} - contains avoid term variant`);
+              return false;
+            }
+            return true;
+          });
+          
+          const afterAvoidFilter = filteredStrictGate.length;
+          if (beforeAvoidFilter !== afterAvoidFilter) {
+            console.log(`[AvoidFilter] filtered=${beforeAvoidFilter - afterAvoidFilter} remaining=${afterAvoidFilter} avoidTerms=[${Array.from(avoidTermVariants).join(", ")}]`);
+          }
+          strictGate.length = 0;
+          strictGate.push(...filteredStrictGate);
+        }
+        
         console.log("[App Proxy] [Layer 2] Strict gate (hard terms + facets):", strictGate.length, "candidates");
         
         // Budget diagnostic: Log strictGate items before budget filter (when budget is active)
@@ -10879,7 +10967,7 @@ async function processSessionInBackground({
                 // This should never happen, but if it does, we need to investigate
               }
               
-              // Build reasoning from AI
+              // Build reasoning from AI (human-like, sales representative style)
               let reasoningText = "";
               if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
                 reasoningText = cleanReasoning(aiBundle.reasoning.trim());
@@ -10887,17 +10975,30 @@ async function processSessionInBackground({
               
               // If cleaned reasoning is empty or too short, create a better fallback
               if (!reasoningText || reasoningText.length < 20) {
-                const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(", ");
-                reasoningText = `Selected a bundle of ${itemNames} that work well together.`;
+                const itemNames = bundleItemsWithBudget.map(item => {
+                  // Capitalize first letter of each item name
+                  const name = item.hardTerms[0];
+                  return name.charAt(0).toUpperCase() + name.slice(1);
+                });
+                
+                // Create human-like bundle reasoning
+                if (itemNames.length === 2) {
+                  reasoningText = `I've curated a perfect pairing of ${itemNames[0]} and ${itemNames[1]} that complement each other beautifully.`;
+                } else if (itemNames.length === 3) {
+                  reasoningText = `I've put together a complete ${itemNames[0]}, ${itemNames[1]}, and ${itemNames[2]} combination that works seamlessly together.`;
+                } else {
+                  reasoningText = `I've selected a carefully curated bundle of ${itemNames.slice(0, -1).join(", ")}, and ${itemNames[itemNames.length - 1]} that work perfectly together.`;
+                }
               }
               
-              // Add delivered vs requested count to reasoning (will be finalized after top-up)
+              // Add delivered vs requested count to reasoning (only if different, in a natural way)
               const deliveredAfterAI = finalHandles.length;
               if (deliveredAfterAI < finalResultCount) {
-                reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+                // Don't add technical count info - it will be added later if needed
+                // The reasoning should focus on the quality of the selection, not the count
               }
               
-              // Final cleanup
+              // Final cleanup (remove any technical metadata)
               reasoningText = cleanReasoning(reasoningText) || reasoningText;
               reasoningParts.push(reasoningText);
               
@@ -10978,14 +11079,23 @@ async function processSessionInBackground({
             if (aiBundle.reasoning && aiBundle.reasoning.trim()) {
               reasoningText = aiBundle.reasoning.trim();
             } else {
-              const itemNames = bundleItemsWithBudget.map(item => item.hardTerms[0]).join(" + ");
-                reasoningText = `Built a bundle: ${itemNames}.`;
-              }
+              // Create human-like bundle reasoning for legacy fallback
+              const itemNames = bundleItemsWithBudget.map(item => {
+                const name = item.hardTerms[0];
+                return name.charAt(0).toUpperCase() + name.slice(1);
+              });
               
-            const deliveredAfterAI = finalHandles.length;
-            if (deliveredAfterAI < finalResultCount) {
-              reasoningText += ` Showing ${deliveredAfterAI} results (requested ${finalResultCount}).`;
+              if (itemNames.length === 2) {
+                reasoningText = `I've curated a perfect pairing of ${itemNames[0]} and ${itemNames[1]} that complement each other beautifully.`;
+              } else if (itemNames.length === 3) {
+                reasoningText = `I've put together a complete ${itemNames[0]}, ${itemNames[1]}, and ${itemNames[2]} combination that works seamlessly together.`;
+              } else {
+                reasoningText = `I've selected a carefully curated bundle of ${itemNames.slice(0, -1).join(", ")}, and ${itemNames[itemNames.length - 1]} that work perfectly together.`;
+              }
             }
+            
+            // Don't add technical count info - it will be added later in a human-like way if needed
+            // The reasoning should focus on the quality of the selection, not the count
             
             reasoningParts.push(reasoningText);
               console.log("[Bundle] [LEGACY FALLBACK] selected", finalHandles.length, "handles across", bundleItemsWithBudget.length, "items");
@@ -13747,7 +13857,7 @@ async function processSessionInBackground({
         
         // Only add customer-friendly context if needed
         if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
-          reasoning = "Showing the best matches we found within your budget. " + reasoning;
+          reasoning = "I've selected the best matches that fit within your budget. " + reasoning;
         }
       } else {
         // Fallback: build reasoning from parts, but make it customer-friendly
@@ -13795,17 +13905,17 @@ async function processSessionInBackground({
             return "Including some options that may have limited availability.";
           }
           if (note.includes("closest matches across")) {
-            return "Showing the best matches we found.";
+            return "I've selected the best matches I found for you.";
           }
           return note;
         }).filter(Boolean) as string[];
         
         reasoning = [...customerFriendlyNotes, ...customerFriendlyParts].filter(Boolean).join(" ");
         
-        // If still empty or too technical, provide a default friendly message
+        // If still empty or too technical, provide a default friendly message (sales representative style)
         if (!reasoning || reasoning.length < 10) {
-          const categoryNames = hardTerms.length > 0 ? hardTerms.join(", ") : "your preferences";
-          reasoning = `Selected the best matches for ${categoryNames}.`;
+          const categoryNames = hardTerms.length > 0 ? hardTerms.slice(0, 2).join(" and ") : "your preferences";
+          reasoning = `I've curated the best matches for ${categoryNames} that I think you'll love.`;
         }
       }
       const finalHandlesArray = Array.isArray(finalHandlesGuaranteed) ? finalHandlesGuaranteed : [];
@@ -14580,7 +14690,7 @@ async function processSessionInBackground({
           
           // Update reasoning to reflect emergency fallback
           if (handlesToSave.length > 0) {
-            reasoning = reasoning || "Showing available products that best match your preferences.";
+            reasoning = reasoning || "I've handpicked available products that best match your preferences.";
           }
         }
       }
@@ -14729,33 +14839,45 @@ async function processSessionInBackground({
       let finalReasoningToSave = reasoning || finalReasoning || "";
       finalReasoningToSave = finalReasoningToSave.replace(/\s*Showing\s+\d+\s+results\s+\(requested\s+\d+\)[^.]*/gi, "");
       
+      // Clean reasoning to remove technical metadata before adding human-like messages
+      finalReasoningToSave = cleanReasoning(finalReasoningToSave) || finalReasoningToSave;
+      
       // Update reasoning with final delivered count (only if different from requested)
+      // Use human-like, sales representative language
       if (deliveredCountFinal < requestedCountFinal) {
-        // Explain why fewer results
+        // Explain why fewer results in a natural, helpful way
         let whyFewer = "";
         if (isBundleModeForReasoning) {
-          // Bundle-specific reasons
+          // Bundle-specific reasons (sales representative style)
           if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
-            whyFewer = "Limited matches available within budget and stock constraints.";
+            whyFewer = "I've selected the best options that fit within your budget while maintaining quality.";
           } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
-            whyFewer = "Limited in-stock matches available for the requested bundle categories.";
+            whyFewer = "I've curated the best available in-stock options for your bundle.";
           } else {
-            whyFewer = "Limited matches available for the requested bundle categories.";
+            whyFewer = "I've handpicked the finest options available for each item in your bundle.";
           }
         } else {
-          // Single-item reasons
+          // Single-item reasons (sales representative style)
           if (relaxNotes.some(n => n.includes("budget") || n.includes("Budget"))) {
-            whyFewer = "Limited matches available within budget constraints.";
+            whyFewer = "I've selected the best options that fit within your budget.";
           } else if (relaxNotes.some(n => n.includes("stock") || n.includes("Stock"))) {
-            whyFewer = "Limited in-stock matches available.";
+            whyFewer = "I've curated the best in-stock options available.";
           } else {
-            whyFewer = "Limited matches available for your criteria.";
+            whyFewer = "I've handpicked the finest options that match your preferences.";
           }
         }
-        finalReasoningToSave += ` Showing ${deliveredCountFinal} results (requested ${requestedCountFinal}). ${whyFewer}`;
+        // Only mention count if significantly different (more than 25% difference)
+        const countDiff = requestedCountFinal - deliveredCountFinal;
+        const percentDiff = (countDiff / requestedCountFinal) * 100;
+        if (percentDiff > 25) {
+          finalReasoningToSave += ` ${whyFewer}`;
+        } else {
+          // For small differences, just add the explanation without mentioning count
+          finalReasoningToSave += ` ${whyFewer}`;
+        }
       } else if (deliveredCountFinal === requestedCountFinal && relaxNotes.some(n => n.includes("exceed") || n.includes("Exceed") || n.includes("relaxed"))) {
-        // Budget was exceeded in pass 3
-        finalReasoningToSave += ` Showing ${deliveredCountFinal} results (requested ${requestedCountFinal}). Budget was relaxed to show more options.`;
+        // Budget was exceeded - use natural language
+        finalReasoningToSave += ` I've expanded the selection slightly to give you more great options to choose from.`;
       }
       
       // Calculate billedCount: 0 if emergency_fallback_unmatched, otherwise deliveredCount
@@ -14768,11 +14890,17 @@ async function processSessionInBackground({
       // BUG FIX #3: Store grouped bundle info if available (as JSON in reasoning or separate field)
       const saveStart = performance.now();
       
-      // For bundles, include grouped structure in reasoning (as JSON string for now)
-      // TODO: Add separate field to ConciergeResult schema for bundleGroupedData
+      // For bundles, store grouped structure separately (not in human-readable reasoning)
+      // The BUNDLE_GROUPED data is stored in reasoning but will be stripped for display
       let reasoningToSave = deliveredCountFinal > 0 ? finalReasoningToSave : finalReasoning;
+      
+      // Clean reasoning to remove any technical metadata before saving
+      reasoningToSave = cleanReasoning(reasoningToSave) || reasoningToSave;
+      
+      // Store bundle grouped data separately in reasoning (will be parsed by frontend if needed)
+      // But ensure it's removed from the human-readable portion
       if (bundleGroupedResult && deliveredCountFinal > 0) {
-        // Append grouped structure as JSON (can be parsed by frontend if needed)
+        // Append grouped structure as JSON (for frontend parsing, but will be stripped from display)
         const groupedJson = JSON.stringify(bundleGroupedResult);
         reasoningToSave += ` [BUNDLE_GROUPED:${groupedJson}]`;
       }
@@ -14940,6 +15068,7 @@ async function processSessionInBackground({
       throw error;
     }
 }
+
 
 
 
