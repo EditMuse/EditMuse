@@ -1,12 +1,13 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData, useNavigate, useSearchParams } from "react-router";
-import { useState, useEffect } from "react";
+import { useLoaderData, useNavigate, useSearchParams, useRevalidator } from "react-router";
+import { useState, useEffect, useMemo } from "react";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { UsageEventType } from "@prisma/client";
 import { getEntitlements } from "~/models/billing.server";
 import { PLAN_TIER } from "~/models/billing.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { showToast } from "~/components/Toast";
 
 type LoaderData = {
   from: string;
@@ -1119,7 +1120,7 @@ export default function UsagePage() {
                     </td>
                   </tr>
                 ) : (
-                  paginatedEvents.map((e, idx) => {
+                  paginatedEvents.map((e: { createdAt: string; eventType: string; metadata: any; creditsBurned: number }, idx: number) => {
                     const globalIdx = (currentPage - 1) * eventsPerPage + idx;
                     return (
                     <tr

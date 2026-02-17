@@ -103,6 +103,58 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const approved = url.searchParams.get("approved") === "true";
   const errorParam = url.searchParams.get("error");
 
+  // Get payment history
+  const paymentHistory = await getPaymentHistory(session.shop, 20, { admin });
+
+  // Get usage breakdown by experience
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const usageByExperienceData = await prisma.conciergeSession.groupBy({
+    by: ["experienceId"],
+    where: {
+      shopId: shop.id,
+      createdAt: { gte: thirtyDaysAgo },
+      result: { isNot: null },
+    },
+    _count: { id: true },
+    _sum: { resultCount: true },
+  });
+
+  const experienceMap = new Map<string, { name: string; sessions: number; credits: number }>();
+  for (const item of usageByExperienceData) {
+    if (item.experienceId && item._count && item._count.id !== undefined) {
+      const exp = await prisma.experience.findUnique({
+        where: { id: item.experienceId },
+        select: { name: true },
+      });
+      if (exp) {
+        // Calculate credits from resultCount (approximate: resultCount * 2 credits per result)
+        const resultCount = item._sum?.resultCount || 0;
+        const estimatedCredits = resultCount * 2; // Approximate credits
+        experienceMap.set(item.experienceId, {
+          name: exp.name,
+          sessions: item._count.id,
+          credits: estimatedCredits,
+        });
+      }
+    }
+  }
+
+  // Plan recommendations
+  const currentMonthCredits = usage.aiRankingsExecuted * 2; // Approximate credits used
+  const currentPlanCredits = currentPlan.includedCredits;
+  const usagePercent = currentPlanCredits > 0 ? (currentMonthCredits / currentPlanCredits) : 0;
+  
+  let recommendedPlan: PlanInfo | null = null;
+  if (usagePercent > 0.8 && currentPlan.tier !== "PRO") {
+    // Recommend upgrade if using >80% of credits
+    const planTiers: PlanTier[] = ["LITE", "GROWTH", "SCALE", "PRO"];
+    const currentIndex = planTiers.indexOf(currentPlan.tier as PlanTier);
+    if (currentIndex < planTiers.length - 1) {
+      recommendedPlan = PLANS[planTiers[currentIndex + 1]];
+    }
+  }
+
   return {
     currentPlan,
     inTrial,
@@ -1659,7 +1711,7 @@ export default function Billing() {
                 </tr>
               </thead>
               <tbody>
-                {usageByExperience.map((item, idx) => (
+                {usageByExperience.map((item: { name: string; sessions: number; credits: number }, idx: number) => (
                   <tr key={idx} style={{ backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB" }}>
                     <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F" }}>
                       {item.name}
@@ -1704,7 +1756,7 @@ export default function Billing() {
                 </tr>
               </thead>
               <tbody>
-                {paymentHistory.map((payment, idx) => (
+                {paymentHistory.map((payment: { id: string; createdAt: string; description: string; amount: number; currencyCode: string }, idx: number) => (
                   <tr key={payment.id} style={{ backgroundColor: idx % 2 === 0 ? "#FFFFFF" : "#F9FAFB" }}>
                     <td style={{ padding: "0.75rem 1rem", borderBottom: "1px solid rgba(11,11,15,0.08)", color: "#0B0B0F", fontSize: "0.875rem" }}>
                       {new Date(payment.createdAt).toLocaleDateString()}
