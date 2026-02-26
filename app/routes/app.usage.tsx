@@ -992,7 +992,10 @@ export default function UsagePage() {
               <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", height: "120px", overflowX: "auto" }}>
                 {data.usageTrends.dailyBurn.map((day: { date: string; credits: number }, idx: number) => {
                   const maxCredits = Math.max(...data.usageTrends.dailyBurn.map((d: { date: string; credits: number }) => d.credits), 1);
-                  const heightPercent = (day.credits / maxCredits) * 100;
+                  // Slightly exaggerate differences so they are more visible
+                  const basePercent = (day.credits / maxCredits) * 100;
+                  const heightPercent = day.credits > 0 ? Math.max(basePercent, 10) : 0; // minimum 10% for non-zero days
+
                   return (
                     <div
                       key={idx}
