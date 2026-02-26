@@ -1027,6 +1027,14 @@ export default function UsagePage() {
                       <div
                         style={{
                           fontSize: "0.625rem",
+                          color: "#7C3AED",
+                        }}
+                      >
+                        {day.credits.toFixed(1)}
+                      </div>
+                      <div
+                        style={{
+                          fontSize: "0.625rem",
                           color: "rgba(11,11,15,0.62)",
                           transform: "rotate(-45deg)",
                           transformOrigin: "center",
