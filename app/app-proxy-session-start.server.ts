@@ -8111,6 +8111,170 @@ async function processSessionInBackground({
       console.log("[App Proxy] [Layer 2] Avoid terms:", avoidTerms);
       console.log("[App Proxy] [Layer 2] Hard facets:", hardFacets);
       
+      // EARLY AVOID TERMS FILTERING: Filter allCandidatesEnriched immediately after intent parsing
+      // This ensures products with avoid terms are removed before any gating or ranking
+      // CRITICAL: Fetches descriptions early to check avoid terms in both title AND description
+      if (avoidTerms.length > 0) {
+        // Separate multi-word phrases from single-word terms
+        const multiWordAvoidTerms = avoidTerms.filter(term => term.includes(" "));
+        const singleWordAvoidTerms = avoidTerms.filter(term => !term.includes(" "));
+        const hasMultiWordAvoidTerms = multiWordAvoidTerms.length > 0;
+        
+        // If we have avoid terms (especially multi-word like "hydrochloric acid"), fetch descriptions early
+        // This ensures we can filter products that contain avoid terms in descriptions, not just titles
+        if (hasMultiWordAvoidTerms && accessToken && allCandidatesEnriched.length > 0) {
+          try {
+            console.log(`[EarlyAvoidFilter] fetching_descriptions_for_avoid_terms candidate_count=${allCandidatesEnriched.length} multi_word_terms=[${multiWordAvoidTerms.join(", ")}]`);
+            
+            // Fetch descriptions for all candidates (up to 500 to avoid timeout)
+            const candidatesToEnrich = allCandidatesEnriched.slice(0, 500);
+            const handlesToFetch = candidatesToEnrich
+              .filter(c => !c.description && !c.descPlain)
+              .map(c => c.handle);
+            
+            if (handlesToFetch.length > 0) {
+              const descriptionMap = await fetchShopifyProductDescriptionsByHandles({
+                shopDomain,
+                accessToken,
+                handles: handlesToFetch,
+              });
+              
+              // Enrich candidates with descriptions
+              for (const candidate of candidatesToEnrich) {
+                if (candidate.description || candidate.descPlain) continue; // Already has description
+                
+                const description = descriptionMap.get(candidate.handle) || null;
+                const descPlain = cleanDescription(description);
+                const desc1000 = descPlain.substring(0, 1000);
+                
+                candidate.description = description;
+                candidate.descPlain = descPlain;
+                candidate.desc1000 = desc1000;
+                
+                // Rebuild searchText with description (includes description snippet for filtering)
+                candidate.searchText = extractSearchText(candidate, indexMetafields);
+              }
+              
+              console.log(`[EarlyAvoidFilter] enriched_with_descriptions count=${handlesToFetch.length}`);
+            }
+          } catch (error) {
+            console.error(`[EarlyAvoidFilter] error fetching descriptions:`, error);
+            // Continue without descriptions if fetch fails - will still check titles/tags
+          }
+        }
+        
+        const normalizeAvoidTerm = (term: string): string[] => {
+          const normalized = term.toLowerCase().trim();
+          const variants: string[] = [normalized];
+          
+          // Handle common misspellings (industry-agnostic)
+          const misspellings: Record<string, string> = {
+            "paterns": "patterns",
+            "patern": "pattern",
+            "pater": "pattern",
+            "prints": "print", // Also normalize "prints" -> "print"
+            "print": "prints", // And "print" -> "prints"
+          };
+          
+          if (misspellings[normalized]) {
+            variants.push(misspellings[normalized]);
+          }
+          
+          // Handle plural/singular variations (industry-agnostic) - only for single words
+          if (!term.includes(" ")) {
+            if (normalized.endsWith("s") && normalized.length > 1) {
+              // Remove 's' for singular
+              variants.push(normalized.slice(0, -1));
+            } else if (normalized.length > 1) {
+              // Add 's' for plural
+              variants.push(normalized + "s");
+              // Also try 'es' for words ending in certain letters
+              if (/[sxz]$/.test(normalized) || /[ch]sh$/.test(normalized)) {
+                variants.push(normalized + "es");
+              }
+            }
+          }
+          
+          return Array.from(new Set(variants));
+        };
+        
+        // Build normalized avoid term set (separate phrases and single words)
+        const avoidTermPhrases = new Set<string>(); // Multi-word phrases (e.g., "hydrochloric acid")
+        const avoidTermVariants = new Set<string>(); // Single-word variants
+        
+        for (const avoidTerm of avoidTerms) {
+          if (avoidTerm.includes(" ")) {
+            // Multi-word phrase: keep as phrase, normalize each word
+            const words = avoidTerm.toLowerCase().trim().split(/\s+/);
+            const normalizedPhrase = words.map(w => normalizeAvoidTerm(w)[0]).join(" ");
+            avoidTermPhrases.add(normalizedPhrase);
+            avoidTermPhrases.add(avoidTerm.toLowerCase().trim()); // Also keep original
+          } else {
+            // Single-word: generate variants
+            const variants = normalizeAvoidTerm(avoidTerm);
+            for (const variant of variants) {
+              avoidTermVariants.add(variant);
+            }
+          }
+        }
+        
+        // Filter out products that contain any avoid term variant
+        if (avoidTermPhrases.size > 0 || avoidTermVariants.size > 0) {
+          const beforeEarlyAvoidFilter = allCandidatesEnriched.length;
+          allCandidatesEnriched = allCandidatesEnriched.filter(candidate => {
+            // Get searchable text (includes title, tags, AND description if fetched)
+            const searchableText = unifiedNormalize(
+              candidate.searchText || extractSearchText(candidate, indexMetafields)
+            );
+            
+            // Check multi-word phrases first (phrase matching for phrases like "hydrochloric acid")
+            if (avoidTermPhrases.size > 0) {
+              const hasPhrase = Array.from(avoidTermPhrases).some(phrase => {
+                // For phrases, use case-insensitive substring matching (more flexible)
+                // This catches "hydrochloric acid" even if there's punctuation or spacing variations
+                const phraseLower = phrase.toLowerCase();
+                return searchableText.includes(phraseLower);
+              });
+              
+              if (hasPhrase) {
+                console.log(`[EarlyAvoidFilter] Rejected ${candidate.handle} - contains avoid phrase in: ${candidate.title || candidate.handle}`);
+                return false;
+              }
+            }
+            
+            // Check single-word variants (word boundary matching for precision)
+            if (avoidTermVariants.size > 0) {
+              const hasAvoidTerm = Array.from(avoidTermVariants).some(avoidVariant => {
+                // Use word boundary matching for better precision (prevents "printing" matching "print")
+                const pattern = new RegExp(`\\b${avoidVariant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                return pattern.test(searchableText);
+              });
+              
+              if (hasAvoidTerm) {
+                console.log(`[EarlyAvoidFilter] Rejected ${candidate.handle} - contains avoid term variant in: ${candidate.title || candidate.handle}`);
+                return false;
+              }
+            }
+            
+            return true;
+          });
+          
+          const afterEarlyAvoidFilter = allCandidatesEnriched.length;
+          if (beforeEarlyAvoidFilter !== afterEarlyAvoidFilter) {
+            const phrasesList = avoidTermPhrases.size > 0 ? ` phrases=[${Array.from(avoidTermPhrases).join(", ")}]` : "";
+            const variantsList = avoidTermVariants.size > 0 ? ` variants=[${Array.from(avoidTermVariants).slice(0, 10).join(", ")}${avoidTermVariants.size > 10 ? "..." : ""}]` : "";
+            console.log(`[EarlyAvoidFilter] filtered=${beforeEarlyAvoidFilter - afterEarlyAvoidFilter} remaining=${afterEarlyAvoidFilter}${phrasesList}${variantsList}`);
+          }
+          
+          // Also update candidateDocs to reflect filtered candidates
+          candidateDocs.length = 0;
+          candidateDocs.push(...allCandidatesEnriched.map(c => ({
+            candidate: c,
+            tokens: tokenize(c.searchText),
+          })));
+        }
+      }
+      
       // Tokenize query terms
       const hardTermTokens = hardTerms.flatMap(t => tokenize(t));
       const softTermTokens = softTerms.flatMap(t => tokenize(t));
@@ -9036,24 +9200,61 @@ async function processSessionInBackground({
           }
           
           // Retry strict gate using expanded tokens (OR logic - match any expanded token)
+          // Industry-agnostic: Filter out irrelevant matches where hard term appears only as part of compound words
+          // (e.g., "top-coat" nail polish or "one-coat" pet product vs actual "coat" clothing)
+          // MODE-AGNOSTIC: This logic applies to Quiz, Chat, and Hybrid modes identically
           const retryStrictGate: EnrichedCandidate[] = [];
+          const primaryHardTerm = hardTerms[0]; // Use first hard term for validation
+          const isSingleWordTerm = primaryHardTerm && primaryHardTerm.split(/\s+/).length === 1;
+          
           for (const candidate of baseCandidates) {
             const haystack = unifiedNormalize(candidate.searchText || extractSearchText(candidate, indexMetafields));
             const candidateTokens = new Set(tokenize(haystack));
             
             // Check if any expanded token matches
             const hasMatch = Array.from(expandedTokens).some(token => candidateTokens.has(token));
-            if (hasMatch) {
-              retryStrictGate.push(candidate);
+            if (!hasMatch) continue;
+            
+            // Industry-agnostic: For single-word hard terms, validate that the term appears meaningfully
+            // Filter out products where term only appears as part of compound words (e.g., "top-coat", "one-coat")
+            if (isSingleWordTerm) {
+              const primaryTerm = unifiedNormalize(primaryHardTerm);
+              const titleNormalized = unifiedNormalize(candidate.title || "");
+              const productTypeNormalized = candidate.productType ? unifiedNormalize(candidate.productType) : "";
+              
+              // Check if term appears as standalone word (with word boundaries) in title or productType
+              const standaloneRegex = new RegExp(`\\b${primaryTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+              const titleHasStandalone = standaloneRegex.test(titleNormalized);
+              const productTypeHasStandalone = productTypeNormalized ? standaloneRegex.test(productTypeNormalized) : false;
+              
+              // Check if term appears only as part of compound (e.g., "top-coat", "one-coat")
+              const titleHasCompound = titleNormalized.includes(primaryTerm) && !titleHasStandalone;
+              
+              // If term only appears as compound in title AND not in productType, likely irrelevant
+              // Allow if productType contains the term (even if compound) OR if title has standalone term
+              if (titleHasCompound && !productTypeHasStandalone && !productTypeNormalized.includes(primaryTerm)) {
+                // Additional check: if productType suggests different category, filter out
+                // Industry-agnostic: check if productType is clearly unrelated (e.g., "Beauty", "Pet", "Health")
+                const unrelatedCategories = ["beauty", "pet", "health", "cosmetic", "nail", "hair", "skin", "treatment", "medicine"];
+                const productTypeIsUnrelated = unrelatedCategories.some(cat => productTypeNormalized.includes(cat));
+                
+                if (productTypeIsUnrelated) {
+                  continue; // Skip - likely irrelevant match (e.g., "top-coat" nail polish)
+                }
+              }
             }
+            
+            retryStrictGate.push(candidate);
           }
           
           if (retryStrictGate.length > 0) {
             strictGateCount = retryStrictGate.length;
-            gatedCandidates = applyBudgetFilterCandidates(retryStrictGate, priceMin, priceMax);
+            // Don't apply budget filter during gating retry - apply it later after we have enough candidates
+            // Budget filter should only be applied once we have sufficient candidates to choose from
+            gatedCandidates = retryStrictGate;
             strictGateCount = gatedCandidates.length;
             trustFallback = false;
-            console.log(`[Gating] Retry with morphology/decompound succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+            console.log(`[Gating] Retry with morphology/decompound succeeded: strictGateCount=${strictGateCount} trustFallback=false (budget filter deferred)`);
           } else {
             // Still 0 - try BM25 with expanded token filter
             console.log(`[Gating] strictGateCount still 0 after morphology retry - trying BM25 with expanded token filter`);
@@ -9091,10 +9292,11 @@ async function processSessionInBackground({
                 return a.candidate.handle.localeCompare(b.candidate.handle);
               });
               
-              gatedCandidates = applyBudgetFilterCandidates(scoredCandidates.map(s => s.candidate), priceMin, priceMax);
+              // Don't apply budget filter during BM25 retry - apply it later after we have enough candidates
+              gatedCandidates = scoredCandidates.map(s => s.candidate);
               strictGateCount = gatedCandidates.length;
               trustFallback = false;
-              console.log(`[Gating] BM25 with expanded token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false`);
+              console.log(`[Gating] BM25 with expanded token filter succeeded: strictGateCount=${strictGateCount} trustFallback=false (budget filter deferred)`);
             } else {
               // All stages failed - try targeted Shopify search fallback if conditions are met
               if (hardTerms.length > 0 && mightHaveMorePages && accessToken && shopDomain) {
@@ -14739,6 +14941,7 @@ async function processSessionInBackground({
           
           // Still provide results but mark as unmatched
           // Only use products that match at least one hard term (industry-agnostic)
+          // Industry-agnostic: Also respect color/material/size constraints if specified
           const emergencyCandidates = allCandidatesEnriched
             .filter(c => {
               // Must be available
@@ -14755,6 +14958,45 @@ async function processSessionInBackground({
                 ].join(" ");
                 const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
                 if (!hasHardTermMatch) return false;
+              }
+              
+              // Industry-agnostic: Check color constraint if specified
+              if (variantConstraints2.color) {
+                const productColors = c.colors || [];
+                const normalizedConstraint = variantConstraints2.color.toLowerCase().trim();
+                const hasColorMatch = productColors.some((color: string) => {
+                  const normalizedColor = color.toLowerCase().trim();
+                  return normalizedColor === normalizedConstraint || 
+                         normalizedColor.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedColor);
+                });
+                if (!hasColorMatch) return false;
+              }
+              
+              // Industry-agnostic: Check size constraint if specified
+              if (variantConstraints2.size) {
+                const productSizes = c.sizes || [];
+                const normalizedConstraint = variantConstraints2.size.toLowerCase().trim();
+                const hasSizeMatch = productSizes.some((size: string) => {
+                  const normalizedSize = size.toLowerCase().trim();
+                  return normalizedSize === normalizedConstraint || 
+                         normalizedSize.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedSize);
+                });
+                if (!hasSizeMatch) return false;
+              }
+              
+              // Industry-agnostic: Check material constraint if specified
+              if (variantConstraints2.material) {
+                const productMaterials = c.materials || [];
+                const normalizedConstraint = variantConstraints2.material.toLowerCase().trim();
+                const hasMaterialMatch = productMaterials.some((material: string) => {
+                  const normalizedMaterial = material.toLowerCase().trim();
+                  return normalizedMaterial === normalizedConstraint || 
+                         normalizedMaterial.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedMaterial);
+                });
+                if (!hasMaterialMatch) return false;
               }
               
               return true;
@@ -14806,6 +15048,13 @@ async function processSessionInBackground({
             handlesToSave = emergencyFiltered.length > 0 ? emergencyFiltered : emergencyCandidates.slice(0, 1).map(c => c.handle);
           } else {
             handlesToSave = emergencyCandidates.map(c => c.handle);
+          }
+          
+          // Deduplicate handles (industry-agnostic: prevent duplicate products)
+          const uniqueHandles = Array.from(new Set(handlesToSave));
+          if (uniqueHandles.length < handlesToSave.length) {
+            console.log(`[Emergency Fallback] deduplicated ${handlesToSave.length - uniqueHandles.length} duplicate handles`);
+            handlesToSave = uniqueHandles;
           }
           
           deliveredCount = handlesToSave.length;
@@ -14824,6 +15073,7 @@ async function processSessionInBackground({
           
           // Emergency fallback: use candidates that match hard terms (industry-agnostic)
           // Only use products that match at least one hard term to avoid random products
+          // Industry-agnostic: Also respect color/material/size constraints if specified
           const emergencyCandidates = allCandidatesEnriched
             .filter(c => {
               // Must be available
@@ -14840,6 +15090,46 @@ async function processSessionInBackground({
                 ].join(" ");
                 const hasHardTermMatch = hardTerms.some(term => matchesHardTermWithBoundary(haystack, term));
                 if (!hasHardTermMatch) return false;
+              }
+              
+              // Industry-agnostic: Check color constraint if specified
+              if (variantConstraints2.color) {
+                const productColors = c.colors || [];
+                const normalizedConstraint = variantConstraints2.color.toLowerCase().trim();
+                const hasColorMatch = productColors.some((color: string) => {
+                  const normalizedColor = color.toLowerCase().trim();
+                  // Exact match or partial match (e.g., "black" matches "Black", "BLACK", "dark black")
+                  return normalizedColor === normalizedConstraint || 
+                         normalizedColor.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedColor);
+                });
+                if (!hasColorMatch) return false;
+              }
+              
+              // Industry-agnostic: Check size constraint if specified
+              if (variantConstraints2.size) {
+                const productSizes = c.sizes || [];
+                const normalizedConstraint = variantConstraints2.size.toLowerCase().trim();
+                const hasSizeMatch = productSizes.some((size: string) => {
+                  const normalizedSize = size.toLowerCase().trim();
+                  return normalizedSize === normalizedConstraint || 
+                         normalizedSize.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedSize);
+                });
+                if (!hasSizeMatch) return false;
+              }
+              
+              // Industry-agnostic: Check material constraint if specified
+              if (variantConstraints2.material) {
+                const productMaterials = c.materials || [];
+                const normalizedConstraint = variantConstraints2.material.toLowerCase().trim();
+                const hasMaterialMatch = productMaterials.some((material: string) => {
+                  const normalizedMaterial = material.toLowerCase().trim();
+                  return normalizedMaterial === normalizedConstraint || 
+                         normalizedMaterial.includes(normalizedConstraint) || 
+                         normalizedConstraint.includes(normalizedMaterial);
+                });
+                if (!hasMaterialMatch) return false;
               }
               
               return true;
@@ -14891,6 +15181,13 @@ async function processSessionInBackground({
             handlesToSave = emergencyFiltered.length > 0 ? emergencyFiltered : emergencyCandidates.slice(0, 1).map(c => c.handle);
           } else {
             handlesToSave = emergencyCandidates.map(c => c.handle);
+          }
+          
+          // Deduplicate handles (industry-agnostic: prevent duplicate products)
+          const uniqueHandles = Array.from(new Set(handlesToSave));
+          if (uniqueHandles.length < handlesToSave.length) {
+            console.log(`[Emergency Fallback] deduplicated ${handlesToSave.length - uniqueHandles.length} duplicate handles`);
+            handlesToSave = uniqueHandles;
           }
           
           deliveredCount = handlesToSave.length;

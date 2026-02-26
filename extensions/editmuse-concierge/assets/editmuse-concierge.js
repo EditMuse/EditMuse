@@ -1490,6 +1490,13 @@
     validateStep(stepEl) {
       if (!stepEl) return false;
       
+      // Check if current question is optional (e.g., hybrid chat question)
+      var question = this.state.questions[this.state.current];
+      if (question && question.optional === true) {
+        // Optional questions are always valid (even if empty)
+        return true;
+      }
+      
       var answer = this.getStepAnswer(stepEl);
       if (!answer) return false;
       
@@ -2413,7 +2420,8 @@
         type: 'textarea',
         question: 'Any extra details?',
         prompt: 'Any extra details?',
-        placeholder: 'Optional: add details that will improve recommendations (brand tone, audience, length, style)…'
+        placeholder: 'Optional: add details that will improve recommendations (brand tone, audience, length, style)…',
+        optional: true // Mark as optional - user can submit without filling this
       };
       
       debugLog('[EditMuse] handleStart: Rendering initial state', { open: this.state.open, mode: this.state.mode });
@@ -2714,7 +2722,10 @@
       }
 
       // Validate using unified function
-      if (!this.validateStep(currentStepEl)) {
+      // Skip validation for optional questions (e.g., hybrid chat question)
+      var question = this.state.questions[this.state.current];
+      var isOptional = question && question.optional === true;
+      if (!isOptional && !this.validateStep(currentStepEl)) {
         this.showError('Please fill in this field');
         return;
       }
@@ -3260,7 +3271,10 @@
       }
 
       // Validate using unified function
-      if (!this.validateStep(currentStepEl)) {
+      // Skip validation for optional questions (e.g., hybrid chat question)
+      var question = this.state.questions[this.state.current];
+      var isOptional = question && question.optional === true;
+      if (!isOptional && !this.validateStep(currentStepEl)) {
         window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
         window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
         this.showError('Please fill in this field');
@@ -3298,14 +3312,23 @@
         }
       } else {
         // Normal flow: collect answers from questions
+        // Skip optional questions if they're empty (e.g., hybrid chat question)
         for (var i = 0; i < this.state.questions.length; i++) {
+          var question = this.state.questions[i];
           var answer = this.state.answers[i];
+          // Include answer if it exists and is non-empty, OR if question is optional (allow empty)
           if (answer !== undefined && answer !== null && answer !== '') {
             messages.push(answer);
+          } else if (question && question.optional === true) {
+            // Optional question with empty answer - skip it (don't add to messages)
+            // This allows submission without filling optional fields
           }
         }
       }
 
+      // Check if we have at least one non-empty answer
+      // In hybrid mode, quiz answers count, and the optional chat question can be empty
+      // In other modes, at least one answer is required
       if (messages.length === 0) {
         window.__EDITMUSE_SUBMIT_LOCK.inFlight = false;
         window.__EDITMUSE_SUBMIT_LOCK.requestId = null;
