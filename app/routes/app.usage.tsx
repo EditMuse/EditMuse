@@ -993,7 +993,7 @@ export default function UsagePage() {
               >
                 Daily Credits Burn
               </div>
-              <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", height: "120px", overflowX: "auto" }}>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", overflowX: "auto", overflowY: "hidden" }}>
                 {data.usageTrends.dailyBurn.map((day: { date: string; credits: number }, idx: number) => {
                   // Slightly exaggerate differences so they are more visible
                   const basePercent = (day.credits / maxDailyBurnCredits) * 100;
@@ -1009,12 +1009,18 @@ export default function UsagePage() {
                         gap: "0.25rem",
                         flex: "1",
                         minWidth: "40px",
-                        height: "100%",
-                        justifyContent: "flex-end",
                       }}
                     >
                       <div
                         style={{
+                          height: "80px",
+                          width: "100%",
+                          display: "flex",
+                          alignItems: "flex-end",
+                        }}
+                      >
+                        <div
+                          style={{
                           width: "100%",
                           height: `${heightPercent}%`,
                           minHeight: "4px",
@@ -1023,7 +1029,8 @@ export default function UsagePage() {
                           transition: "all 0.3s",
                         }}
                         title={`${day.date}: ${day.credits.toFixed(2)} credits`}
-                      />
+                        />
+                      </div>
                       <div
                         style={{
                           fontSize: "0.625rem",
