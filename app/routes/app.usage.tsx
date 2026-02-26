@@ -49,8 +49,32 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const from = url.searchParams.get("from");
   const to = url.searchParams.get("to");
 
-  const toDate = to ? new Date(to) : new Date();
-  const fromDate = from ? new Date(from) : new Date(toDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+  // Normalize date range to full UTC days so charts and filters are consistent
+  // - fromDate: start of day 00:00:00.000Z
+  // - toDate: end of day 23:59:59.999Z
+  const now = new Date();
+
+  let toDate: Date;
+  let fromDate: Date;
+
+  if (to) {
+    // Explicit "to" from query string (YYYY-MM-DD)
+    toDate = new Date(`${to}T23:59:59.999Z`);
+  } else {
+    // Default to "today" (UTC end-of-day)
+    const utcYear = now.getUTCFullYear();
+    const utcMonth = now.getUTCMonth();
+    const utcDate = now.getUTCDate();
+    toDate = new Date(Date.UTC(utcYear, utcMonth, utcDate, 23, 59, 59, 999));
+  }
+
+  if (from) {
+    // Explicit "from" from query string (YYYY-MM-DD)
+    fromDate = new Date(`${from}T00:00:00.000Z`);
+  } else {
+    // Default to last 30 days inclusive
+    fromDate = new Date(toDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+  }
 
   const rows = await prisma.usageEvent.findMany({
     where: {
