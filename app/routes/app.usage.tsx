@@ -202,6 +202,10 @@ export default function UsagePage() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const revalidator = useRevalidator();
   const eventsPerPage = 50;
+  const maxDailyBurnCredits = useMemo(
+    () => Math.max(...data.usageTrends.dailyBurn.map((d) => d.credits), 1),
+    [data.usageTrends.dailyBurn]
+  );
 
   // Auto-refresh functionality
   useEffect(() => {
@@ -991,9 +995,8 @@ export default function UsagePage() {
               </div>
               <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", height: "120px", overflowX: "auto" }}>
                 {data.usageTrends.dailyBurn.map((day: { date: string; credits: number }, idx: number) => {
-                  const maxCredits = Math.max(...data.usageTrends.dailyBurn.map((d: { date: string; credits: number }) => d.credits), 1);
                   // Slightly exaggerate differences so they are more visible
-                  const basePercent = (day.credits / maxCredits) * 100;
+                  const basePercent = (day.credits / maxDailyBurnCredits) * 100;
                   const heightPercent = day.credits > 0 ? Math.max(basePercent, 10) : 0; // minimum 10% for non-zero days
 
                   return (
@@ -1006,6 +1009,8 @@ export default function UsagePage() {
                         gap: "0.25rem",
                         flex: "1",
                         minWidth: "40px",
+                        height: "100%",
+                        justifyContent: "flex-end",
                       }}
                     >
                       <div
